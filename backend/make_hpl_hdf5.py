@@ -615,21 +615,41 @@ def package_slides_to_h5(
                         slide_ds[write_index:end] = np.array(slides, dtype=slide_dtype)
                         tile_ds[write_index:end] = np.array(tiles, dtype=tile_dtype)
                         write_index = end
-                        # Recorded only after the .h5 writes above have
-                        # returned, so the checkpoint can never claim a tile
-                        # is durable before it actually is. The reverse order
-                        # would let a resume skip a tile that was never
-                        # written.
+
+                        # Push HDF5's own cache out BEFORE recording these
+                        # tiles as complete. This ordering is the whole
+                        # correctness argument for resume, and it is easy to
+                        # get backwards: returning from the assignments above
+                        # only means the data reached the chunk cache, which
+                        # this file deliberately sizes at 64 MiB (~430 tiles).
+                        # Recording the labels first would let the checkpoint
+                        # durably claim tiles were written while their chunks
+                        # were still only in memory — and since resume trusts
+                        # the label count to set write_index, a kill in that
+                        # window would leave it skipping straight past rows
+                        # that never reached disk: permanent zero-filled holes
+                        # in the .h5 that nothing would ever re-decode,
+                        # because every one of those tiles is on the completed
+                        # list. Flushing first makes the only possible
+                        # inconsistency the harmless direction — data durable
+                        # but not yet recorded, so resume redoes at most one
+                        # chunk and overwrites those rows.
+                        #
+                        # Scope: H5Fflush hands the data to the filesystem, so
+                        # this covers the failure that actually happens here —
+                        # the process being killed (SIGTERM on TIMEOUT, OOM)
+                        # while the node stays up. It is not an fsync and so
+                        # does not promise durability across a node or power
+                        # failure; recovering from that still means discarding
+                        # the checkpoint and repackaging.
+                        hdf5.flush()
+
                         completed_f.write("".join(label + "\n" for label in labels))
 
-                    # Flushed per chunk, not per tile — a crash in the
-                    # narrow window between the h5 writes above and this
-                    # flush can leave at most one chunk's worth of tiles
-                    # written to the .h5 but not yet recorded as done, so a
-                    # resume would redecode and rewrite them at a new index.
-                    # That's a few duplicate rows at worst, never data loss
-                    # or corruption — an acceptable trade for not fsync-ing
-                    # on every single tile across a run with millions.
+                    # Flushed per chunk, not per tile. Skipped labels carry no
+                    # ordering constraint — they describe tiles that were
+                    # never written and occupy no index, so losing one just
+                    # means it gets re-read and re-skipped on resume.
                     completed_f.flush()
                     skipped_f.flush()
 

@@ -29,6 +29,13 @@ from PIL import Image, UnidentifiedImageError
 from slide_naming import slide_id_from_raw_path
 from tile_metadata import CORRUPT, read_tile_metadata, tile_metadata_path
 
+# HDF5 chunk cache for the output file. One tile is one chunk (see the
+# create_dataset call in package_slides_to_h5), i.e. 224*224*3 = 147 KiB, so
+# this holds roughly 430 of them. The HDF5 default is 1 MiB, which cannot hold
+# even a full chunk-batch and forces an evict-and-refetch on essentially every
+# write.
+_CHUNK_CACHE_BYTES = 64 * 1024 * 1024
+
 
 
 
@@ -487,7 +494,23 @@ def package_slides_to_h5(
 
     skipped_tiles: list[str] = list(skipped_labels)
     h5_mode = "r+" if resuming else "w"
-    with h5py.File(partial_h5_path, h5_mode) as hdf5:
+
+    # The worker pool is created BEFORE the HDF5 file is opened, and this
+    # ordering is load-bearing rather than stylistic. HDF5 is not fork-safe:
+    # with the pool created inside the open-file block (as it was), every
+    # forked worker inherited this process's open HDF5 file descriptor and
+    # h5py's atexit close handler, so a worker exiting could flush or close a
+    # file it does not own. Forking first means there is no HDF5 state in
+    # existence for a child to inherit.
+    with ProcessPoolExecutor(max_workers=resolved_n_processes) as executor, \
+         h5py.File(
+             partial_h5_path, h5_mode,
+             # The default chunk cache is 1 MiB, which cannot even hold a
+             # handful of the 147 KiB chunks below — every write would evict
+             # and re-read. 64 MiB holds ~430 of them; nslots is prime and
+             # ~10x the chunk count, per HDF5's own guidance.
+             rdcc_nbytes=_CHUNK_CACHE_BYTES, rdcc_nslots=4001,
+         ) as hdf5:
         if resuming:
             img_ds = hdf5["img"]
             sample_ds = hdf5["samples"]
@@ -495,7 +518,25 @@ def package_slides_to_h5(
             tile_ds = hdf5["tiles"]
         else:
             img_shape = (total_tiles, tile_size, tile_size, 3)
-            img_ds = hdf5.create_dataset("img", img_shape, maxshape=img_shape, dtype="uint8")
+            # chunks is set explicitly, and this is the single biggest
+            # throughput factor in this function. Passing maxshape without
+            # chunks forces a chunked layout and leaves h5py to guess the
+            # shape — and its guess targets ~1 MiB chunks by subdividing the
+            # *pixel* dimensions, e.g. (250, 14, 28, 1) for 4k tiles or
+            # (3125, 7, 14, 1) for 100k. Each such chunk spans thousands of
+            # images but a tiny patch of one channel, so writing one image
+            # became a read-modify-write across 384-1536 separate chunks:
+            # ~250x the necessary I/O at 4k tiles, ~3125x at 100k, and worse
+            # as the dataset grows. That is why packaging time exploded on
+            # large runs rather than scaling linearly.
+            #
+            # One tile per chunk makes a single image write exactly one chunk
+            # write, and is also the right shape for reads, since training
+            # reads individual tiles.
+            img_ds = hdf5.create_dataset(
+                "img", img_shape, maxshape=img_shape, dtype="uint8",
+                chunks=(1, tile_size, tile_size, 3),
+            )
             sample_ds = hdf5.create_dataset(
                 "samples", (total_tiles,), maxshape=(total_tiles,), dtype=sample_dtype
             )
@@ -523,8 +564,7 @@ def package_slides_to_h5(
         # index in the first place.
         write_index = len(completed_labels)
 
-        with ProcessPoolExecutor(max_workers=resolved_n_processes) as executor, \
-             open(ckpt["completed"], "a", encoding="utf-8") as completed_f, \
+        with open(ckpt["completed"], "a", encoding="utf-8") as completed_f, \
              open(ckpt["skipped"], "a", encoding="utf-8") as skipped_f:
             chunk_iter = iter(chunks)
 
@@ -544,28 +584,52 @@ def package_slides_to_h5(
                     chunk = in_flight.pop(future)
                     results = future.result()
 
+                    # Collect this chunk's successful tiles, then write them
+                    # as contiguous slices rather than one row at a time.
+                    # Every tile in a chunk lands at consecutive indices by
+                    # construction (write_index only ever advances), so a
+                    # slice assignment is equivalent to the per-row loop that
+                    # used to be here — but it replaces up to chunk_size
+                    # separate HDF5 calls, each with its own chunk lookup and
+                    # cache round trip, with four.
+                    imgs: list[np.ndarray] = []
+                    labels: list[str] = []
+                    samples: list[bytes] = []
+                    slides: list[bytes] = []
+                    tiles: list[bytes] = []
                     for (_, tile_label, sample, slide_id, col_row), img_array in zip(chunk, results):
                         if img_array is None:
                             skipped_tiles.append(tile_label)
                             skipped_f.write(tile_label + "\n")
                             continue
+                        imgs.append(img_array)
+                        labels.append(tile_label)
+                        samples.append(sample.encode("utf-8"))
+                        slides.append(slide_id.encode("utf-8"))
+                        tiles.append(col_row.encode("utf-8"))
 
-                        img_ds[write_index] = img_array
-                        sample_ds[write_index] = sample.encode("utf-8")
-                        slide_ds[write_index] = slide_id.encode("utf-8")
-                        tile_ds[write_index] = col_row.encode("utf-8")
-                        write_index += 1
-                        completed_f.write(tile_label + "\n")
+                    if imgs:
+                        end = write_index + len(imgs)
+                        img_ds[write_index:end] = np.stack(imgs)
+                        sample_ds[write_index:end] = np.array(samples, dtype=sample_dtype)
+                        slide_ds[write_index:end] = np.array(slides, dtype=slide_dtype)
+                        tile_ds[write_index:end] = np.array(tiles, dtype=tile_dtype)
+                        write_index = end
+                        # Recorded only after the .h5 writes above have
+                        # returned, so the checkpoint can never claim a tile
+                        # is durable before it actually is. The reverse order
+                        # would let a resume skip a tile that was never
+                        # written.
+                        completed_f.write("".join(label + "\n" for label in labels))
 
                     # Flushed per chunk, not per tile — a crash in the
-                    # narrow window between an h5 write above and this
-                    # flush can leave a handful of tiles (at most one
-                    # chunk's worth) written to the .h5 but not yet
-                    # recorded as done, so a resume would redecode and
-                    # rewrite them at a new index. That's a few duplicate
-                    # rows at worst, never data loss or corruption — an
-                    # acceptable trade for not fsync-ing on every single
-                    # tile across a run with millions of them.
+                    # narrow window between the h5 writes above and this
+                    # flush can leave at most one chunk's worth of tiles
+                    # written to the .h5 but not yet recorded as done, so a
+                    # resume would redecode and rewrite them at a new index.
+                    # That's a few duplicate rows at worst, never data loss
+                    # or corruption — an acceptable trade for not fsync-ing
+                    # on every single tile across a run with millions.
                     completed_f.flush()
                     skipped_f.flush()
 

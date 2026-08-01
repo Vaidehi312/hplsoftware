@@ -344,7 +344,15 @@ def submit_array(
     *,
     max_concurrent: int = 12,
     partition: str | None = None,
-    cpus: int = 4,
+    # One CPU per task, because tiling is single-threaded: neither
+    # auto_tile_from_mask.py nor tile_mask.py uses a thread pool, a process
+    # pool, or any cpu_count-driven parallelism, so the previous default of 4
+    # held four cores per slide to keep one busy. Beyond the waste, a 1-CPU
+    # task is far easier for the scheduler to backfill, so more of them run
+    # concurrently for the same share of the partition — which matters more
+    # for wall-clock than per-task speed, since throughput here is bounded by
+    # how many slides run at once, not how fast any one of them goes.
+    cpus: int = 1,
     memory: str = "24G",
     time_limit: str = "2-00:00:00",
     job_name: str = "wsi_mask_tile",
@@ -458,6 +466,17 @@ def submit_array(
 
     batches = [slides[i:i + batch_size] for i in range(0, len(slides), batch_size)]
 
+    # Slurm's "%N" array throttle applies per array job, not across a whole
+    # submission — so with the limit passed through unchanged to every batch,
+    # max_concurrent=12 across 14 batches meant up to 168 concurrent tasks,
+    # not 12. The effective ceiling silently scaled with dataset size (and,
+    # multiplied by cpus-per-task, with the core count requested), which made
+    # it both unpredictable and a good way to starve a shared partition.
+    # Divide it instead, so max_concurrent means what it says: the total
+    # number of tiling tasks running at once across every batch. Floor of 1
+    # per batch, since 0 would throttle a batch to nothing.
+    per_batch_concurrent = max(1, max_concurrent // len(batches))
+
     # A brief pause between submissions, on top of the retry-with-backoff
     # inside each one — firing many sbatch calls back-to-back with zero
     # gap can itself look like a burst to the controller, separate from how
@@ -481,7 +500,7 @@ def submit_array(
                 mask_dir=mask_dir,
                 tile_dir=tile_dir,
                 dataset_name=dataset_name,
-                max_concurrent=max_concurrent,
+                max_concurrent=per_batch_concurrent,
                 partition=partition,
                 cpus=cpus,
                 memory=memory,
@@ -524,6 +543,11 @@ def submit_array(
         "mask_dir": str(mask_dir),
         "tile_dir": str(tile_dir),
         "max_concurrent": max_concurrent,
+        # What each array job was actually throttled to, so the effective
+        # total (this x batch_count) is visible rather than having to be
+        # inferred from the sbatch command.
+        "per_batch_concurrent": per_batch_concurrent,
+        "cpus_per_task": cpus,
         "batch_size": batch_size,
         "batch_count": len(batches),
         "batches": batch_results,
@@ -727,7 +751,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--partition", default=None,
         help="Omit to let Slurm use the cluster's default partition.",
     )
-    parser.add_argument("--cpus", type=int, default=4)
+    # Matches submit_array()'s default — tiling is single-threaded, see there.
+    parser.add_argument("--cpus", type=int, default=1)
     parser.add_argument("--memory", default="24G")
     parser.add_argument("--time-limit", default="12:00:00")
     parser.add_argument("--job-name", default="wsi_mask_tile")

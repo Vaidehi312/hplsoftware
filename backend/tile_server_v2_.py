@@ -407,7 +407,61 @@ def _list_dataset_roots() -> list[str]:
     )
 
 
-_SACCT_ARRAY_TASK_RE = re.compile(r"^\d+_(\d+)\|(\S+)$")
+# Shapes sacct emits in its JobID column, all of which have to be told apart:
+#
+#   12345              a plain, non-array job
+#   12345_7            one task of an array job
+#   12345_[5-100]      a *pending* array range — one row standing for many
+#                      tasks, optionally "%throttle" or a comma list
+#   12345.batch        a job step; duplicates its parent's accounting and must
+#                      never be counted
+#
+# The previous single pattern (^\d+_(\d+)\|(\S+)$) matched only the second of
+# these. It silently dropped pending array ranges — so tiling could look
+# finished while tasks were still queued — and, because "(\S+)$" cannot span a
+# space, it also dropped every "CANCELLED by <uid>" row, hiding cancelled
+# tasks from the packaging guard that is supposed to block on them. Steps were
+# excluded only by accident, since "12345.batch" happens not to match; that is
+# now explicit, because the patterns below deliberately accept bare job IDs.
+_SACCT_ARRAY_TASK_RE = re.compile(r"^\d+_\d+$")
+_SACCT_ARRAY_RANGE_RE = re.compile(r"^\d+_\[(.+?)\]$")
+_SACCT_PLAIN_JOB_RE = re.compile(r"^\d+$")
+
+
+def _array_range_size(spec: str) -> int:
+    """How many array tasks a pending-range JobID stands for.
+
+    "5-100" -> 96, "5,7,9" -> 3, "5-10%2" -> 6 (the %N concurrency throttle
+    is not part of the task set). Counting the real span rather than treating
+    the row as a single task keeps the state totals meaningful — a run with
+    9,000 tasks still queued should not report one PENDING.
+    """
+    spec = spec.split("%", 1)[0]
+    total = 0
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        low, dash, high = part.partition("-")
+        if dash:
+            try:
+                total += int(high) - int(low) + 1
+                continue
+            except ValueError:
+                pass
+        total += 1
+    return max(total, 1)
+
+
+def _normalise_slurm_state(state: str) -> str:
+    """Bare state name, dropping any trailing detail sacct appends.
+
+    The one that matters is "CANCELLED by 1234" — sacct records who cancelled
+    a job, and callers compare against plain state names, so the suffix has to
+    come off for a cancelled task to be recognised as cancelled at all.
+    """
+    state = state.strip()
+    return state.split()[0] if state else ""
 
 # squeue exits non-zero when asked about a job ID it has no record of. That's
 # a real answer ("not live"), not a failure, and has to be told apart from an
@@ -511,10 +565,23 @@ def _get_slurm_array_state_counts(job_ids: list[str]) -> dict[str, int] | None:
 
     counts: dict[str, int] = {}
     for line in result.stdout.splitlines():
-        match = _SACCT_ARRAY_TASK_RE.match(line.strip())
-        if match:
-            state = match.group(2)
+        job_field, separator, state_field = line.strip().partition("|")
+        if not separator:
+            continue
+        job_field = job_field.strip()
+        if "." in job_field:
+            # A job step ("12345.batch", "12345_5.extern"). These repeat their
+            # parent's state, so counting them would inflate every total.
+            continue
+        state = _normalise_slurm_state(state_field)
+        if not state:
+            continue
+        if _SACCT_ARRAY_TASK_RE.match(job_field) or _SACCT_PLAIN_JOB_RE.match(job_field):
             counts[state] = counts.get(state, 0) + 1
+            continue
+        pending_range = _SACCT_ARRAY_RANGE_RE.match(job_field)
+        if pending_range:
+            counts[state] = counts.get(state, 0) + _array_range_size(pending_range.group(1))
     if counts:
         return counts
 
@@ -552,8 +619,13 @@ def _get_slurm_job_state(job_id: str) -> str | None:
 
     for line in result.stdout.splitlines():
         parts = line.strip().split("|")
+        # Normalised for the same reason as the array counts above: an
+        # un-normalised "CANCELLED by 1234" matches neither "COMPLETED" nor
+        # any entry in IN_FLIGHT_SLURM_STATES, so it happened to be treated as
+        # failed — right answer, but by accident, and it surfaced the raw uid
+        # in user-facing messages.
         if len(parts) == 2 and parts[0] == job_id:
-            return parts[1]
+            return _normalise_slurm_state(parts[1])
 
     live_states = _slurm_jobs_live_states([job_id])
     if live_states is None:

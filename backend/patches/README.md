@@ -27,15 +27,28 @@ that happens — run it after any pull.
 
 ## hpl-encode-io.patch
 
-Throughput of `real_encode_contrastive_from_checkpoint` in
+The complete delta from upstream, in two parts.
+
+**Throughput** of `real_encode_contrastive_from_checkpoint` in
 `models/evaluation/features.py`: overlaps tile reads with the forward pass,
 writes latents one slice per batch instead of one row per tile, and reads as
 float32 rather than float64.
 
-Changes no embedding — see `backend/tests/test_encode_loop_equivalence.py`,
-and the reasoning in the commit message inside the patch.
+**Sharding**: `--row_start` / `--row_stop` on
+`run_representationspathology_projection.py`, so N jobs can encode disjoint
+row ranges of one input concurrently, each into its own
+`<name>.rows<lo>-<hi>.h5`. Reassembled by `backend/merge_projection_shards.py`.
+This is what makes the decode parallel — h5py serialises HDF5 calls on a
+global lock, so threads within one process cannot.
 
-**Already applied in the subtree.** Base: upstream `aec5145`.
+Changes no embedding. See `backend/tests/test_encode_loop_equivalence.py` for
+the encoding loop and `backend/tests/test_shard_merge.py` for the split and
+merge.
+
+**Already applied in the subtree.** Base: upstream `aec5145`. Verified to
+reproduce the subtree byte-for-byte when applied to a pristine clone of that
+commit — paths are relative to the HPL repo root, so it can also go to Kai
+as-is.
 
 To re-apply it after a `subtree pull` reverted it, from the repo root:
 

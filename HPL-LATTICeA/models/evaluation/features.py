@@ -5,8 +5,10 @@ from models.utils import *
 import tensorflow as tf
 import numpy as np
 import matplotlib
+import threading
 import random
 import shutil
+import queue
 import h5py
 import os
 
@@ -856,54 +858,105 @@ def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoi
 							print('Number of Real Images:', num_samples)
 							print('Starting encoding...')
 
+							# Batches are read on a background thread so decoding the
+							# next one overlaps the current one's forward pass. This
+							# matters more than it looks: the packaged .h5 stores one
+							# tile per gzip chunk, so reading a batch is `batches`
+							# separate decompressions, and measured on 224x224x3 tiles
+							# that caps a single reader near 1.3k tiles/s regardless of
+							# batch size — slower than the H200 encodes them. Without
+							# the overlap the GPU idles through every one of those reads.
+							#
+							# One reader thread, not several: h5py serialises all HDF5
+							# calls on a global lock, so extra threads do not decompress
+							# in parallel (measured: 8 threads bought 10%). Parallel
+							# decode needs separate processes — i.e. splitting the
+							# dataset across independent jobs.
+							#
+							# Depth 2 holds one batch in flight and one being built. At
+							# batch 512 that is ~300 MB per queued batch of float32.
+							batch_queue = queue.Queue(maxsize=2)
+							reader_error = []
+
+							def _read_batches():
+								# Any failure has to reach the main thread. A reader that
+								# died quietly would be indistinguishable from a short
+								# dataset, and would silently truncate the output.
+								try:
+									for start in range(0, num_samples, batches):
+										stop = min(start + batches, num_samples)
+										# float32 on read rather than letting `/255.`
+										# produce float64: the placeholder is float32, so
+										# the wider intermediate is 4x the host memory
+										# traffic for precision discarded on the next line.
+										# Bit-identical — all 256 possible uint8/255 values
+										# round to the same float32 either way.
+										batch = hdf5_file[key][start:stop, :, :, :].astype(np.float32)/np.float32(255.)
+										batch_queue.put((start, stop, batch))
+								except BaseException as e:
+									reader_error.append(e)
+								finally:
+									batch_queue.put(None)
+
+							reader = threading.Thread(target=_read_batches)
+							reader.daemon = True
+							reader.start()
+
+							if 'ContrastivePathology_SwAV' in model.model_name:
+								outputs_model = [model.h_rep_out, model.z_rep_out, model.z_norm_out, model.prot_out]
+							else:
+								outputs_model = [model.h_rep_out, model.z_rep_out]
+
 							ind = 0
-							while ind < num_samples:					
-								# Image batch construction.
-								if (ind + batches) < num_samples:
-									real_img_batch = hdf5_file[key][ind: ind+batches, :, :, :]/255.
-									
-								else:
-									real_img_batch = hdf5_file[key][ind:, :, :, :]/255.
+							next_report = 10000
+							while True:
+								item = batch_queue.get()
+								if item is None:
+									break
+								start, stop, real_img_batch = item
+
 								# Encode real images into W latent space.
 								feed_dict = {model.real_images_2:real_img_batch}
-								if 'ContrastivePathology_SwAV' in model.model_name:
-									outputs_model = [model.h_rep_out, model.z_rep_out, model.z_norm_out, model.prot_out]
-								else:
-									outputs_model = [model.h_rep_out, model.z_rep_out]
 								outputs = session.run(outputs_model, feed_dict=feed_dict)
-								# Save batch samples into storage.
-								for i in range(batches):
-									if ind == num_samples:
-										break
-									h_storage[ind] = outputs[0][i, :]
-									z_storage[ind] = outputs[1][i, :]
-									if 'ContrastivePathology_SwAV' in model.model_name:
-										z_norm_storage[ind] = outputs[2][i, :]
-										prot_storage[ind]   = outputs[3][i, :]
-									if save_img: img_storage[ind] = real_img_batch[i, :, :, :]
-									ind += 1
-								# Report progress.
-								if ind%10000==0: print('Processed', ind, 'images')
+
+								# Save batch samples into storage. One slice per batch
+								# rather than a row at a time: the per-row form issued two
+								# HDF5 calls per tile and measured ~23k tiles/s against
+								# ~150k for this, for byte-identical output.
+								h_storage[start:stop] = outputs[0]
+								z_storage[start:stop] = outputs[1]
+								if 'ContrastivePathology_SwAV' in model.model_name:
+									z_norm_storage[start:stop] = outputs[2]
+									prot_storage[start:stop]   = outputs[3]
+								if save_img: img_storage[start:stop] = real_img_batch
+
+								# Report progress. Against a running threshold because
+								# `ind` now advances a batch at a time and would step
+								# straight over an `ind%10000==0` test for most batch sizes.
+								ind = stop
+								if ind >= next_report:
+									print('Processed', ind, 'images', flush=True)
+									next_report += 10000
+
+							reader.join()
+							if reader_error:
+								raise reader_error[0]
+							# The output datasets were sized from the input, so a short
+							# read leaves zero-filled rows in a file that still validates
+							# as complete. Refuse to let that pass silently.
+							if ind != num_samples:
+								raise RuntimeError('Encoded %s of %s images — output is incomplete.' % (ind, num_samples))
 							print(ind, 'Encoded Images')
 					# Carry on any other dataset.
 					else:
 						storage = hdf5_file_w.create_dataset(name=key, shape=key_shape, dtype=dtype)
-						ind = 0
-						while ind < num_samples:
-							# Real images.
-							if (ind + batches) < num_samples:
-								info_batch = hdf5_file[key][ind:ind+batches]
-							else:
-								info_batch = hdf5_file[key][ind:]
-
-							# Fill in storage for latent and image.
-							for i in range(batches):
-								if ind == num_samples:
-									break
-
-								# Reconstructed images.
-								storage[ind] = info_batch[i]
-								ind += 1
+						# Copied a slice at a time rather than a row at a time, for
+						# the same reason as the latents above. These datasets are
+						# small next to the images, but the per-row form cost one
+						# HDF5 call per tile per dataset and bought nothing.
+						for start in range(0, num_samples, batches):
+							stop = min(start + batches, num_samples)
+							storage[start:stop] = hdf5_file[key][start:stop]
 	# H5 File already created.													
 	else:
 		# Retrieve number of samples.

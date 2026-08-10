@@ -1,12 +1,29 @@
 # Patches to HPL-LATTICeA
 
-`HPL-LATTICeA` is a clone of [K-Rakovic/HPL-LATTICeA](https://github.com/K-Rakovic/HPL-LATTICeA),
-not part of this repository — it is untracked here and carries its own git
-history. Changes made inside that clone are invisible to this repo, and a
-fresh clone on a new machine silently loses them.
+`HPL-LATTICeA/` is a **git subtree** of
+[K-Rakovic/HPL-LATTICeA](https://github.com/K-Rakovic/HPL-LATTICeA), imported
+squashed from upstream `master` (`aec5145`). Its files are tracked in this
+repository like any others — cloning this repo gets you the encoder, and our
+changes to it are ordinary commits. There is no separate clone to keep in sync
+and nothing to re-apply after checkout.
 
-So each change we depend on lives here as a patch file as well as on a branch
-in the clone. The patch is the copy that survives.
+The patches here are therefore **not** how the change reaches your working
+tree. They are kept for two things: sending the change upstream to Kai, and
+re-applying it by hand if a `git subtree pull` ever clobbers it.
+
+## Working with the subtree
+
+```bash
+# Pull upstream changes in (from the repo root, working tree clean):
+git subtree pull --prefix=HPL-LATTICeA hpl master --squash
+
+# The remote, if it is not configured on a fresh clone:
+git remote add hpl https://github.com/K-Rakovic/HPL-LATTICeA.git
+```
+
+A `subtree pull` can revert our encoder change if upstream has touched the
+same lines. `backend/tests/test_encode_loop_equivalence.py` fails loudly when
+that happens — run it after any pull.
 
 ## hpl-encode-io.patch
 
@@ -18,24 +35,17 @@ float32 rather than float64.
 Changes no embedding — see `backend/tests/test_encode_loop_equivalence.py`,
 and the reasoning in the commit message inside the patch.
 
-Apply to a fresh clone:
+**Already applied in the subtree.** Base: upstream `aec5145`.
+
+To re-apply it after a `subtree pull` reverted it, from the repo root:
 
 ```bash
-cd $HPL_REPO_DIR
-git apply --check ../backend/patches/hpl-encode-io.patch   # dry run
-git apply         ../backend/patches/hpl-encode-io.patch
+git apply --directory=HPL-LATTICeA --check backend/patches/hpl-encode-io.patch  # dry run
+git apply --directory=HPL-LATTICeA       backend/patches/hpl-encode-io.patch
 ```
 
-Or, to keep it as a commit with its message intact:
+`--directory` is needed because the patch is written against the HPL repo
+root, while the files now live one level down under `HPL-LATTICeA/`.
 
-```bash
-git am ../backend/patches/hpl-encode-io.patch
-```
-
-Verify afterwards with `python backend/tests/test_encode_loop_equivalence.py`,
-whose last test reads the patched file and fails if the per-row writes came
-back (e.g. after a `git pull` from upstream).
-
-If upstream has moved and the patch no longer applies, `git apply -3` will
-attempt a three-way merge; the branch `perf/encode-io` in the clone holds the
-same change if you need to rebase it by hand.
+If upstream has moved and it no longer applies, `git apply -3` will attempt a
+three-way merge.

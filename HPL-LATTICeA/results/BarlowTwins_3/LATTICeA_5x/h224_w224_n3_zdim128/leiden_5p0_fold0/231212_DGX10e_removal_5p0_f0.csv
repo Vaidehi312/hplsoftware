@@ -1,0 +1,109 @@
+﻿cluster,description,remove
+0,acinar and papillary with columnar cells ,
+1,loose stroma with sparse tumour,
+2,inflamed thickened lung,
+3,mucinous,
+4,"open, emphysematous lung",
+5,loose stroma  ,
+6,background,1
+7,mildly fibrotic lung,
+8,infiltrative tumour,
+9,background,1
+10,mildly fibrotic lung,
+11,infiltrative high grade tumour,
+12,mpap,
+13,infallmed areas with tumour,
+14,tumour with necrosis,
+15,haemorrhagic lung,
+16,background,1
+17,"inflamed stroma, little tumour",
+18,fibrotic lung,
+19,edge,1
+20,haemorrhagic thickened lung,
+21,collapsed lung,
+22,open normal lung,
+23,complex acinar,
+24,moderately collagenous stroma,
+25,collapsed lung,
+26,loose vascularised stroma,
+27,infiltrative tumour,
+28,background,1
+29,background,1
+30,disrupted tissue,1
+31,infiltrative tumour with collageous stroma,
+32,sheets of high grade tumour,
+33,background,1
+34,inflamed stroma  ,
+35,normal lung,
+36,large vessels,
+37,bronchial wall,
+38,infiltrative tumour with collageous stroma,
+39,lepidic,
+40,necrosis,
+41,intraalveolar mucin,
+42,background,1
+43,inflamed acinar,
+44,normal lung,
+45,plaque like,
+46,edge,1
+47,background,1
+48,inflamed and solid,
+49,inflamed and ciomplex acinar,
+50,background,1
+51,acinar clear cells,
+52,solid retraction artefact,
+53,edge,1
+54,large vessels,
+55,lepidic,
+56,sweeping stroma,
+57,stroma with pigment,
+58,background,1
+59,disrupted tissue,1
+60,lepidic and insterstitial expansion,
+61,solid retraction artefact,
+62,compressed lepidic,
+63,burnt out stroma,
+64,complex acinar,
+65,adipose tissue,
+66,TLS,
+67,sheets of inflamed tumour,
+68,v inflame stroma,
+69,TLS,
+70,broad papillary and lepidic,
+71,cribriform,
+72,background,1
+73,background,1
+74,out of focus,1
+75,inflameds disrupted tumour,
+76,necrosis,
+77,stroma with necrosis,
+78,anthracotic pigment,
+79,edge,1
+80,slide edge,1
+81,tumour with pigment,
+82,invasive tumour,
+83,solid and cribriform,
+84,anthracotic pigment,
+85,background,1
+86,fibrotic lung,
+87,necrosis,
+88,papillary and mpap,
+89,pigment and stroma,
+90,mostly vessel lumina,
+91,compressed lung,
+92,ink,1
+93,blood,
+94,artefact,1
+95,vessel and thickened lung,
+96,cartilage,
+97,infiltrative tumour,
+98,peribronchial glands,
+99,haemorrhagic tissue,
+100,edge,1
+101,inflamed stroma,
+102,slide edge,1
+103,sheets of inflamed tumour,
+104,TLS,
+105,ink,1
+106,cartilage,
+107,air bubble,1

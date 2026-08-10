@@ -1,0 +1,10 @@
+{
+    "output_path":"/nfs/home/users/krakovic/sharedscratch/datasets/LATTICeA/tiles/",
+    "tile_size":224,
+    "pixel_size":1.8,
+    "magnification":5,
+    "background":40,
+    "img_ext":".ndpi",
+    "sampleID":8,
+    "slideID":16
+}

@@ -804,7 +804,7 @@ def discriminator_features_from_checkpoint(model, data, data_out_path, checkpoin
 	return hdf5_path, num_samples
 
 
-def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoint, real_hdf5, batches=50, save_img=False):
+def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoint, real_hdf5, batches=50, save_img=False, row_start=None, row_stop=None):
 	# Directory handling.
 	path = os.path.join(data_out_path, 'results')
 	path = os.path.join(path, model.model_name)
@@ -817,8 +817,38 @@ def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoi
 		print('H5 File not found:', real_hdf5)
 		exit()
 
+	# Row range handling. row_start/row_stop let several jobs encode disjoint
+	# slices of the *same* input file concurrently, which is the only way to
+	# parallelise the gzip decode that bounds this function — h5py serialises
+	# HDF5 calls on a global lock, so threads within one process cannot. Every
+	# shard opens the input read-only, which HDF5 permits; nothing here writes
+	# to it.
+	#
+	# Each shard writes its own part file. backend/merge_projection_shards.py
+	# concatenates them into the single file the rest of the pipeline expects,
+	# and refuses unless the parts tile the input exactly.
+	sharded = row_start is not None or row_stop is not None
+	row_lo, row_hi = 0, None
+	if sharded:
+		with h5py.File(real_hdf5, mode='r') as probe:
+			image_keys = [k for k in probe.keys() if 'image' in k or 'img' in k]
+			if len(image_keys) != 1:
+				print('Expected exactly one image dataset, found:', image_keys)
+				exit()
+			total_rows = probe[image_keys[0]].shape[0]
+		row_lo = 0 if row_start is None else max(0, min(int(row_start), total_rows))
+		row_hi = total_rows if row_stop is None else max(row_lo, min(int(row_stop), total_rows))
+		if row_lo == row_hi:
+			print('Empty row range [%s, %s) - nothing to encode.' % (row_lo, row_hi))
+			exit()
+
 	# Extracting name for projections.
 	name_file = real_hdf5.split('/')[-1]
+	if sharded:
+		# The range goes in the filename rather than a bare shard index: the
+		# merge step reads these bounds back off the parts, so a part is checked
+		# against where it claims to belong instead of trusted by position.
+		name_file = name_file.replace('.h5', '') + '.rows%s-%s.h5' % (row_lo, row_hi)
 	hdf5_path = os.path.join(path, name_file)
 	# Check if file is already there.
 	print('H5 Projections file path:', hdf5_path)
@@ -831,9 +861,15 @@ def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoi
 				# Iterate through H5 datasets.
 				for key in hdf5_file.keys():
 					print('\t Key: %s' % key)
-					key_shape = hdf5_file[key].shape
 					dtype = hdf5_file[key].dtype
-					num_samples = key_shape[0]
+					# Every dataset in the packaged .h5 is one row per tile, so one
+					# slice applies to all of them. Clamped per key rather than taken
+					# on trust: a carried dataset shorter than the images would
+					# otherwise be read past its end.
+					lo = min(row_lo, hdf5_file[key].shape[0])
+					hi = hdf5_file[key].shape[0] if row_hi is None else min(row_hi, hdf5_file[key].shape[0])
+					num_samples = hi - lo
+					key_shape = (num_samples,) + tuple(hdf5_file[key].shape[1:])
 
 					# Processing the image dataset.
 					if 'image' in key or 'img' in key:
@@ -891,7 +927,7 @@ def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoi
 										# traffic for precision discarded on the next line.
 										# Bit-identical — all 256 possible uint8/255 values
 										# round to the same float32 either way.
-										batch = hdf5_file[key][start:stop, :, :, :].astype(np.float32)/np.float32(255.)
+										batch = hdf5_file[key][lo+start:lo+stop, :, :, :].astype(np.float32)/np.float32(255.)
 										batch_queue.put((start, stop, batch))
 								except BaseException as e:
 									reader_error.append(e)
@@ -956,7 +992,7 @@ def real_encode_contrastive_from_checkpoint(model, data, data_out_path, checkpoi
 						# HDF5 call per tile per dataset and bought nothing.
 						for start in range(0, num_samples, batches):
 							stop = min(start + batches, num_samples)
-							storage[start:stop] = hdf5_file[key][start:stop]
+							storage[start:stop] = hdf5_file[key][lo+start:lo+stop]
 	# H5 File already created.													
 	else:
 		# Retrieve number of samples.

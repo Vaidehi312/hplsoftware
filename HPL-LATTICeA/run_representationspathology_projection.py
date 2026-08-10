@@ -24,6 +24,8 @@ parser.add_argument('--model',         dest='model',         type=str,          
 parser.add_argument('--main_path',     dest='main_path',     type=str,            default=None,                   help='Path for the output run.')
 parser.add_argument('--dbs_path',      dest='dbs_path',      type=str,            default=None,                   help='Directory with DBs to use.')
 parser.add_argument('--save_img',      dest='save_img',      action='store_true', default=False,                  help='Save reconstructed images in the H5 file.')
+parser.add_argument('--row_start',     dest='row_start',     type=int,            default=None,                   help='First tile to encode. With --row_stop, encodes a slice of the input into its own part file, so several jobs can split one .h5 between them.')
+parser.add_argument('--row_stop',      dest='row_stop',      type=int,            default=None,                   help='One past the last tile to encode. See --row_start.')
 args           = parser.parse_args()
 checkpoint     = args.checkpoint
 real_hdf5      = args.real_hdf5
@@ -38,6 +40,8 @@ model          = args.model
 main_path      = args.main_path
 dbs_path       = args.dbs_path
 save_img       = args.save_img
+row_start      = args.row_start
+row_stop       = args.row_stop
 
 # Main paths for data output and databases.
 if main_path is None:
@@ -92,4 +96,4 @@ with tf.Graph().as_default():
 	contrast_pathology = RepresentationsPathology(data=data, z_dim=z_dim, layers=layers, beta_1=beta_1, init=init, regularizer_scale=regularizer_scale, spectral=spectral, attention=attention, learning_rate_e=learning_rate_e, model_name=model)
 	
 	# Run projections into H5.
-	real_encode_contrastive_from_checkpoint(model=contrast_pathology, data=data, data_out_path=main_path, checkpoint=checkpoint, real_hdf5=real_hdf5, batches=batch_size, save_img=save_img)
+	real_encode_contrastive_from_checkpoint(model=contrast_pathology, data=data, data_out_path=main_path, checkpoint=checkpoint, real_hdf5=real_hdf5, batches=batch_size, save_img=save_img, row_start=row_start, row_stop=row_stop)

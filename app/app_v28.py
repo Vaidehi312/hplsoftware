@@ -2308,9 +2308,19 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
         return
 
     if state == "blocked":
+        # Blocked only means *this run's* tracked extraction has not produced a
+        # usable output. Assigning an existing projections file by path does not
+        # depend on that at all, and returning here would have made embeddings
+        # that already exist on disk unreachable from the UI — the exact case of a
+        # subset encoded before the run was being tracked.
         st.caption(
-            "Needs feature extraction to finish first — cluster assignment reads "
-            "those embeddings."
+            "This run has no finished feature extraction yet, so there is nothing "
+            "tracked to assign. If you already have a projections .h5 on disk, "
+            "assign it directly:"
+        )
+        _render_assign_clusters_form(
+            status, submission_id, key_prefix,
+            button_label="Assign clusters for this .h5", test_only=True,
         )
         return
 
@@ -2333,7 +2343,8 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
 
 
 def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: str,
-                                 button_label: str = "Start cluster assignment"):
+                                 button_label: str = "Start cluster assignment",
+                                 test_only: bool = False):
     """Reference + backend inputs for Stage 4.
 
     The reference is left blank by default on purpose: it is a deployment-level
@@ -2342,12 +2353,17 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
     real thing to want, and because a run assigned against the wrong one looks
     completely healthy.
     """
-    mode = st.radio(
-        "Run",
-        ["Full dataset", "Test on a sample .h5"],
-        horizontal=True,
-        key=f"{key_prefix}assign_mode_{submission_id}",
-    )
+    # test_only when the run has no tracked projections file: offering "Full
+    # dataset" there would be a button whose only outcome is a 400.
+    if test_only:
+        mode = "Test on a sample .h5"
+    else:
+        mode = st.radio(
+            "Run",
+            ["Full dataset", "Test on a sample .h5"],
+            horizontal=True,
+            key=f"{key_prefix}assign_mode_{submission_id}",
+        )
 
     with st.expander("Options", expanded=False):
         reference = st.text_input(

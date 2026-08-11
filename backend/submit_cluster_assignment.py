@@ -100,6 +100,24 @@ def check_reference(reference: Path) -> dict:
             f"Or set {_REFERENCE_ENV} to an existing one."
         )
 
+    # The .h5ad is the *source* for the reference, not the reference. Pointing
+    # at it is the natural mistake — it is the file you have, its name contains
+    # "leiden_2p5__fold2", and the UI asks for a path. numpy's own complaint
+    # ("This file contains pickled (object) data") describes the byte format it
+    # failed to parse and says nothing about the missing build step, so the case
+    # is detected here and named.
+    with reference.open("rb") as fh:
+        magic = fh.read(8)
+    if magic == b"\x89HDF\r\n\x1a\n" or reference.suffix == ".h5ad":
+        raise ValueError(
+            f"{reference} is an HDF5/.h5ad file, not a reference .npz. The .h5ad is "
+            f"what the reference is *built from* — convert it once:\n"
+            f"  python build_hpc_reference.py \\\n"
+            f"      --h5ad {reference} \\\n"
+            f"      --out {_reference_path().name}\n"
+            f"then leave the reference field blank to use it, or give the .npz path."
+        )
+
     import numpy as np
     try:
         with np.load(reference, allow_pickle=False) as npz:

@@ -2366,6 +2366,9 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
             "Reference .npz (blank = the server's configured reference)",
             key=f"{key_prefix}assign_reference_{submission_id}",
             placeholder="hpc_reference_leiden_2p5_fold2.npz",
+            help="The .npz built by build_hpc_reference.py — NOT the Leiden .h5ad "
+                 "it is built from. Leave blank unless you are deliberately "
+                 "comparing two references.",
         )
         backend = st.selectbox(
             "Search backend",

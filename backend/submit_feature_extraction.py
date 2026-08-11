@@ -26,7 +26,8 @@ multi-hour "GPU job" that never used a GPU. The NGC 23.03-tf1-py3 image
 ships TF 1.15.5 + CUDA 12.1 and supports Hopper.
 
 The job also fails fast if TensorFlow does not register a GPU after
-allocation: better to burn one minute of queue than twelve hours of CPU.
+allocation: better to burn one minute of queue than the two-day walltime on
+CPU. That guard is worth more now than it was at a twelve-hour limit.
 It fails fast on a missing container package for the same reason — the NGC
 image is not built for this repo and is missing scikit-image, which the repo
 imports at module scope (models/data_augmentation.py). That import happens
@@ -155,6 +156,17 @@ _REQUIRED_CONTAINER_MODULES = ("skimage.color", "skimage.io")
 # normalisation uses stored moving averages rather than batch statistics, and
 # every tile's output is independent of what else is in its batch.
 _DEFAULT_BATCH_SIZE = 256
+
+# Slurm walltime for the encode job, in Slurm's D-HH:MM:SS form. Two days
+# rather than twelve hours because the encoder has no resume: it opens its
+# output with mode='w' and starts from row zero, so a run killed by the wall
+# clock at 99% has produced nothing and costs the entire allocation again.
+# Overshooting the limit is close to free by comparison — Slurm bills what is
+# used, and the only real cost is a worse position in the backfill queue.
+#
+# Sharded runs inherit this per array task, which is the right unit: each task
+# encodes 1/N of the input, so N shards do not need N times the walltime.
+_DEFAULT_TIME_LIMIT = "2-00:00:00"
 
 
 def expected_extraction_output_path(
@@ -774,7 +786,7 @@ def submit_feature_extraction_job(
     gres: str = GPU_GRES,
     cpus: int = 8,
     memory: str = "64G",
-    time_limit: str = "12:00:00",
+    time_limit: str = _DEFAULT_TIME_LIMIT,
     job_name: str = "hpl_feature_extraction",
     notify_email: str | None = None,
     clear_stale_output: bool = True,
@@ -1047,7 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gres", type=str, default=GPU_GRES)
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--memory", type=str, default="64G")
-    parser.add_argument("--time-limit", type=str, default="12:00:00")
+    parser.add_argument("--time-limit", type=str, default=_DEFAULT_TIME_LIMIT)
     parser.add_argument("--notify-email", type=str, default=None)
     parser.add_argument(
         "--keep-stale-output",

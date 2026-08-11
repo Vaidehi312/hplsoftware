@@ -456,6 +456,23 @@ def test_probe_runs_before_the_encoder(tmp_path):
     assert "set -euo pipefail" in cmd
 
 
+def test_walltime_is_two_days_and_reaches_sbatch(tmp_path):
+    """The encoder has no resume — it opens its output with mode='w' and starts
+    from row zero — so a run killed by the wall clock at 99% has produced
+    nothing and costs the whole allocation again. Overshooting the limit only
+    costs backfill position, since Slurm bills what is used."""
+    del tmp_path
+    from submit_feature_extraction import _DEFAULT_TIME_LIMIT, build_parser
+
+    assert _DEFAULT_TIME_LIMIT == "2-00:00:00", _DEFAULT_TIME_LIMIT
+    # Both entry points, so the CLI and the server-side call agree.
+    assert build_parser().get_default("time_limit") == _DEFAULT_TIME_LIMIT
+    import inspect
+    from submit_feature_extraction import submit_feature_extraction_job
+    got = inspect.signature(submit_feature_extraction_job).parameters["time_limit"].default
+    assert got == _DEFAULT_TIME_LIMIT, got
+
+
 def test_container_flags_present(tmp_path):
     """--nv injects the driver's libcuda; without it the container sees no GPU
     at all. --cleanenv keeps the host's CUDA 10 stubs out of LD_LIBRARY_PATH,

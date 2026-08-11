@@ -282,6 +282,61 @@ def test_csv_merge_rejects_mismatched_columns(tmp_path):
     _merge_fails(final, contains="not parts of one run", expected_rows=200)
 
 
+def test_reference_keys_match_the_builder(tmp_path):
+    """submit_cluster_assignment.check_reference validates the .npz before
+    queueing. It once required a "labels" key the builder has never written, so
+    a correctly built 2.5M-tile reference was rejected as malformed.
+
+    Round-tripping through the real build_hpc_reference.save() is what keeps the
+    reader and the writer in step — listing the keys in both places is how they
+    drifted in the first place.
+    """
+    import build_hpc_reference
+    from submit_cluster_assignment import check_reference
+
+    out = tmp_path / "ref.npz"
+    build_hpc_reference.save(
+        {
+            "reference": np.zeros((100, NCOMP), np.float32),
+            "components": np.zeros((DIM, NCOMP), np.float32),
+            "codes": np.arange(100, dtype=np.int64) % NCLUST,
+            "categories": [str(i) for i in range(NCLUST)],
+            "n_neighbors": 250,
+            "groupby": "leiden_2.5",
+            "source": "synthetic",
+            "mean": None,
+        },
+        out,
+    )
+
+    info = check_reference(out)
+    assert info["reference_rows"] == 100
+    assert info["reference_dims"] == NCOMP
+    assert info["n_clusters"] == NCLUST
+    assert info["groupby"] == "leiden_2.5"
+    assert info["k"] == 250
+    # This reference stores no mean, so --centering reference is unavailable and
+    # sharding must go through --query-mean.
+    assert info["has_mean"] is False
+
+    # And with a mean, it is reported.
+    out2 = tmp_path / "ref_mean.npz"
+    build_hpc_reference.save(
+        {
+            "reference": np.zeros((100, NCOMP), np.float32),
+            "components": np.zeros((DIM, NCOMP), np.float32),
+            "codes": np.arange(100, dtype=np.int64) % NCLUST,
+            "categories": [str(i) for i in range(NCLUST)],
+            "n_neighbors": 250,
+            "groupby": "leiden_2.5",
+            "source": "synthetic",
+            "mean": np.zeros(DIM, np.float32),
+        },
+        out2,
+    )
+    assert check_reference(out2)["has_mean"] is True
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

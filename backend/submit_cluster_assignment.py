@@ -67,6 +67,13 @@ _REFERENCE_ENV = "HPC_REFERENCE_PATH"
 # into a hard dependency. Whether it was actually used is reported by the job.
 _REQUIRED_MODULES = ("numpy", "pandas", "h5py")
 
+# Exactly what build_hpc_reference.save() writes. Listed rather than guessed:
+# an earlier version of this check looked for a "labels" key that the builder
+# has never written, so a perfectly good reference was rejected as malformed.
+# test_reference_keys_match_the_builder keeps the two in step by round-tripping
+# through the real save().
+_REFERENCE_KEYS = {"reference", "components", "codes", "categories", "n_neighbors", "meta"}
+
 
 def _reference_path(explicit: Path | None = None) -> Path:
     if explicit is not None:
@@ -118,21 +125,36 @@ def check_reference(reference: Path) -> dict:
             f"then leave the reference field blank to use it, or give the .npz path."
         )
 
+    import json
+
     import numpy as np
     try:
         with np.load(reference, allow_pickle=False) as npz:
             keys = set(npz.files)
-            missing = {"reference", "components", "labels"} - keys
+            missing = _REFERENCE_KEYS - keys
             if missing:
                 raise ValueError(
-                    f"{reference} is missing {sorted(missing)} — it does not look "
-                    f"like a build_hpc_reference.py artifact. Rebuild it."
+                    f"{reference} is missing {sorted(missing)} (it has {sorted(keys)}) "
+                    f"— it does not look like a build_hpc_reference.py artifact. "
+                    f"Rebuild it."
                 )
+            meta = {}
+            try:
+                meta = json.loads(str(npz["meta"]))
+            except (ValueError, TypeError):
+                pass
             info = {
                 "reference_path": str(reference),
                 "reference_rows": int(npz["reference"].shape[0]),
                 "reference_dims": int(npz["reference"].shape[1]),
-                "n_clusters": int(len(set(npz["labels"].tolist()))),
+                "n_clusters": int(len(npz["categories"])),
+                "groupby": meta.get("groupby"),
+                "k": int(npz["n_neighbors"]),
+                # No stored mean means --centering reference is unavailable, so
+                # sharding has to go through --query-mean rather than the
+                # shard-independent reference frame. Worth surfacing, since the
+                # alternative is finding out from a failed job.
+                "has_mean": "mean" in keys,
             }
     except (OSError, ValueError) as e:
         if isinstance(e, ValueError) and "does not look like" in str(e):

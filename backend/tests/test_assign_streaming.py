@@ -222,27 +222,6 @@ def test_partial_output_is_not_left_behind(tmp_path):
     assert not out.with_name(out.name + ".partial").exists()
 
 
-# --- standalone runner ---------------------------------------------------
-
-def main():
-    tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_")]
-    failures = []
-    for name, fn in tests:
-        tmp_path = Path(tempfile.mkdtemp(prefix="hpl_assign_test_"))
-        try:
-            fn(tmp_path)
-            print(f"PASS  {name}")
-        except Exception as e:
-            failures.append(name)
-            print(f"FAIL  {name}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
-    return 1 if failures else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 # --- merging the shards --------------------------------------------------
 # Same failure shapes as test_shard_merge.py covers for the HDF5 merge. A CSV
 # concatenation is simpler but fails identically: joined across a gap or over a
@@ -301,3 +280,24 @@ def test_csv_merge_rejects_mismatched_columns(tmp_path):
     _write_csv_parts(final, [(0, 100)])
     _write_csv_parts(final, [(100, 200)], header="a,b,different")
     _merge_fails(final, contains="not parts of one run", expected_rows=200)
+
+
+# --- standalone runner ---------------------------------------------------
+
+def main():
+    tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_")]
+    failures = []
+    for name, fn in tests:
+        tmp_path = Path(tempfile.mkdtemp(prefix="hpl_assign_test_"))
+        try:
+            fn(tmp_path)
+            print(f"PASS  {name}")
+        except Exception as e:
+            failures.append(name)
+            print(f"FAIL  {name}: {type(e).__name__}: {e}")
+    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

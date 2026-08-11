@@ -141,6 +141,12 @@ _CONTAINER_EXTRA_PACKAGES = (
     "tifffile",
     "PyWavelets",
     "packaging",
+    # For Stage 4. Measured on the real reference shape (360,667 x 128, k=250),
+    # faiss's selection kernels run the k-NN search ~43x faster than the exact
+    # NumPy fallback — 59 tiles/s becomes 2,500. It is the whole difference
+    # between that stage taking minutes and taking hours, and it is the only
+    # optimisation there that does not change an assignment.
+    "faiss-cpu",
 )
 
 # Import-checked in the job before encoding. Module name, not package name:

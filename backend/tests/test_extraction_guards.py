@@ -30,6 +30,7 @@ import shlex  # noqa: E402
 
 from submit_feature_extraction import (  # noqa: E402
     GPU_GRES,
+    GPU_PREFERENCE,
     _build_extraction_command,
     _check_checkpoint,
     _check_container_extras,
@@ -432,11 +433,113 @@ def test_container_checks_the_checkpoint_directory(tmp_path):
 
 
 def test_gres_names_the_gpu_model(tmp_path):
-    """Bare gpu:1 is satisfiable by an A100 or H100 on this cluster. The point
-    of naming the type is that "did it get an H200" stops being a question you
-    answer by reading sacct after the fact."""
+    """Bare gpu:1 is satisfiable by any card on the partition, including ones
+    whose CUDA this container cannot use — the misconfig that put a run on CPU
+    for 8.6 hours. Every type the submitter can request must be named."""
     del tmp_path
     assert "h200" in GPU_GRES.lower(), GPU_GRES
+    assert GPU_PREFERENCE, "the preference list must not be empty"
+    for gpu_type in GPU_PREFERENCE:
+        assert gpu_type and ":" not in gpu_type, gpu_type
+
+
+def test_h200_is_preferred_but_not_required(tmp_path):
+    """H200 first, then next-best. The fallback matters because the H200 queue
+    is often full, and after the read-path work extraction is decode-bound at
+    ~1.4k tiles/s — below what any of these cards encode — so an H100 or A100
+    finishes in about the same wall clock."""
+    del tmp_path
+    assert GPU_PREFERENCE[0] == "nvidia_h200", GPU_PREFERENCE
+    assert len(GPU_PREFERENCE) > 1, "a preference list of one cannot fall back"
+
+
+def _select_with_sinfo(monkeypatched_output, *, returncode=0, raises=None):
+    """select_gpu_gres against a stubbed sinfo."""
+    import submit_feature_extraction as sfe
+
+    class _Result:
+        def __init__(self, out):
+            self.stdout, self.stderr, self.returncode = out, "", returncode
+
+    original = sfe.subprocess.run
+    try:
+        if raises is not None:
+            def _run(*a, **k):
+                raise raises
+            sfe.subprocess.run = _run
+        else:
+            sfe.subprocess.run = lambda *a, **k: _Result(monkeypatched_output)
+        return sfe.select_gpu_gres("gpu")
+    finally:
+        sfe.subprocess.run = original
+
+
+def test_best_free_gpu_is_chosen(tmp_path):
+    del tmp_path
+    # H200 free -> take it.
+    gres, _ = _select_with_sinfo("gpu:nvidia_h200:4|idle|2\ngpu:nvidia_a100:8|idle|3\n")
+    assert gres == "gpu:nvidia_h200:1", gres
+
+    # H200 fully allocated -> next preference that is free.
+    gres, _ = _select_with_sinfo(
+        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_h100:4|idle|1\ngpu:nvidia_a100:8|idle|3\n"
+    )
+    assert gres == "gpu:nvidia_h100:1", gres
+
+    # Nothing idle, but an A100 node is partly free -> better than waiting.
+    gres, _ = _select_with_sinfo(
+        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_h100:4|alloc|1\ngpu:nvidia_a100:8|mix|3\n"
+    )
+    assert gres == "gpu:nvidia_a100:1", gres
+
+
+def test_nothing_free_queues_for_the_best(tmp_path):
+    """Requesting the fastest card and waiting beats silently downgrading, since
+    this cannot compare queue depths."""
+    del tmp_path
+    gres, reason = _select_with_sinfo(
+        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_a100:8|alloc|3\n"
+    )
+    assert gres == "gpu:nvidia_h200:1", gres
+    assert "queueing" in reason
+
+
+def test_unresponsive_nodes_do_not_count_as_free(tmp_path):
+    """sinfo's '*' means the node is not answering, so 'idle*' is idle and
+    unschedulable. Counting it would keep picking a dead H200 over a live
+    A100 — a job that queues forever rather than one that runs."""
+    del tmp_path
+    gres, _ = _select_with_sinfo("gpu:nvidia_h200:4|idle*|2\ngpu:nvidia_a100:8|idle|3\n")
+    assert gres == "gpu:nvidia_a100:1", gres
+
+
+def test_unknown_cluster_types_are_used_rather_than_invented(tmp_path):
+    """Requesting a type the cluster has never heard of is rejected by sbatch
+    outright, so an unrecognised partition falls back to what is actually there
+    and says how to configure it."""
+    del tmp_path
+    gres, reason = _select_with_sinfo("gpu:tesla_v100:2|idle|5\n")
+    assert gres == "gpu:tesla_v100:1", gres
+    assert "HPL_GPU_PREFERENCE" in reason
+
+
+def test_missing_sinfo_is_not_read_as_no_gpus(tmp_path):
+    """Same distinction the tiling code draws for sacct: "cannot ask" must not
+    become a positive claim. Ask for the first preference and let Slurm decide."""
+    del tmp_path
+    for kwargs in ({"returncode": 1}, {"raises": OSError("sinfo not found")}):
+        gres, reason = _select_with_sinfo("", **kwargs)
+        assert gres == "gpu:nvidia_h200:1", gres
+        assert "unavailable" in reason
+
+
+def test_explicit_gres_is_never_second_guessed(tmp_path):
+    """An operator naming a type has a reason; probing would override it."""
+    del tmp_path
+    from submit_feature_extraction import select_gpu_gres
+    gres, reason = select_gpu_gres("gpu", explicit="gpu:tesla_v100:2")
+    assert gres == "gpu:tesla_v100:2"
+    assert "explicit" in reason
 
 
 def test_probe_refuses_to_continue_without_a_gpu(tmp_path):

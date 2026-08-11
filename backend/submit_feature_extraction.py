@@ -9,8 +9,15 @@ so it can be corrected on the cluster without editing this file:
 
     HPL_REPO_DIR            — where you've cloned K-Rakovic/HPL-LATTICeA
     HPL_GPU_PARTITION       — GPU partition name (here: gpu)
-    HPL_GPU_GRES            — must name the GPU type; bare gpu:1 lets Slurm
-                              hand out an A100/H100/H200 at random
+    HPL_GPU_GRES            — legacy fixed request, kept for callers that pass
+                              --gres explicitly; ignored otherwise
+    HPL_GPU_PREFERENCE      — comma-separated GPU types, fastest first. The
+                              submitter picks the best one that looks free, so a
+                              busy H200 queue falls back rather than stalling.
+                              Bare gpu:1 is still avoided: an untyped request
+                              lets Slurm hand out a card the container cannot
+                              drive, which is how a run once spent 8.6 hours on
+                              CPU
     HPL_SINGULARITY_IMAGE   — NGC TensorFlow 1.15 SIF with a Hopper-capable
                               CUDA stack (not the host's hpl_tf15 conda env,
                               which cannot register an H200)
@@ -99,6 +106,15 @@ MERGE_PARTITION = os.getenv("HPL_MERGE_PARTITION", GPU_PARTITION)
 # Named GPU type, not bare gpu:1. On this cluster that is what distinguishes
 # an H200 from an H100 / A100 — see `sinfo -p gpu -o "%N %G"`.
 GPU_GRES = os.getenv("HPL_GPU_GRES", "gpu:nvidia_h200:1")
+# GPU types in descending order of preference, used when no --gres is given.
+# H200 first, then whatever is next best, so a busy H200 queue does not stall a
+# run that an H100 or A100 would serve just as well — see select_gpu_gres for
+# why "just as well" is close to literal here.
+GPU_PREFERENCE = tuple(
+    t.strip() for t in os.getenv(
+        "HPL_GPU_PREFERENCE", "nvidia_h200,nvidia_h100,nvidia_a100"
+    ).split(",") if t.strip()
+)
 SINGULARITY_BIN = os.getenv("HPL_SINGULARITY_BIN", "/usr/bin/singularity")
 SINGULARITY_IMAGE = Path(
     os.getenv(
@@ -173,6 +189,129 @@ _DEFAULT_BATCH_SIZE = 256
 # Sharded runs inherit this per array task, which is the right unit: each task
 # encodes 1/N of the input, so N shards do not need N times the walltime.
 _DEFAULT_TIME_LIMIT = "2-00:00:00"
+
+
+def discover_gpu_types(partition: str, timeout: int = 20) -> dict[str, dict[str, int]]:
+    """GPU types on a partition and how free they look, from sinfo.
+
+    Returns {type: {"total": nodes, "idle": nodes, "mix": nodes}}. Node counts,
+    not GPU counts: sinfo's per-node GRES-used reporting varies enough between
+    Slurm versions that parsing it reliably is not worth it, and node state is
+    enough to rank types by "something is probably free here".
+
+    Empty dict when sinfo cannot be reached or says nothing useful, which the
+    caller must treat as "no information" rather than "no GPUs" — the same
+    distinction the tiling status code draws for sacct.
+    """
+    try:
+        result = subprocess.run(
+            ["sinfo", "-h", "-p", partition, "-o", "%G|%t|%D"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    found: dict[str, dict[str, int]] = {}
+    for line in (result.stdout or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3:
+            continue
+        gres_field, state, node_count = parts
+        try:
+            nodes = int(node_count)
+        except ValueError:
+            continue
+        # "gpu:nvidia_h200:4(S:0-1),gpu:nvidia_h100:2" and "(null)" both occur.
+        for spec in gres_field.split(","):
+            spec = spec.strip()
+            if not spec.startswith("gpu:"):
+                continue
+            fields = spec.split(":")
+            if len(fields) < 3:
+                continue  # bare "gpu:4" names no type, so it cannot be preferred
+            gpu_type = fields[1]
+            entry = found.setdefault(gpu_type, {"total": 0, "idle": 0, "mix": 0})
+            entry["total"] += nodes
+            # sinfo suffixes carry the part that matters most here. '*' means
+            # the node is not responding, so an "idle*" node is idle and
+            # unschedulable — counting it as free is how the preference would
+            # keep choosing a dead H200 over a live A100. It still counts toward
+            # `total`, so the type remains queueable.
+            flags = state.strip()
+            base = flags.rstrip("*~#$@+").lower()
+            if "*" in flags:
+                continue
+            if base == "idle":
+                entry["idle"] += nodes
+            elif base in ("mix", "mixed"):
+                entry["mix"] += nodes
+    return found
+
+
+def select_gpu_gres(
+    partition: str,
+    preference: tuple[str, ...] = GPU_PREFERENCE,
+    count: int = 1,
+    explicit: str | None = None,
+) -> tuple[str, str]:
+    """Pick a --gres value, preferring the fastest GPU that looks free.
+
+    Returns (gres, reason) — the reason is printed at submit time, because
+    "which GPU did this run actually get, and why" is otherwise only
+    recoverable from sacct after the fact.
+
+    The preference list is ordered fastest-first. Within it, a type with an idle
+    node beats one with only a partially-allocated node, which beats one that
+    merely exists. If nothing is free anywhere, the first *existing* preferred
+    type is requested and the job queues for it — queueing for the best GPU is
+    usually better than not running, and this function has no way to compare
+    queue depths.
+
+    Worth knowing before tuning this: after the read-path work, feature
+    extraction is decode-bound at roughly 1.4k tiles/s, well under what any
+    modern GPU encodes. So falling back from an H200 to an H100 or A100 costs
+    little or nothing in wall clock — the GPU stopped being the bottleneck. The
+    fallback exists to avoid *waiting*, not to trade away speed.
+    """
+    if explicit:
+        return explicit, "explicitly requested"
+
+    available = discover_gpu_types(partition)
+    if not available:
+        # No information is not the same as no GPUs. Ask for the first
+        # preference and let Slurm accept or reject it.
+        return (
+            f"gpu:{preference[0]}:{count}",
+            f"sinfo unavailable — requesting {preference[0]} without checking",
+        )
+
+    for stage, key in (("idle", "idle"), ("partly free", "mix")):
+        for gpu_type in preference:
+            entry = available.get(gpu_type)
+            if entry and entry[key] > 0:
+                return (
+                    f"gpu:{gpu_type}:{count}",
+                    f"{gpu_type}: {entry[key]} {stage} node(s)",
+                )
+
+    for gpu_type in preference:
+        if gpu_type in available:
+            return (
+                f"gpu:{gpu_type}:{count}",
+                f"{gpu_type} exists but nothing is free — queueing for it",
+            )
+
+    # The partition has typed GPUs, none of them ours. Take the first it does
+    # have rather than requesting a type this cluster has never heard of, which
+    # sbatch rejects outright.
+    fallback = sorted(available)[0]
+    return (
+        f"gpu:{fallback}:{count}",
+        f"none of {list(preference)} exist here; falling back to {fallback}. "
+        f"Set HPL_GPU_PREFERENCE to rank this cluster's types.",
+    )
 
 
 def expected_extraction_output_path(
@@ -559,8 +698,9 @@ def _gpu_probe_python() -> str:
         "if not ok:\n"
         "    print(\n"
         "        'FATAL: TensorFlow did not register a GPU. Refusing to run on CPU. '\n"
-        "        'Check --gres (want gpu:nvidia_h200:1), singularity --nv, and that '\n"
-        "        'this SIF is the NGC TF1 Hopper image.',\n"
+        "        'Check the --gres in this job\\'s sbatch line names a GPU type the '\n"
+        "        'container can drive, that singularity got --nv, and that this SIF '\n"
+        "        'is the NGC TF1 image (CUDA 12).',\n"
         "        file=sys.stderr,\n"
         "    )\n"
         "    sys.exit(1)\n"
@@ -789,7 +929,7 @@ def submit_feature_extraction_job(
     shards: int = 1,
     merge_partition: str = MERGE_PARTITION,
     partition: str = GPU_PARTITION,
-    gres: str = GPU_GRES,
+    gres: str | None = None,
     cpus: int = 8,
     memory: str = "64G",
     time_limit: str = _DEFAULT_TIME_LIMIT,
@@ -817,14 +957,26 @@ def submit_feature_extraction_job(
     _check_hpl_repo_dir(hpl_repo_dir)
     _check_checkpoint(checkpoint)
 
-    if "h200" not in gres.lower():
-        # Soft guard rather than hard reject: an operator may deliberately
-        # retarget, but bare gpu:1 is the exact misconfig that burned a
-        # previous run on CPU, so call it out loudly in the submit log.
+    gres, gres_reason = select_gpu_gres(partition, explicit=gres)
+    print(f"GPU request:      {gres}  ({gres_reason})")
+    if ":" not in gres.rsplit(":", 1)[0]:
+        # A bare "gpu:1" names no type, which is the misconfig that let a run
+        # land on a card whose CUDA the container could not use and silently
+        # fall back to CPU for 8.6 hours. Still a warning rather than a reject:
+        # some clusters do not type their GPUs at all.
         print(
-            f"WARNING: --gres={gres!r} does not name an H200. "
-            f"On this cluster use gpu:nvidia_h200:1 (got from "
-            f"`sinfo -p gpu -o '%N %G'`).",
+            f"WARNING: --gres={gres!r} names no GPU type, so Slurm may hand out "
+            f"any card on the partition. Check `sinfo -p {partition} -o '%N %G'`.",
+            file=sys.stderr,
+        )
+    elif not any(t in gres for t in ("h200", "h100")):
+        # Not an error — the fallback is deliberate, and extraction is
+        # decode-bound rather than GPU-bound so the cost is small. But a
+        # smaller-memory card may not hold the default batch.
+        print(
+            f"NOTE: running on {gres} rather than an H200. Throughput should be "
+            f"similar (extraction is read-bound), but if the job OOMs on the GPU, "
+            f"lower --batch-size.",
             file=sys.stderr,
         )
 
@@ -1062,7 +1214,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--merge-partition", type=str, default=MERGE_PARTITION)
     parser.add_argument("--partition", type=str, default=GPU_PARTITION)
-    parser.add_argument("--gres", type=str, default=GPU_GRES)
+    parser.add_argument(
+        "--gres", type=str, default=None,
+        help="Override the GPU request. Omit to pick the best free type from "
+             f"HPL_GPU_PREFERENCE ({','.join(GPU_PREFERENCE)}).",
+    )
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--memory", type=str, default="64G")
     parser.add_argument("--time-limit", type=str, default=_DEFAULT_TIME_LIMIT)

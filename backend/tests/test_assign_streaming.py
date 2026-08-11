@@ -241,3 +241,63 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- merging the shards --------------------------------------------------
+# Same failure shapes as test_shard_merge.py covers for the HDF5 merge. A CSV
+# concatenation is simpler but fails identically: joined across a gap or over a
+# half-written part, it produces a file with the right columns and no missing
+# values that every downstream consumer accepts.
+
+def _write_csv_parts(final: Path, bounds, rows_per=None, header="a,b,hpc_reference"):
+    for lo, hi in bounds:
+        n = (hi - lo) if rows_per is None else rows_per.get((lo, hi), hi - lo)
+        part = final.with_name(f"{final.stem}.rows{lo}-{hi}{final.suffix}")
+        part.write_text(header + "\n" + "".join(f"{i},x,ref\n" for i in range(lo, lo + n)))
+
+
+def _merge_fails(final, *, contains, expected_rows=None):
+    from merge_assignment_shards import merge_assignment_shards
+    try:
+        merge_assignment_shards(final, expected_rows=expected_rows)
+    except (ValueError, FileExistsError) as e:
+        assert contains in str(e), f"expected {contains!r} in: {e}"
+        return
+    raise AssertionError(f"expected a failure mentioning {contains!r}")
+
+
+def test_csv_merge_round_trips(tmp_path):
+    from merge_assignment_shards import merge_assignment_shards
+    final = tmp_path / "out.csv"
+    _write_csv_parts(final, [(0, 100), (100, 200), (200, 300)])
+    info = merge_assignment_shards(final, expected_rows=300, cleanup=True)
+    assert info["rows"] == 300 and info["parts"] == 3
+    lines = final.read_text().splitlines()
+    assert len(lines) == 301
+    # Row order must come from the filenames, not the glob.
+    assert [int(l.split(",")[0]) for l in lines[1:]] == list(range(300))
+    assert not list(tmp_path.glob("*.rows*"))
+
+
+def test_csv_merge_rejects_gap_overlap_and_short_parts(tmp_path):
+    for label, bounds, kw in [
+        ("Gap in coverage",   [(0, 100), (200, 300)], {}),
+        ("overlaps",          [(0, 150), (100, 300)], {}),
+        ("last shard is missing", [(0, 100), (100, 200)], {"expected_rows": 300}),
+    ]:
+        final = tmp_path / f"{label[:6].replace(' ','_')}.csv"
+        _write_csv_parts(final, bounds)
+        _merge_fails(final, contains=label, **kw)
+        assert not final.exists(), "nothing may be written when coverage is bad"
+
+    # A part that died mid-write: its name claims more rows than it holds.
+    final = tmp_path / "short.csv"
+    _write_csv_parts(final, [(0, 100), (100, 200)], rows_per={(100, 200): 40})
+    _merge_fails(final, contains="incomplete", expected_rows=200)
+
+
+def test_csv_merge_rejects_mismatched_columns(tmp_path):
+    final = tmp_path / "cols.csv"
+    _write_csv_parts(final, [(0, 100)])
+    _write_csv_parts(final, [(100, 200)], header="a,b,different")
+    _merge_fails(final, contains="not parts of one run", expected_rows=200)

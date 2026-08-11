@@ -43,6 +43,7 @@ import h5py
 
 from submit_feature_extraction import (
     CONTAINER_EXTRAS,
+    shard_ranges,
     MERGE_PARTITION,
     SINGULARITY_BIN,
     SINGULARITY_IMAGE,
@@ -196,6 +197,8 @@ def _build_assignment_command(
     backend: str,
     batch_size: int,
     validate_against: Path | None,
+    query_mean: Path | None = None,
+    shard_bounds: list[tuple[int, int]] | None = None,
 ) -> str:
     """Shell command the Slurm --wrap runs.
 
@@ -225,6 +228,26 @@ def _build_assignment_command(
     if validate_against is not None:
         args.append(f"--validate-against {shlex.quote(real(validate_against))}")
 
+    # Sharding. The mean is supplied rather than computed per task because
+    # --centering query centres on the mean of *all* queries: a task that
+    # computed its own would project into a slightly different space and emit a
+    # well-formed CSV of different cluster IDs. assign_hpc_clusters.py refuses
+    # the combination outright, so this is belt and braces on a guard that
+    # already exists.
+    shard_preamble = ""
+    if query_mean is not None:
+        args.append(f"--query-mean {shlex.quote(real(query_mean))}")
+    if shard_bounds is not None:
+        starts = " ".join(str(lo) for lo, _ in shard_bounds)
+        stops = " ".join(str(hi) for _, hi in shard_bounds)
+        shard_preamble = (
+            f"SHARD_STARTS=({starts}); SHARD_STOPS=({stops}); "
+            'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
+            'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
+            'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
+        )
+        args.append("--row-start $ROW_START --row-stop $ROW_STOP")
+
     inner = (
         "set -euo pipefail; "
         f"export PYTHONPATH={shlex.quote(real(extras_dir))}${{PYTHONPATH:+:$PYTHONPATH}}; "
@@ -237,8 +260,39 @@ def _build_assignment_command(
         'export MKL_NUM_THREADS="$OMP_NUM_THREADS"; '
         "echo '=== Container packages ==='; "
         f"python -c {shlex.quote(_import_check_python(real(reference)))}; "
+        f"{shard_preamble}"
         "echo '=== Cluster assignment ==='; "
         f"python {shlex.quote(real(assign_script))} {' '.join(args)}"
+    )
+    return " ".join([
+        shlex.quote(singularity_bin), "exec", "--cleanenv", *binds,
+        shlex.quote(str(singularity_image)), "bash", "-lc", shlex.quote(inner),
+    ])
+
+
+def _build_simple_command(
+    *,
+    singularity_bin: str,
+    singularity_image: Path,
+    extras_dir: Path,
+    script: Path,
+    args: list[str],
+    extra_binds: list[Path],
+    banner: str,
+) -> str:
+    """One-liner container invocation, shared by the mean and merge jobs.
+
+    Both are small, CPU-only, single-purpose steps around the array; giving each
+    its own bespoke builder would be three near-identical functions.
+    """
+    binds = _bind_args(script.parent, extras_dir, singularity_image, *extra_binds)
+    real = os.path.realpath
+    inner = (
+        "set -euo pipefail; "
+        f"export PYTHONPATH={shlex.quote(real(extras_dir))}${{PYTHONPATH:+:$PYTHONPATH}}; "
+        'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"; '
+        f"echo '=== {banner} ==='; "
+        f"python {shlex.quote(real(script))} {' '.join(args)}"
     )
     return " ".join([
         shlex.quote(singularity_bin), "exec", "--cleanenv", *binds,
@@ -255,8 +309,10 @@ def submit_cluster_assignment_job(
     rep_key: str = "z_latent",
     k: int | None = None,
     backend: str = "auto",
-    batch_size: int = 4096,
+    batch_size: int = 16_384,
     validate_against: Path | None = None,
+    shards: int = 1,
+    centering: str = "query",
     partition: str = MERGE_PARTITION,
     cpus: int = 16,
     memory: str = "64G",
@@ -293,11 +349,78 @@ def submit_cluster_assignment_job(
     _check_singularity_image(singularity_image, singularity_bin)
     _check_container_extras(extras_dir, singularity_image, singularity_bin)
 
+    if shards > 1 and depends_on_job_id is not None:
+        # The array size has to be known at sbatch time, and it comes from the
+        # projections file's row count — which does not exist yet when this is
+        # chained behind extraction. Refused rather than guessed.
+        raise ValueError(
+            "Cannot combine --shards with --depends-on-job-id: the number of rows "
+            "to split is read from the projections file, which the job it depends "
+            "on has not written yet. Either submit unsharded and chained, or wait "
+            "for extraction to finish and then submit sharded."
+        )
+
     script_path = Path(__file__).resolve()
     backend_dir = script_path.parent
     log_dir = backend_dir / "slurm_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- sharding -----------------------------------------------------------
+    # Three jobs rather than one: compute the query mean over the whole file,
+    # then an array of assign tasks all handed that same mean, then a merge.
+    #
+    # The mean job exists solely because --centering query centres on the mean of
+    # every query. Letting each task compute its own would put each shard in a
+    # slightly different space and produce a well-formed CSV of different cluster
+    # IDs — the one failure here that no downstream check would catch.
+    shard_bounds = None
+    mean_path = None
+    mean_job_id = None
+    if shards > 1:
+        shard_bounds = shard_ranges(rows, shards)
+        mean_path = out_csv.with_name(f"{out_csv.stem}.query_mean.npy")
+
+        if centering == "query":
+            mean_command = _build_simple_command(
+                singularity_bin=singularity_bin, singularity_image=singularity_image,
+                extras_dir=extras_dir, script=backend_dir / ASSIGN_SCRIPT,
+                args=[
+                    f"--reference {shlex.quote(os.path.realpath(reference))}",
+                    f"--h5 {shlex.quote(os.path.realpath(projections_h5))}",
+                    f"--rep-key {shlex.quote(rep_key)}",
+                    f"--precompute-mean {shlex.quote(os.path.realpath(mean_path.parent) + '/' + mean_path.name)}",
+                ],
+                extra_binds=[projections_h5, reference.parent, out_csv.parent],
+                banner="Query mean",
+            )
+            mean_sbatch = [
+                "sbatch", f"--job-name={job_name}_mean",
+                f"--partition={partition}", "--cpus-per-task=4", "--mem=16G",
+                "--time=02:00:00",
+                f"--output={log_dir}/hpl_assign_mean_%j.out",
+                f"--error={log_dir}/hpl_assign_mean_%j.err",
+                f"--chdir={backend_dir}",
+                "--wrap", f"bash -lc {shlex.quote(mean_command)}",
+            ]
+            try:
+                mean_result = _run_sbatch_with_retry(mean_sbatch)
+            except subprocess.CalledProcessError as e:
+                reason = (e.stderr or "").strip() or (e.stdout or "").strip() or "no output"
+                raise RuntimeError(f"Could not submit the query-mean job: {reason}") from e
+            match = re.search(r"Submitted batch job (\d+)", mean_result.stdout or "")
+            mean_job_id = match.group(1) if match else None
+            if not mean_job_id:
+                raise RuntimeError(
+                    "The query-mean job was submitted but sbatch reported no job ID, "
+                    "so the shard array cannot be made to depend on it. Without that "
+                    "dependency the shards would read a mean file that does not exist "
+                    "yet."
+                )
+        else:
+            # reference / none centering needs no shared mean: both are
+            # shard-independent by construction.
+            mean_path = None
 
     command = _build_assignment_command(
         singularity_bin=singularity_bin,
@@ -312,6 +435,8 @@ def submit_cluster_assignment_job(
         backend=backend,
         batch_size=batch_size,
         validate_against=validate_against,
+        query_mean=mean_path,
+        shard_bounds=shard_bounds,
     )
 
     sbatch_command = [
@@ -321,7 +446,12 @@ def submit_cluster_assignment_job(
         f"--cpus-per-task={cpus}",
         f"--mem={memory}",
         f"--time={time_limit}",
-        *([f"--dependency=afterok:{depends_on_job_id}"] if depends_on_job_id else []),
+        *([f"--array=0-{shards - 1}"] if shard_bounds else []),
+        # afterok on the mean job when sharding: a shard that ran before the mean
+        # file existed would fail on a missing --query-mean, and one that somehow
+        # read a stale mean would silently disagree with its siblings.
+        *([f"--dependency=afterok:{mean_job_id or depends_on_job_id}"]
+          if (mean_job_id or depends_on_job_id) else []),
         f"--output={log_dir}/hpl_assign_%j.out",
         f"--error={log_dir}/hpl_assign_%j.err",
         f"--chdir={backend_dir}",
@@ -334,6 +464,10 @@ def submit_cluster_assignment_job(
         "out_csv": str(out_csv),
         "embeddings": rows,
         "assignment_job_id": None,
+        "shards": shards,
+        "shard_bounds": shard_bounds,
+        "mean_job_id": mean_job_id,
+        "merge_job_id": None,
         "sbatch_command": shlex.join(sbatch_command),
         **reference_info,
     }
@@ -349,6 +483,52 @@ def submit_cluster_assignment_job(
     match = re.search(r"Submitted batch job (\d+)", stdout)
     if match:
         info["assignment_job_id"] = match.group(1)
+
+    if shard_bounds:
+        if not info["assignment_job_id"]:
+            raise RuntimeError(
+                "The shard array was submitted but sbatch reported no job ID, so the "
+                "merge cannot depend on it. Merge by hand once the array finishes:\n"
+                f"  python {backend_dir / 'merge_assignment_shards.py'} "
+                f"--output {out_csv} --expected-rows {rows} --cleanup"
+            )
+        merge_command = _build_simple_command(
+            singularity_bin=singularity_bin, singularity_image=singularity_image,
+            extras_dir=extras_dir, script=backend_dir / "merge_assignment_shards.py",
+            args=[
+                f"--output {shlex.quote(os.path.realpath(out_csv.parent) + '/' + out_csv.name)}",
+                # Checked against the projections file rather than believed from
+                # the parts: a missing final shard leaves no gap to detect.
+                f"--expected-rows {rows}",
+                "--cleanup",
+            ],
+            extra_binds=[out_csv.parent],
+            banner="Merging shards",
+        )
+        merge_sbatch = [
+            "sbatch", f"--job-name={job_name}_merge",
+            f"--partition={partition}", "--cpus-per-task=2", "--mem=8G",
+            "--time=02:00:00",
+            # afterok, not afterany: concatenating around a failed shard is the
+            # silent corruption this whole path is built to avoid.
+            f"--dependency=afterok:{info['assignment_job_id']}",
+            f"--output={log_dir}/hpl_assign_merge_%j.out",
+            f"--error={log_dir}/hpl_assign_merge_%j.err",
+            f"--chdir={backend_dir}",
+            "--wrap", f"bash -lc {shlex.quote(merge_command)}",
+        ]
+        try:
+            merge_result = _run_sbatch_with_retry(merge_sbatch)
+        except subprocess.CalledProcessError as e:
+            reason = (e.stderr or "").strip() or (e.stdout or "").strip() or "no output"
+            raise RuntimeError(
+                f"The shard array is job {info['assignment_job_id']}, but the merge "
+                f"job could not be submitted: {reason}. Merge by hand once it finishes."
+            ) from e
+        merge_match = re.search(r"Submitted batch job (\d+)", merge_result.stdout or "")
+        if merge_match:
+            info["merge_job_id"] = merge_match.group(1)
+
     return info
 
 
@@ -370,7 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "Leiden n_neighbors, which is what ingest used.")
     parser.add_argument("--backend", type=str, default="auto",
                         choices=["auto", "faiss", "faiss-ivf", "numpy"])
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--validate-against", type=Path, default=None,
                         help="A CSV of known labels to check the assignment reproduces. "
                              "Use Kai's TCGA transfer as an acceptance test.")
@@ -379,6 +559,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory", type=str, default="64G")
     parser.add_argument("--time-limit", type=str, default="04:00:00")
     parser.add_argument("--notify-email", type=str, default=None)
+    parser.add_argument("--shards", type=int, default=1,
+                        help="Split the assignment across N array tasks. A mean job "
+                             "runs first so every shard centres identically, then a "
+                             "merge job concatenates the parts.")
+    parser.add_argument("--centering", type=str, default="query",
+                        choices=["query", "reference", "none"])
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace an existing output CSV.")
     return parser
@@ -397,6 +583,8 @@ def main() -> None:
             backend=args.backend,
             batch_size=args.batch_size,
             validate_against=args.validate_against,
+            shards=args.shards,
+            centering=args.centering,
             partition=args.partition,
             cpus=args.cpus,
             memory=args.memory,
@@ -414,6 +602,12 @@ def main() -> None:
     if info["embeddings"] is not None:
         print(f"Embeddings:       {info['embeddings']:,}")
     print(f"Output CSV:       {info['out_csv']}")
+    if info["shards"] > 1:
+        b = info["shard_bounds"]
+        print(f"Shards:           {info['shards']}  "
+              f"(rows {b[0][0]}-{b[0][1]} ... {b[-1][0]}-{b[-1][1]})")
+        print(f"Mean job ID:      {info['mean_job_id']}")
+        print(f"Merge job ID:     {info['merge_job_id']}")
     print(f"Slurm job ID:     {info['assignment_job_id']}")
 
 

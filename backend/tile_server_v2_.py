@@ -32,11 +32,13 @@ GET  /tile_image/{slide_tile}        → H5-backed tile image by slide_tile key
 
 import getpass
 import hashlib
+import inspect
 import io
 import os
 import re
 import time
 import json
+import random
 import subprocess
 from contextlib import asynccontextmanager, contextmanager
 from functools import lru_cache
@@ -55,20 +57,78 @@ from sqlalchemy import create_engine, text
 from openslide.deepzoom import DeepZoomGenerator
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from tile_cache import TileCache
 from tile_mask import run_tissue_detection
 from auto_tile_from_mask import tile_slide_from_mask
 from slide_naming import slide_id_from_raw_path
 from submit_mask_tile_slurm import submit_array as submit_dataset_array
-from submit_mask_tile_slurm import submit_packaging_job
-from make_hpl_hdf5 import package_slides_to_h5, hpl_h5_output_path
+from submit_mask_tile_slurm import (
+    submit_packaging_job,
+    discover_slides,
+    write_manifest,
+    tiling_output_complete,
+)
+from make_hpl_hdf5 import _checkpoint_paths, package_slides_to_h5, hpl_h5_output_path
 from find_missing_slides import find_missing_slides_detailed
+from dataset_rollup import (
+    coarse_run_state as _coarse_run_state,
+    group_runs_by_dataset,
+    job_ids as _split_job_ids,
+    rollup_dataset,
+)
 from submit_feature_extraction import (
     submit_feature_extraction_job,
     expected_extraction_output_path,
+    validate_extraction_output as _validate_extraction_output,
     HPL_REPO_DIR,
 )
+
+from submit_cluster_assignment import submit_cluster_assignment_job
+
+# Columns assign_hpc_clusters.py writes. The cluster column itself is named
+# after the reference's groupby (e.g. 'leiden_2.5'), so it is matched by
+# elimination rather than by name — hardcoding a name here would break the
+# moment the reference changes resolution, which is the kind of coupling that
+# makes a validator call a healthy file broken.
+_ASSIGNMENT_REQUIRED_COLUMNS = (
+    "samples", "slides", "tiles", "vote_margin", "neighbor_distance", "hpc_reference",
+)
+
+
+def _validate_assignment_output(path: Path, expected_rows: int | None = None):
+    """Confirm an assignment CSV is a full set of cluster IDs, not a stub.
+
+    Same role as validate_extraction_output plays for Stage 3: a file existing
+    at the right path is not evidence the job produced anything usable. A run
+    killed partway leaves a CSV with a header and some rows, which reads as
+    success to anything that only checks existence.
+    """
+    if not path.is_file():
+        return False, "no output file"
+    try:
+        with path.open() as fh:
+            header = fh.readline().strip()
+            if not header:
+                return False, "the file is empty"
+            columns = [c.strip() for c in header.split(",")]
+            missing = [c for c in _ASSIGNMENT_REQUIRED_COLUMNS if c not in columns]
+            if missing:
+                return False, f"missing column(s): {', '.join(missing)}"
+            if len(columns) <= len(_ASSIGNMENT_REQUIRED_COLUMNS):
+                return False, "no cluster-ID column alongside the metadata columns"
+            rows = sum(1 for _ in fh)
+    except OSError as e:
+        return False, f"could not be read: {e}"
+
+    if rows == 0:
+        return False, "holds a header but no assignments"
+    if expected_rows is not None and rows != expected_rows:
+        return False, (
+            f"holds {rows:,} assignments but the projections file has "
+            f"{expected_rows:,} embeddings"
+        )
+    return True, ""
 
 # sacct states that mean "still queued or actively running" — anything else
 # (COMPLETED, FAILED, CANCELLED, TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, ...) is
@@ -78,7 +138,12 @@ from submit_feature_extraction import (
 # filesystem) may not be done yet, so a retry-guard or tiling_complete check
 # that treated COMPLETING as terminal could let a second packaging/extraction
 # job start writing the same output file while the first is still finishing.
-IN_FLIGHT_SLURM_STATES = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "COMPLETING"}
+# CONFIGURING is a squeue-only state (nodes allocated, prologue still running)
+# that sacct rarely surfaces — it only started mattering once squeue became the
+# first source consulted in _get_slurm_job_state.
+IN_FLIGHT_SLURM_STATES = {
+    "PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "COMPLETING", "CONFIGURING",
+}
 
 
 # Configuration — edit these to match your HPCC environment
@@ -525,11 +590,64 @@ def _slurm_jobs_live_states(job_ids: list[str]) -> list[str] | None:
         # report. Everything else (controller unreachable, auth) is genuinely
         # unknown and must stay None so callers don't mistake it for proof.
         if _SQUEUE_UNKNOWN_JOB_RE.search(result.stderr or ""):
-            return []
+            # Parse stdout anyway rather than returning [] outright. With a
+            # list of IDs, squeue reports the unknown ones on stderr and still
+            # prints rows for the valid ones, exiting non-zero for the whole
+            # call. Returning [] here therefore threw away live rows whenever
+            # a single ID in the batch had aged out of the controller —
+            # claiming "nothing is running" while tiling was demonstrably
+            # still going. Empty stdout still yields [], the intended answer
+            # when every ID really is unknown.
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
         print(f"[{','.join(job_ids)}] squeue exited {result.returncode}: "
               f"{(result.stderr or '').strip()[:200]}")
         return None
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _slurm_controller_known_jobs(job_ids: list[str]) -> list[str] | None:
+    """The subset of job_ids that slurmctld still holds a record of.
+
+    This exists because --dependency is resolved by the controller and
+    nothing else. sacct reads slurmdbd, whose retention is days to weeks;
+    the controller forgets a job MinJobAge seconds after it ends (default
+    300). So sacct's view and sbatch's view of "does this job exist" diverge
+    within minutes of a run finishing, and a dependency on a job only sacct
+    remembers is rejected outright with "Job dependency problem". Asking
+    scontrol is asking the same component sbatch is about to ask, which is
+    the only view that actually predicts whether the submission succeeds.
+
+    Queried one ID at a time rather than as a list, because the answer we
+    need is per-ID: a single unknown ID among live ones is exactly the mixed
+    case worth resolving precisely, and a combined query collapses it into
+    one pass/fail. That costs one local RPC per batch (~15 for a large
+    dataset), which only happens on an explicit submit.
+
+    A non-zero exit is a real answer here, not a failure — scontrol rejects
+    an ID it has no record of with "Invalid job id specified", which is
+    precisely the "controller has forgotten this" result being asked for.
+    Same distinction _slurm_jobs_live_states draws, and the same regex.
+    Returns None if scontrol itself is unusable, so callers can tell "the
+    controller does not know these jobs" from "we could not ask" — only the
+    former is grounds for dropping a dependency.
+    """
+    known: list[str] = []
+    for job_id in job_ids:
+        cmd = ["scontrol", "show", "job", job_id]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"[{job_id}] scontrol unavailable: {e}")
+            return None
+        if result.returncode == 0:
+            known.append(job_id)
+            continue
+        if _SQUEUE_UNKNOWN_JOB_RE.search(result.stderr or ""):
+            continue
+        print(f"[{job_id}] scontrol exited {result.returncode}: "
+              f"{(result.stderr or '').strip()[:200]}")
+        return None
+    return known
 
 
 def _get_slurm_array_state_counts(job_ids: list[str]) -> dict[str, int] | None:
@@ -583,6 +701,33 @@ def _get_slurm_array_state_counts(job_ids: list[str]) -> dict[str, int] | None:
         if pending_range:
             counts[state] = counts.get(state, 0) + _array_range_size(pending_range.group(1))
     if counts:
+        if any(state in IN_FLIGHT_SLURM_STATES for state in counts):
+            # sacct says some tasks are still queued/running. Check that
+            # against the live queue before believing it: slurmdbd lags, and a
+            # task that died (TIMEOUT, OOM, node failure) keeps its last
+            # RUNNING row until accounting catches up. tiling_complete is
+            # computed as "no in-flight state present", so one stale row kept
+            # the whole run pinned at "tiling in progress" — which in turn
+            # left the packaging step blocked, hiding its Full-dataset /
+            # subset options entirely.
+            #
+            # An empty squeue result is proof of absence here (not merely a
+            # missing answer): _slurm_jobs_live_states returns None when it
+            # could not ask, and only [] when the scheduler answered and holds
+            # none of these IDs. In that case drop the stale in-flight rows.
+            # Dropping rather than guessing an outcome is deliberate — the
+            # caller's fallback for thin/empty counts is to read each slide's
+            # _tiling_summary.json off disk, which is ground truth about what
+            # actually finished, and far better evidence than a state we would
+            # otherwise have to invent.
+            live_states = _slurm_jobs_live_states(job_ids)
+            if live_states == []:
+                stale = {s: n for s, n in counts.items() if s in IN_FLIGHT_SLURM_STATES}
+                print(
+                    f"[{','.join(job_ids)}] sacct reports {stale} but squeue holds none of "
+                    f"these jobs — treating the accounting rows as stale."
+                )
+                counts = {s: n for s, n in counts.items() if s not in IN_FLIGHT_SLURM_STATES}
         return counts
 
     live_states = _slurm_jobs_live_states(job_ids)
@@ -593,28 +738,280 @@ def _get_slurm_array_state_counts(job_ids: list[str]) -> dict[str, int] | None:
     return counts
 
 
-def _get_slurm_job_state(job_id: str) -> str | None:
-    """Single (non-array) job's current Slurm state via sacct, e.g. for the
-    h5-packaging job.
+def _slurm_states_by_job(
+    job_ids: list[str], *, timeout: int = 45
+) -> dict[str, set[str]] | None:
+    """Every state seen per job ID, from ONE sacct call.
 
-    Returns None if neither sacct nor squeue could be reached — genuinely
-    unknown, callers should not guess. Returns "" only once sacct has no
-    record of this job AND squeue also confirms it isn't currently
-    queued/running — for an old-enough job that combination means it's
-    aged out of Slurm's accounting-DB retention window (long finished),
-    not that it never existed. sacct alone returning nothing isn't enough:
-    a job submitted moments ago can legitimately have no sacct rows yet
-    since slurmdbd syncs on its own schedule, well after squeue would
-    already show it live — without the squeue cross-check, a freshly
-    retried packaging/extraction job would look "finished long ago" on
-    every single poll right after submission, offering another retry
-    before the previous one even had a chance to start.
+    _get_slurm_job_state answers for a single job and _get_slurm_array_state_counts
+    aggregates across jobs while discarding which job each state came from.
+    Neither can label a *list* of runs: the first needs one call per run (ten
+    sequential sacct calls to draw a ten-row list, on a controller already slow
+    enough to have blown the UI's 30s read timeout mid-run), and the second
+    cannot tell them apart afterwards.
+
+    Keyed by base job ID, so array tasks ("123_5") and job steps ("123.batch")
+    both fold into "123" — a caller asking "how is run X doing" wants the whole
+    array's states together, not one row per task.
+
+    Returns None if sacct could not be reached at all: genuinely unknown, which
+    callers must not render as "finished". An empty set for a job ID means sacct
+    ran and had nothing for it — aged out of retention, or too fresh to have
+    been written yet, and those two are only distinguishable via squeue.
+
+    timeout is a parameter because "one call" does not bound the work: sacct's
+    cost scales with the *tasks* behind the IDs, not the IDs themselves, and
+    tiling records one array job per ~1000-slide batch. A whole-history listing
+    reached 321 IDs standing for tens of thousands of tasks, which took longer
+    than the 45s default every single time and therefore returned None — the
+    entire UI reading "can't reach Slurm" while Slurm was perfectly healthy.
+    Callers spanning many runs must pass a smaller timeout and a smaller batch
+    (see _listing_job_states) rather than inheriting a default sized for one.
     """
+    if not job_ids:
+        return {}
+    result = _run_slurm(
+        ["sacct", "-j", ",".join(job_ids), "--format=JobID,State",
+         "--parsable2", "--noheader"],
+        timeout=timeout,
+    )
+    if result is None:
+        return None
+
+    states: dict[str, set[str]] = {job_id: set() for job_id in job_ids}
+    for line in result.stdout.splitlines():
+        job_field, separator, state_field = line.strip().partition("|")
+        if not separator:
+            continue
+        job_field = job_field.strip()
+        # "123.batch"/"123_5.extern" repeat their parent's state.
+        job_field = job_field.split(".", 1)[0]
+        base = job_field.split("_", 1)[0]
+        state = _normalise_slurm_state(state_field)
+        if not state:
+            continue
+        if base in states:
+            states[base].add(state)
+    return states
+
+
+# Bounds for the dataset listing's Slurm lookup. The listing is polled and spans
+# every run ever recorded, so it cannot afford the per-run treatment: it asks
+# about recent jobs precisely and lets older ones be answered by the queue plus
+# whatever is on disk.
+#
+# WINDOW_DAYS is Slurm's accounting retention as configured here. Asking sacct
+# about a job older than that is not merely wasted work — it returns nothing, so
+# the answer is identical to not having asked, at the price of the slowest part
+# of the call. Set it *shorter* than the real retention rather than longer; the
+# cost of being wrong in that direction is one extra squeue row, and in the
+# other direction it is a job whose failure we never notice.
+_LISTING_SACCT_WINDOW_DAYS = 10
+_LISTING_SACCT_CHUNK = 40
+_LISTING_SACCT_CHUNK_TIMEOUT = 12
+_LISTING_SACCT_BUDGET_S = 24.0
+_LISTING_SQUEUE_CHUNK = 100
+
+
+def _squeue_states_by_job(job_ids: list[str]) -> dict[str, set[str]] | None:
+    """Live queue state per base job ID — squeue only, no accounting DB.
+
+    _slurm_jobs_live_states answers the same question but discards which job
+    each state belonged to, which is fine for one run and useless for a listing
+    of fifty. Chunked because the ID list runs to the hundreds here and a single
+    argument that long is worth avoiding regardless of what the shell tolerates.
+
+    A chunk that fails is skipped rather than fatal: squeue exits non-zero for a
+    batch containing any ID the controller has already forgotten (see
+    _slurm_jobs_live_states), which for a listing of historic runs is the normal
+    case, not an error. Returns None only if *every* chunk failed, i.e. squeue
+    itself is unreachable.
+    """
+    if not job_ids:
+        return {}
+
+    states: dict[str, set[str]] = {job_id: set() for job_id in job_ids}
+    any_answered = False
+    for start in range(0, len(job_ids), _LISTING_SQUEUE_CHUNK):
+        chunk = job_ids[start:start + _LISTING_SQUEUE_CHUNK]
+        try:
+            result = subprocess.run(
+                ["squeue", "-j", ",".join(chunk), "-h", "-o", "%i|%T"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"[listing] squeue unavailable: {e}")
+            continue
+        if result.returncode != 0 and not _SQUEUE_UNKNOWN_JOB_RE.search(result.stderr or ""):
+            print(f"[listing] squeue exited {result.returncode}: "
+                  f"{(result.stderr or '').strip()[:200]}")
+            continue
+        any_answered = True
+        for line in result.stdout.splitlines():
+            job_field, separator, state_field = line.strip().partition("|")
+            if not separator:
+                continue
+            base = job_field.strip().split(".", 1)[0].split("_", 1)[0]
+            state = _normalise_slurm_state(state_field)
+            if state and base in states:
+                states[base].add(state)
+    return states if any_answered else None
+
+
+def _listing_job_states(
+    datasets: list[dict],
+) -> tuple[dict[str, set[str]] | None, bool]:
+    """Job states for every run in a dataset listing, on a time budget.
+
+    Returns (states, complete). complete is False when some jobs were left to
+    squeue alone — the answer is still usable, but a recent job that *failed*
+    can read as merely "no longer queued", so the caller should say so rather
+    than present it as the last word. The per-run /dataset-jobs/{id}/status
+    endpoint remains the precise view, and is where the UI sends anyone who
+    opens a single run.
+
+    Two sources, deliberately:
+
+      * squeue for every ID, because it is cheap at any list length (controller
+        memory, no accounting DB) and it alone can say "this is running right
+        now" — the one thing a polled listing must never get wrong.
+      * sacct only for jobs from recent runs, in bounded chunks, because it is
+        the expensive one and is the only way to tell COMPLETED from FAILED.
+
+    An ID that neither source reports gets an empty set, which coarse_run_state
+    reads as "no record" — aged out of retention, i.e. long finished. That is
+    the same inference _get_slurm_array_state_counts already documents, and it
+    is only sound because squeue was asked: without it, "nothing came back"
+    would equally describe a job submitted ten seconds ago.
+    """
+    recent_ids: list[str] = []
+    every_id: list[str] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_LISTING_SACCT_WINDOW_DAYS)
+
+    for dataset in datasets:
+        for run in dataset["runs"]:
+            ids: list[str] = []
+            for field in ("job_id", "h5_job_id", "extraction_job_id", "test_h5_job_id"):
+                ids.extend(_split_job_ids(run.get(field)))
+            if not ids:
+                continue
+            every_id.extend(ids)
+            submitted = _parse_timestamp(run.get("submitted_at"))
+            # Unparseable timestamps count as recent: a row we cannot date is
+            # more safely treated as one whose outcome still matters than as
+            # one old enough to assume finished.
+            if submitted is None or submitted >= cutoff:
+                recent_ids.extend(ids)
+
+    every_id = sorted(set(every_id))
+    recent_ids = sorted(set(recent_ids))
+    if not every_id:
+        return {}, True
+
+    live = _squeue_states_by_job(every_id)
+
+    accounted: dict[str, set[str]] = {}
+    deadline = time.monotonic() + _LISTING_SACCT_BUDGET_S
+    complete = True
+    sacct_reached = False
+    for start in range(0, len(recent_ids), _LISTING_SACCT_CHUNK):
+        chunk = recent_ids[start:start + _LISTING_SACCT_CHUNK]
+        if time.monotonic() >= deadline:
+            print(f"[listing] sacct budget spent; {len(recent_ids) - start} recent "
+                  f"job ids left to squeue alone")
+            complete = False
+            break
+        chunk_states = _slurm_states_by_job(
+            chunk, timeout=_LISTING_SACCT_CHUNK_TIMEOUT
+        )
+        if chunk_states is None:
+            complete = False
+            continue
+        sacct_reached = True
+        accounted.update(chunk_states)
+
+    if live is None and not sacct_reached:
+        return None, False
+    if len(recent_ids) < len(every_id):
+        # Older jobs were never asked about. Honest, but not the whole story.
+        complete = False
+
+    states = {job_id: set(live.get(job_id, set()) if live else set()) for job_id in every_id}
+    for job_id, seen in accounted.items():
+        states.setdefault(job_id, set()).update(seen)
+    return states, complete
+
+
+def _parse_timestamp(value) -> datetime | None:
+    """A tz-aware datetime from whatever the runs table hands back.
+
+    Values arrive as ISO strings via pandas' to_json (which renders naive
+    timestamps with a trailing Z) or as datetimes when read directly. A naive
+    value is read as UTC, matching how submitted_at is written.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# _coarse_run_state is imported from dataset_rollup rather than defined here:
+# the dataset rollup has to classify the same job states this server does, and
+# two copies of that ordering would drift the moment one of them learned about
+# a new Slurm state.
+
+
+def _get_slurm_job_state(job_id: str) -> str | None:
+    """Single (non-array) job's current Slurm state, e.g. for the h5-packaging
+    job. squeue is asked first, sacct only as a fallback.
+
+    That order is the whole point of this function and it used to be the other
+    way round. sacct reads slurmdbd, which syncs on its own schedule; squeue
+    reads slurmctld, which *is* the scheduler. Whenever the two disagree,
+    squeue is right and sacct is merely stale, so consulting sacct first meant
+    the UI reported a lagging accounting record in preference to the live
+    queue — in both directions:
+
+      * a job that had already died (TIMEOUT, OOM, a crash like the h5 file
+        lock failure) kept its last sacct row of RUNNING, so the pipeline
+        stepper showed "Running (Slurm state: RUNNING)" and hid the retry
+        button, sometimes for minutes after the job was gone;
+      * a job submitted moments ago has no sacct row at all yet, which the
+        old code only rescued via the fallback below.
+
+    Asking the queue first collapses both cases: if slurmctld still holds the
+    job, its state is authoritative and current, full stop. squeue is also the
+    cheaper of the two (no accounting DB), so this is not a cost for the
+    common "is it still running?" poll.
+
+    Whatever squeue reports is returned as-is rather than assumed to be a
+    live state — a job that finished very recently can still appear in the
+    queue as COMPLETED/FAILED, and that is a perfectly good terminal answer.
+
+    Return contract is unchanged. None means neither source could be reached
+    (genuinely unknown — callers must not guess). "" means squeue confirms the
+    job is not in the queue AND sacct has no record of it, which for an
+    old-enough job means it aged out of the accounting-DB retention window,
+    i.e. long finished (see _job_output_ready).
+    """
+    live_states = _slurm_jobs_live_states([job_id])
+    if live_states:
+        return _normalise_slurm_state(live_states[0])
+
     result = _run_slurm(
         ["sacct", "-j", job_id, "--format=JobID,State", "--parsable2", "--noheader"],
         timeout=15,
     )
     if result is None:
+        # squeue said "not in the queue" but sacct can't say how it ended.
+        # Not-in-queue is not by itself an outcome, and "" would be read as
+        # "aged out, trust the output file" — so stay honestly unknown.
         return None
 
     for line in result.stdout.splitlines():
@@ -627,11 +1024,11 @@ def _get_slurm_job_state(job_id: str) -> str | None:
         if len(parts) == 2 and parts[0] == job_id:
             return _normalise_slurm_state(parts[1])
 
-    live_states = _slurm_jobs_live_states([job_id])
+    # sacct ran and has no row for this job. Only call that "aged out" if
+    # squeue actually answered; if squeue itself was unreachable (None) we
+    # have two non-answers, not evidence.
     if live_states is None:
         return None
-    if live_states:
-        return live_states[0]
     return ""
 
 
@@ -825,7 +1222,32 @@ def _job_output_ready(
     """
     if not output_path or not output_path.is_file():
         return False
-    if slurm_state != "COMPLETED" and not (
+
+    # slurm_state is None means Slurm itself could not be reached. That is
+    # normally not enough to call an output ready — but it must not be an
+    # automatic "no" either, or an unreachable sacct makes a *finished* run
+    # look interrupted and puts a Retry button in front of a perfectly good
+    # output. For packaging that retry would resubmit over a complete .h5 and
+    # throw away hours of work, which is a far worse outcome than the
+    # over-cautious "not ready" was ever protecting against.
+    #
+    # There is independent, on-disk evidence available in exactly that case:
+    # packaging writes to a ".partial" sibling and os.replace()s it into place
+    # only after a successful run, so the real path existing at all already
+    # means a run finished, and the absence of a leftover ".partial" means no
+    # other attempt is mid-write. Combined with a validator that opens the file
+    # and reads its first and last row, that is strictly stronger proof than
+    # the sacct row we could not fetch. Requiring a validator keeps this narrow:
+    # callers with no way to check their output's integrity (no validator) get
+    # the old conservative answer.
+    partial_sibling = output_path.with_name(output_path.name + ".partial")
+    unverifiable_but_complete = (
+        slurm_state is None
+        and validator is not None
+        and not partial_sibling.exists()
+    )
+
+    if not unverifiable_but_complete and slurm_state != "COMPLETED" and not (
         slurm_state == "" and output_path.stat().st_size > 0
     ):
         return False
@@ -834,6 +1256,11 @@ def _job_output_ready(
         if not ok:
             print(f"[{output_path}] output rejected as not ready: {reason}")
             return False
+    if unverifiable_but_complete:
+        print(
+            f"[{output_path}] Slurm unreachable, but the output validates and no "
+            f".partial is present — treating it as complete."
+        )
     return True
 
 
@@ -1240,10 +1667,106 @@ def slide_processing_status(slide_id: str):
     return _get_processing_status(slide_id)
 
 
+# Every submit_array() argument that changes what the tiles themselves look
+# like — as opposed to how the job is scheduled (cpus, memory, partition,
+# batch_size) or which slides are picked (sample_size, slide_names). These are
+# what has to be identical between an original run and any resume of it, since
+# a dataset half-tiled at one threshold and half at another is not one dataset.
+#
+# jpeg_quality is included: it only affects the on-disk JPEGs and not the .h5's
+# uncompressed pixels, but it does change the image data those pixels are
+# decoded from, so a resume at a different quality is still a mixed dataset.
+_TILING_PARAM_NAMES = (
+    "min_tissue",
+    "target_mpp",
+    "target_tile_px",
+    "level",
+    "jpeg_quality",
+    "mask_max_size",
+    "mask_saturation",
+    "mask_value",
+)
+
+
+def _default_tiling_params() -> dict:
+    """Current defaults, read off submit_array()'s own signature.
+
+    Introspection rather than a hardcoded copy specifically so this cannot
+    drift from the function it feeds: changing a default in
+    submit_mask_tile_slurm.py updates what gets recorded here automatically,
+    and a renamed or removed parameter fails loudly at import instead of
+    silently recording a value nothing uses.
+    """
+    signature = inspect.signature(submit_dataset_array)
+    defaults = {}
+    for name in _TILING_PARAM_NAMES:
+        parameter = signature.parameters.get(name)
+        if parameter is None or parameter.default is inspect.Parameter.empty:
+            raise RuntimeError(
+                f"submit_array() no longer has a defaulted '{name}' parameter — "
+                f"_TILING_PARAM_NAMES needs updating."
+            )
+        defaults[name] = parameter.default
+    return defaults
+
+
+def _resolve_tiling_params(req: "DatasetJobRequest") -> dict:
+    """The tiling parameters this submission will actually run with.
+
+    Precedence: an explicit tiling_params block (how a resume passes the
+    original run's recorded values through) over the defaults, and an
+    explicitly-set min_tissue over both — min_tissue predates tiling_params as
+    a top-level request field and the UI still sends it that way.
+
+    model_fields_set is what makes that last part work: min_tissue has a
+    default on the model, so its presence in the request is the only way to
+    tell "the user chose 30.0" from "the user said nothing and 30.0 is the
+    default". Without that distinction a resume could not avoid overriding the
+    recorded value with a default that merely looks deliberate.
+    """
+    params = _default_tiling_params()
+    if req.tiling_params:
+        params.update(
+            {k: v for k, v in req.tiling_params.items() if k in _TILING_PARAM_NAMES}
+        )
+    if "min_tissue" in req.model_fields_set:
+        params["min_tissue"] = req.min_tissue
+    return params
+
+
+def _row_tiling_params(row) -> dict | None:
+    """Tiling parameters recorded for a run, or None if it predates the column.
+
+    None is returned rather than the defaults so callers can tell "this run
+    used these values" from "nobody knows what this run used" — only the former
+    is grounds for claiming a resume reproduces the original.
+    """
+    try:
+        recorded = row["tiling_params"]
+    except (KeyError, IndexError):
+        # Server pointed at a database without the migration applied.
+        return None
+    if not recorded:
+        return None
+    if isinstance(recorded, str):
+        # psycopg2 without the JSONB adapter registered hands back raw text.
+        try:
+            recorded = json.loads(recorded)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(recorded, dict):
+        return None
+    return {k: v for k, v in recorded.items() if k in _TILING_PARAM_NAMES} or None
+
+
 class DatasetJobRequest(BaseModel):
     dataset_path: str
     max_concurrent: int = 10
     min_tissue: float = 30.0
+    # Set by resume_dataset_job (and the UI's full-directory run) to reproduce
+    # an earlier run's tiling exactly. Unset on a fresh submission, which then
+    # takes the current defaults plus whatever min_tissue the user chose.
+    tiling_params: Optional[dict] = None
     sample_size: Optional[int] = None
     slide_names: Optional[list[str]] = None
     partition: Optional[str] = None  # None -> Slurm's own default partition
@@ -1369,6 +1892,111 @@ def _resolve_dataset_path(user_path: str) -> Path:
     return candidate
 
 
+def _record_run_job(
+    submission_id: str,
+    stage: str,
+    job_id: str | None,
+    output_path: str | None = None,
+    params: dict | None = None,
+) -> None:
+    """Append one submitted Slurm job to a run's history.
+
+    Purely additive alongside the single-slot columns on slurm_dataset_runs,
+    which stay authoritative for gating (see migrate_dataset_run_jobs.sql).
+
+    Never raises. Every caller is on the far side of a successful sbatch, so a
+    bookkeeping failure must not become a 500 — that would tell the caller
+    nothing was queued while the job runs anyway, which is worse than a gap in
+    the history. ON CONFLICT DO NOTHING makes it safe to call again for a job
+    already recorded, which the tiling path does after recovering job ids by
+    name.
+    """
+    if not job_id:
+        return
+    try:
+        eng = _get_engine()
+        with eng.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO slurm_dataset_run_jobs
+                        (submission_id, stage, job_id, output_path, params)
+                    VALUES (:submission_id, :stage, :job_id, :output_path, :params)
+                    ON CONFLICT (submission_id, stage, job_id) DO NOTHING
+                """),
+                {
+                    "submission_id": submission_id,
+                    "stage": stage,
+                    "job_id": str(job_id),
+                    "output_path": str(output_path) if output_path else None,
+                    # Serialised here rather than relying on the driver's dict
+                    # adaptation, which differs between psycopg2 and psycopg3 —
+                    # same reason tiling_params is written this way.
+                    "params": json.dumps(params) if params is not None else None,
+                },
+            )
+    except Exception as e:
+        print(f"[warn] could not record {stage} job {job_id} for {submission_id}: {e}")
+
+
+def _run_job_history(submission_id: str) -> list[dict]:
+    """Every recorded Slurm job for a run, newest first, with live state.
+
+    States for the whole history come from one sacct call via
+    _slurm_states_by_job — a per-row lookup would be one call per attempt, and
+    this is rendered inside a run's panel where several attempts are normal.
+    """
+    try:
+        eng = _get_engine()
+        with eng.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT stage, job_id, output_path, params, submitted_at
+                    FROM slurm_dataset_run_jobs
+                    WHERE submission_id = :submission_id
+                    ORDER BY submitted_at DESC, id DESC
+                """),
+                {"submission_id": submission_id},
+            ).mappings().fetchall()
+    except Exception as e:
+        # The table may not exist yet if the code is deployed before the
+        # migration is run. An empty history is the right degradation; failing
+        # the whole status response is not.
+        print(f"[warn] could not read job history for {submission_id}: {e}")
+        return []
+
+    every_id: list[str] = []
+    for row in rows:
+        every_id.extend(j for j in str(row["job_id"]).split(",") if j)
+    states = _slurm_states_by_job(sorted(set(every_id)))
+
+    history = []
+    for row in rows:
+        ids = [j for j in str(row["job_id"]).split(",") if j]
+        if states is None:
+            state = "unknown"
+        else:
+            seen: set[str] = set()
+            for job_id in ids:
+                seen |= states.get(job_id.split("_", 1)[0], set())
+            state = _coarse_run_state(seen)
+        params = row["params"]
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except json.JSONDecodeError:
+                params = None
+        history.append({
+            "stage": row["stage"],
+            "job_id": row["job_id"],
+            "batch_count": len(ids),
+            "output_path": row["output_path"],
+            "params": params,
+            "submitted_at": row["submitted_at"].isoformat() if row["submitted_at"] else None,
+            "slurm_state": state,
+        })
+    return history
+
+
 def _update_dataset_run(submission_id: str, **fields):
     eng = _get_engine()
     set_clause = ", ".join(f"{k} = :{k}" for k in fields)
@@ -1435,7 +2063,12 @@ def _run_dataset_submission(submission_id: str, raw_dir: str, req: DatasetJobReq
             mask_dir=TISSUE_MASK_DIR,
             tile_dir=PROCESSED_TILES_DIR,
             max_concurrent=req.max_concurrent,
-            min_tissue=req.min_tissue,
+            # Every tile-affecting parameter, from the same resolved dict that
+            # was written to the row — including min_tissue, which used to be
+            # passed on its own. Passing them as a unit is what guarantees a
+            # resume runs the original values: there is no second code path
+            # here that could quietly reintroduce a default.
+            **(req.tiling_params or _default_tiling_params()),
             sample_size=req.sample_size,
             slide_names=req.slide_names,
             partition=req.partition,
@@ -1472,6 +2105,16 @@ def _run_dataset_submission(submission_id: str, raw_dir: str, req: DatasetJobReq
                 total_slides=result["slides_found"],
                 error=partial_failure_note,
             )
+            _record_run_job(
+                submission_id, "tiling", ",".join(job_ids),
+                output_path=result["manifest_path"],
+                params={
+                    "slides": result["slides_found"],
+                    "batches": len(job_ids),
+                    "failed_batches": failed_batch_count,
+                    "tiling_params": req.tiling_params,
+                },
+            )
             # Packaging (and later, feature extraction) no longer auto-chain
             # from here — each stage now needs an explicit "start" click from
             # the UI once the previous stage is confirmed done. See
@@ -1489,14 +2132,54 @@ def _run_dataset_submission(submission_id: str, raw_dir: str, req: DatasetJobReq
         _update_dataset_run(submission_id, status="error", error=str(e))
 
 
+def _record_resume_lineage(submission_id: str, parent_submission_id: str) -> None:
+    """Note that this run was created by resuming another.
+
+    A separate best-effort UPDATE rather than a column in the INSERT, and it
+    never raises, for the same reason _record_run_job doesn't: this is
+    bookkeeping on the far side of a decision that has already been made. If
+    migrate_dataset_runs_lineage.sql has not been applied yet, folding this
+    into the INSERT would make every resume fail outright — trading a missing
+    display detail for a broken pipeline stage.
+
+    GET /datasets does not depend on this. It groups runs by
+    (raw_dir, dataset_name), which resume reuses, so lineage only sharpens the
+    picture from "these runs share a directory" to "this one continued that
+    one".
+    """
+    try:
+        eng = _get_engine()
+        with eng.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE slurm_dataset_runs "
+                    "SET resumed_from_submission_id = :parent "
+                    "WHERE submission_id = :submission_id"
+                ),
+                {"parent": parent_submission_id, "submission_id": submission_id},
+            )
+    except Exception as e:
+        print(
+            f"[warn] could not record that {submission_id} resumed "
+            f"{parent_submission_id}: {e}"
+        )
+
+
 def _start_dataset_submission(
-    raw_dir: Path, req: DatasetJobRequest, background_tasks: BackgroundTasks
+    raw_dir: Path,
+    req: DatasetJobRequest,
+    background_tasks: BackgroundTasks,
+    resumed_from_submission_id: str | None = None,
 ) -> dict:
     """Create a new slurm_dataset_runs row and kick off the background
     pipeline for it. Shared by POST /dataset-jobs (a fresh submission) and
     the /resume endpoint (a follow-up submission for whatever a previous
     run's slides are still missing) — both are "start a submission for this
     raw_dir with this req," just with req.slide_names populated differently.
+
+    resumed_from_submission_id is what tells those two apart afterwards. Both
+    land in the same table looking identical, so without it a resume and a
+    deliberate second run over the same directory are indistinguishable.
     """
     submission_id = str(uuid.uuid4())
     is_subset = bool(req.sample_size or req.slide_names)
@@ -1511,7 +2194,14 @@ def _start_dataset_submission(
         dataset_name = _sanitize_dataset_name(req.dataset_name) if req.dataset_name else raw_dir.name
     except ValueError as e:
         raise HTTPException(400, str(e))
-    req = req.model_copy(update={"dataset_name": dataset_name})
+    # Resolved once, here, then both persisted and handed to submit_array — so
+    # the row records exactly what ran rather than a second, independently
+    # computed guess at it. A resume reads these back and passes them straight
+    # through, which is the whole point: nothing downstream re-derives them.
+    tiling_params = _resolve_tiling_params(req)
+    req = req.model_copy(
+        update={"dataset_name": dataset_name, "tiling_params": tiling_params}
+    )
 
     eng = _get_engine()
     with eng.begin() as conn:
@@ -1519,10 +2209,12 @@ def _start_dataset_submission(
             text("""
                 INSERT INTO slurm_dataset_runs
                     (submission_id, raw_dir, mask_dir, tile_dir, status,
-                     is_subset, partition, notify_email, dataset_name)
+                     is_subset, partition, notify_email, dataset_name,
+                     tiling_params)
                 VALUES
                     (:submission_id, :raw_dir, :mask_dir, :tile_dir, 'queued',
-                     :is_subset, :partition, :notify_email, :dataset_name)
+                     :is_subset, :partition, :notify_email, :dataset_name,
+                     :tiling_params)
             """),
             {
                 "submission_id": submission_id,
@@ -1533,8 +2225,16 @@ def _start_dataset_submission(
                 "partition": req.partition,
                 "notify_email": req.notify_email,
                 "dataset_name": dataset_name,
+                # Serialised here rather than relying on the driver's dict
+                # adaptation, which differs between psycopg2 and psycopg3.
+                "tiling_params": json.dumps(tiling_params),
             },
         )
+
+    # After the INSERT, so a database without the lineage migration still gets
+    # a fully working run out of this function.
+    if resumed_from_submission_id:
+        _record_resume_lineage(submission_id, resumed_from_submission_id)
 
     background_tasks.add_task(_run_dataset_submission, submission_id, str(raw_dir), req)
 
@@ -1618,20 +2318,44 @@ def resume_dataset_job(submission_id: str, background_tasks: BackgroundTasks):
 
     missing_slide_ids = [slide_id_from_raw_path(p) for p in missing_raw_paths]
 
+    # The parameters the original run actually tiled with, so the resumed
+    # slides come out identical to the ones already on disk. Note min_tissue is
+    # deliberately NOT passed as a top-level field: doing so would put it in
+    # model_fields_set and let it override the recorded block (see
+    # _resolve_tiling_params). None here — a run predating the tiling_params
+    # column — falls back to current defaults, reported below so the caller
+    # knows the resume is not a guaranteed reproduction.
+    recorded_tiling_params = _row_tiling_params(row)
+
     resume_req = DatasetJobRequest(
         dataset_path=row["raw_dir"],
         slide_names=missing_slide_ids,
         partition=row["partition"],
         notify_email=row["notify_email"],
+        tiling_params=recorded_tiling_params,
         # Re-run into the same folder tiles already live in, not whatever
         # raw_dir.name would resolve to by default — matters if the
         # original submission was given a custom dataset_name.
         dataset_name=dataset_name,
     )
-    result = _start_dataset_submission(Path(row["raw_dir"]), resume_req, background_tasks)
+    result = _start_dataset_submission(
+        Path(row["raw_dir"]),
+        resume_req,
+        background_tasks,
+        # Persisted, not just echoed back: this reply is the only place the
+        # relationship existed before, so reloading the page lost it.
+        resumed_from_submission_id=submission_id,
+    )
     result.update({
         "resumed": True,
         "resumed_from_submission_id": submission_id,
+        # What the resumed slides will be tiled with, and whether that is the
+        # original run's own recorded settings or a fallback. The caller should
+        # surface the fallback case: mixing thresholds within one dataset is
+        # exactly the failure this is meant to prevent, and silently defaulting
+        # would reintroduce it for every pre-migration run.
+        "tiling_params": _resolve_tiling_params(resume_req),
+        "tiling_params_source": "original_run" if recorded_tiling_params else "defaults",
         "missing_slide_count": len(missing_raw_paths),
         "never_attempted_count": len(breakdown["never_attempted"]),
         "corrupt_metadata_count": len(breakdown["corrupt"]),
@@ -1639,6 +2363,25 @@ def resume_dataset_job(submission_id: str, background_tasks: BackgroundTasks):
         "total_in_original_manifest": total,
     })
     return result
+
+
+def _row_test_packaging_params(row) -> dict | None:
+    """What the recorded test packaging job actually sampled.
+
+    Lets the UI say "the job below is from an earlier setup" after a reload has
+    thrown away the form state it used to compare against — previously that
+    warning only worked within a single session, which is the one case where the
+    user could still remember what they had typed.
+    """
+    recorded = row.get("test_h5_params")
+    if not recorded:
+        return None
+    if isinstance(recorded, str):
+        try:
+            recorded = json.loads(recorded)
+        except json.JSONDecodeError:
+            return None
+    return recorded if isinstance(recorded, dict) else None
 
 
 def _row_dataset_name(row) -> str:
@@ -1661,6 +2404,299 @@ def _get_dataset_run_row(submission_id: str) -> dict:
     return dict(row)
 
 
+def _tiled_coverage(
+    raw_dir: Path, tile_dir: Path, dataset_name: str, *, strict: bool = False
+) -> dict:
+    """What is actually tiled on disk right now, for every slide in raw_dir.
+
+    The run's manifest says what a submission set out to do; this says what
+    exists. They diverge constantly and the difference is what the UI needs:
+    a subset run's manifest lists 30 slides, but the dataset folder may hold
+    tiles for all 400 because earlier runs (or a resume, or a hand-run job)
+    filled it in. Deciding what can be packaged from the manifest alone means
+    refusing to package tiles that are sitting right there.
+
+    "Tiled" delegates to tiling_output_complete() — the same function
+    submit_mask_tile_slurm.py's worker uses to decide whether to skip a slide —
+    so the two cannot drift apart as that test is tightened.
+
+    strict=False (the default) is the one deliberate difference. The full test
+    also parses the tile-metadata CSV to confirm its row count matches the
+    summary's saved_tiles, which costs a whole-file parse per slide: fine for
+    the single slide a worker is deciding about, ruinous across 14,000 of them
+    on cephfs while a user waits. The JSON checks (parseable summary,
+    saved_tiles present and sane) are kept, since those files are small.
+    #
+    The asymmetry that leaves is worth being explicit about: a slide whose CSV
+    stopped short of its summary counts as tiled here, and the worker would
+    re-tile it. That is the safe direction — the worker has the final say and
+    redoes the work — but it means this count can be marginally optimistic
+    after an interrupted tiling run. strict=True removes that gap at the cost
+    of reading every CSV, which is why it's opt-in and never used by anything
+    polling: it's for the one moment someone wants to sign off on a dataset
+    being finished before committing GPU hours to it.
+
+    Cost is a stat plus a small JSON read per slide over a network filesystem.
+    That's why this lives behind its own endpoint rather than in the 10s poll.
+    """
+    slide_dataset_dir = tile_dir / dataset_name
+    tiled: list[str] = []
+    untiled: list[str] = []
+    for slide_path in discover_slides(raw_dir):
+        slide_id = slide_id_from_raw_path(slide_path)
+        slide_tile_dir = slide_dataset_dir / slide_id
+        metadata = slide_tile_dir / f"{slide_id}_tile_metadata.csv"
+        summary = slide_tile_dir / f"{slide_id}_tiling_summary.json"
+        complete = tiling_output_complete(
+            metadata, summary, slide_tile_dir, verify_row_count=strict
+        )
+        (tiled if complete else untiled).append(str(slide_path))
+    return {
+        "raw_dir": str(raw_dir),
+        "dataset_name": dataset_name,
+        "strict": strict,
+        "slides_in_directory": len(tiled) + len(untiled),
+        "slides_tiled": len(tiled),
+        "slides_untiled": len(untiled),
+        "tiled_paths": tiled,
+        # Capped: this is for showing the user which slides still need work,
+        # and a full list on a 14,000-slide directory is neither useful in the
+        # UI nor cheap to ship on every poll.
+        "untiled_sample": [Path(p).name for p in untiled[:50]],
+    }
+
+
+@app.get("/dataset-jobs/{submission_id}/jobs")
+def dataset_job_history(submission_id: str):
+    """Every Slurm job this run has submitted, across all stages, newest first.
+
+    Separate from /status because it costs an sacct call and answers a different
+    question: /status says what the run can do next, this says what it has
+    already tried. Repackaging and repeated test packaging are invisible in
+    /status by design — those fields hold only the latest attempt.
+    """
+    _get_dataset_run_row(submission_id)      # 404s for an unknown run
+    return {"submission_id": submission_id, "jobs": _run_job_history(submission_id)}
+
+
+@app.get("/dataset-jobs/{submission_id}/tiled-coverage")
+def tiled_coverage(submission_id: str):
+    """Live, on-disk answer to "how much of this directory is actually tiled?"
+
+    Deliberately not folded into /status: it stats two files per slide over
+    cephfs, and /status is polled every 10s by every open tab.
+    """
+    row = _get_dataset_run_row(submission_id)
+    return _tiled_coverage(
+        Path(row["raw_dir"]), Path(row["tile_dir"]), _row_dataset_name(row)
+    )
+
+
+def _runs_for_directory(raw_dir: Path, dataset_name: str) -> list[dict]:
+    """Every recorded run that tiled into this (raw_dir, dataset_name) pair.
+
+    Filtering on dataset_name in Python rather than SQL because
+    _row_dataset_name() has to resolve a NULL column back to raw_dir's folder
+    name for rows predating that column — a WHERE clause would silently drop
+    exactly those older runs, which are the ones most likely to hold the
+    tiles nobody remembers submitting.
+    """
+    eng = _get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT * FROM slurm_dataset_runs WHERE raw_dir = :raw_dir "
+                "ORDER BY submitted_at ASC"
+            ),
+            {"raw_dir": str(raw_dir)},
+        ).mappings().fetchall()
+    return [dict(row) for row in rows if _row_dataset_name(row) == dataset_name]
+
+
+def _tiling_readiness(
+    raw_dir: Path, tile_dir: Path, dataset_name: str, *, strict: bool = False
+) -> dict:
+    """One answer to "is tiling finished for this whole directory?", across
+    every run that ever tiled into it.
+
+    The per-run endpoints cannot answer this, and that is the point. A run's
+    /status reports the run's own manifest — correct, but a 30-slide subset
+    run reporting 30/30 reads as "the dataset is tiled" when 14,000 slides
+    sit beside it untouched. Directories here get filled in by several runs
+    plus resumes plus hand-run jobs, so the only trustworthy scope is the
+    directory, and the only trustworthy authority is the disk.
+
+    Disk decides what is *done*; Slurm decides what that means about what is
+    *left*. Untiled slides with jobs still running is a wait; the same
+    untiled slides with nothing running is a stall needing resubmission, and
+    those two need to be distinguishable without reading sacct by hand.
+
+    sacct being unreachable is reported as its own verdict rather than
+    folded into either. _get_slurm_array_state_counts returns None for
+    "genuinely unknown" and {} for "ran fine, nothing in flight" — collapsing
+    those would let a controller outage read as "nothing is running, so this
+    has stalled" and send someone off to resubmit work that is mid-flight.
+    """
+    coverage = _tiled_coverage(raw_dir, tile_dir, dataset_name, strict=strict)
+    runs = _runs_for_directory(raw_dir, dataset_name)
+
+    job_ids: list[str] = []
+    for run in runs:
+        job_ids.extend(j for j in (run["job_id"] or "").split(",") if j)
+    job_ids = sorted(set(job_ids))
+
+    state_counts = _get_slurm_array_state_counts(job_ids)
+    slurm_known = state_counts is not None
+    in_flight = bool(
+        slurm_known and set(state_counts) & IN_FLIGHT_SLURM_STATES
+    )
+
+    untiled = coverage["slides_untiled"]
+    total = coverage["slides_in_directory"]
+
+    if not total:
+        verdict = "no_slides"
+        message = f"No supported WSI files found under {raw_dir}."
+    elif not untiled:
+        verdict = "complete"
+        message = (
+            f"All {total} slides in {raw_dir} have tiles on disk"
+            f"{' (row counts verified)' if strict else ''}."
+        )
+    elif in_flight:
+        verdict = "in_progress"
+        message = (
+            f"{coverage['slides_tiled']} of {total} slides tiled; "
+            f"tiling jobs are still running."
+        )
+    elif not slurm_known:
+        verdict = "unknown"
+        message = (
+            f"{coverage['slides_tiled']} of {total} slides tiled, but sacct "
+            f"could not be reached — cannot confirm whether the remaining "
+            f"{untiled} are still being worked on. Retry before resubmitting."
+        )
+    elif not runs:
+        # No tracked run has ever targeted this directory, so there is nothing
+        # to have stalled and nothing to resume. Kept distinct from "stalled"
+        # because the two need opposite actions — submit a first run here,
+        # versus resume an existing one — and because a brand-new dataset
+        # being told it "needs resubmitting" is the kind of wrong-but-plausible
+        # message that sends someone hunting for a run that never existed.
+        verdict = "not_started"
+        if coverage["slides_tiled"]:
+            message = (
+                f"{coverage['slides_tiled']} of {total} slides already have "
+                f"tiles, but no tracked run targeted this directory — they came "
+                f"from a hand-run job or a different raw_dir. Submit a run "
+                f"(POST /dataset-jobs) to tile the remaining {untiled}."
+            )
+        else:
+            message = (
+                f"None of the {total} slides in {raw_dir} have been tiled, and "
+                f"no run has been submitted for it. Submit one with "
+                f"POST /dataset-jobs."
+            )
+    else:
+        verdict = "stalled"
+        # Name a real run to resume rather than a {submission_id} placeholder —
+        # the most recent one, since _runs_for_directory orders oldest-first.
+        message = (
+            f"{coverage['slides_tiled']} of {total} slides tiled and no tiling "
+            f"job is running — the remaining {untiled} need resubmitting "
+            f"(POST /dataset-jobs/{runs[-1]['submission_id']}/resume)."
+        )
+
+    return {
+        "raw_dir": str(raw_dir),
+        "dataset_name": dataset_name,
+        # The plain yes/no. Deliberately only true on full coverage, so it
+        # cannot be satisfied by a subset run finishing its own manifest.
+        "tiling_done": verdict == "complete",
+        "verdict": verdict,
+        "message": message,
+        "strict": strict,
+        "slides_in_directory": total,
+        "slides_tiled": coverage["slides_tiled"],
+        "slides_untiled": untiled,
+        "untiled_sample": coverage["untiled_sample"],
+        # tiled_paths is omitted: 14,000 absolute paths is a payload nobody
+        # reading a verdict wants. /tiled-coverage still returns it for the
+        # callers that package from it.
+        "runs_checked": len(runs),
+        "runs": [
+            {
+                "submission_id": run["submission_id"],
+                "status": run["status"],
+                "is_subset": run["is_subset"],
+                "total_slides": run["total_slides"],
+                "job_id": run["job_id"],
+                "submitted_at": str(run["submitted_at"]) if run["submitted_at"] else None,
+            }
+            for run in runs
+        ],
+        "slurm_job_ids": job_ids,
+        "slurm_state_counts": state_counts,
+        "slurm_reachable": slurm_known,
+    }
+
+
+@app.get("/tiling-readiness")
+def tiling_readiness(
+    raw_dir: Optional[str] = Query(
+        None, description="Directory of WSIs to check. Omit if passing submission_id."
+    ),
+    dataset_name: Optional[str] = Query(
+        None, description="Tile folder under PROCESSED_TILES_DIR. Defaults to raw_dir's name."
+    ),
+    submission_id: Optional[str] = Query(
+        None, description="Resolve raw_dir/dataset_name from an existing run instead."
+    ),
+    strict: bool = Query(
+        False,
+        description="Also verify each slide's tile-metadata row count against its "
+                    "summary. Authoritative but reads every CSV — minutes on a "
+                    "14,000-slide directory. Use before committing to GPU hours.",
+    ),
+):
+    """Is tiling actually finished for a whole directory, across every run?
+
+    Not scoped to one submission, unlike /dataset-jobs/{id}/tiled-coverage —
+    pass submission_id only as a convenient way to name the directory, and
+    the answer still covers everything in it.
+
+    Same cost profile as /tiled-coverage (two files stat'd per slide over
+    cephfs, more with strict=true), so this is a button, not a poll.
+    """
+    if submission_id:
+        row = _get_dataset_run_row(submission_id)
+        resolved_raw = Path(row["raw_dir"])
+        resolved_tile = Path(row["tile_dir"])
+        resolved_dataset = dataset_name or _row_dataset_name(row)
+    elif raw_dir:
+        # Through the same resolver POST /dataset-jobs uses, so the path this
+        # looks up is byte-identical to what that endpoint stored. A bare
+        # Path(raw_dir) matched nothing for "~/x", a trailing slash, or a
+        # symlink — _runs_for_directory compares raw_dir as an exact string, so
+        # every run would silently drop out and a fully-tiled directory could
+        # report as never started.
+        try:
+            resolved_raw = _resolve_dataset_path(raw_dir)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        # PROCESSED_TILES_DIR is this server's current default. A run records
+        # its own tile_dir, so if one was submitted when that pointed
+        # elsewhere, pass submission_id instead and the row decides.
+        resolved_tile = PROCESSED_TILES_DIR
+        resolved_dataset = dataset_name or resolved_raw.name
+    else:
+        raise HTTPException(400, "Provide raw_dir or submission_id.")
+
+    return _tiling_readiness(
+        resolved_raw, resolved_tile, resolved_dataset, strict=strict
+    )
+
+
 @app.post("/dataset-jobs/{submission_id}/package")
 def start_packaging_job(
     submission_id: str,
@@ -1668,6 +2704,20 @@ def start_packaging_job(
         False,
         description="Package even though some slides failed tiling. Switches the Slurm "
                     "dependency from afterok to afterany and accepts a dataset with holes.",
+    ),
+    scope: str = Query(
+        "run",
+        description="'run' packages this run's own manifest (the default, unchanged). "
+                    "'tiled' packages every slide in the raw directory that has tiles on "
+                    "disk right now, regardless of which run produced them.",
+    ),
+    resume: Optional[bool] = Query(
+        None,
+        description="true continues a previous attempt's checkpoint (and fails if there "
+                    "is none); false discards it and repackages from scratch. Omit only "
+                    "for non-interactive callers — the UI always sends an explicit "
+                    "choice, because silently continuing an earlier attempt is a "
+                    "decision the user should be making.",
     ),
 ):
     """Manually start .h5 packaging for a run whose tiling has already been
@@ -1695,6 +2745,69 @@ def start_packaging_job(
             raise HTTPException(400, "Tiling hasn't been submitted yet for this run.")
 
         tile_dataset_name = _row_dataset_name(row)
+
+        manifest_path = Path(row["manifest_path"]) if row["manifest_path"] else None
+        if not manifest_path or not manifest_path.is_file():
+            raise HTTPException(400, f"Manifest no longer exists on disk: {manifest_path}")
+        job_ids = [j for j in row["job_id"].split(",") if j]
+
+        # Scope is resolved up front, before the retry guard below, because it
+        # decides *which output file* this submission is about. Resolving it
+        # afterwards meant the guard always judged the run's recorded path: a
+        # subset run whose own 30-slide .h5 had completed refused a scope="tiled"
+        # request with "Packaging has already completed for this run", even
+        # though the full-coverage .h5 it was actually asking for did not exist.
+        if scope == "tiled":
+            # Package what is on disk, not what this run set out to do. A
+            # subset run's manifest is 30 slides even when the dataset folder
+            # holds tiles for the whole directory — put there by an earlier
+            # run, a resume, or a hand-run job. Packaging from the manifest
+            # then ignores tiles sitting right there, and no amount of
+            # re-running this run widens it, because its manifest was fixed at
+            # submission time.
+            coverage = _tiled_coverage(
+                Path(row["raw_dir"]), Path(row["tile_dir"]), tile_dataset_name
+            )
+            if not coverage["slides_tiled"]:
+                raise HTTPException(
+                    400, f"No slide in {row['raw_dir']} has tiles on disk yet."
+                )
+            # The real-time completeness gate. Disk is the authority, not
+            # sacct: a slide either has its tiles or it does not, whatever
+            # Slurm remembers about the job that was meant to produce them.
+            if coverage["slides_untiled"] and not allow_incomplete:
+                raise HTTPException(
+                    400,
+                    {
+                        "error": "tiling_incomplete",
+                        "submission_id": submission_id,
+                        "slides_tiled": coverage["slides_tiled"],
+                        "slides_untiled": coverage["slides_untiled"],
+                        "slides_in_directory": coverage["slides_in_directory"],
+                        "untiled_sample": coverage["untiled_sample"],
+                        "message": (
+                            f"{coverage['slides_untiled']} of "
+                            f"{coverage['slides_in_directory']} slides in this directory "
+                            f"have no tiles on disk. Tile them first, or package the "
+                            f"{coverage['slides_tiled']} that do."
+                        ),
+                    },
+                )
+            manifest_path = manifest_path.parent / (
+                f"wsi_manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"_tiled_{tile_dataset_name}.txt"
+            )
+            write_manifest([Path(p) for p in coverage["tiled_paths"]], manifest_path)
+            # Full coverage of the dataset folder is by definition not a
+            # subset, so it takes the unsuffixed name and its own output
+            # directory — deliberately leaving any "_subset_N" .h5 this run
+            # already produced untouched instead of overwriting it.
+            dataset_name = _effective_h5_dataset_name(tile_dataset_name, False)
+            # Nothing to wait on: the tiles already exist. Keeping this run's
+            # tiling job IDs as a dependency would only expose the submission
+            # to slurmctld having forgotten them.
+            job_ids = []
+
         # Only pick a *new* "_subset_N" the first time this run packages.
         # _effective_h5_dataset_name numbers by scanning HPL_DATASETS_ROOT, so
         # calling it again on a retry returns the *next* N — i.e. a different
@@ -1709,10 +2822,27 @@ def start_packaging_job(
         # retries — the same approach start_feature_extraction_job already
         # takes, for the same reason. Full (non-subset) runs were unaffected
         # either way, since their name never had a suffix to renumber.
-        if row["h5_output_path"]:
-            dataset_name = Path(row["h5_output_path"]).parent.name
-        else:
-            dataset_name = _effective_h5_dataset_name(tile_dataset_name, bool(row["is_subset"]))
+        # scope="tiled" already chose its own name above and must not be
+        # overridden by whatever this run last recorded.
+        if scope != "tiled":
+            recorded_name = (
+                Path(row["h5_output_path"]).parent.name if row["h5_output_path"] else None
+            )
+            if recorded_name and not (
+                # One case where the recorded name must NOT be reused: a subset
+                # run that previously packaged with scope="tiled" has the
+                # *unsuffixed* full-dataset directory on record. Reading it back
+                # for a plain scope="run" retry would write this run's 30-slide
+                # manifest over the full-coverage .h5. Fall through to the
+                # computed subset name, which is where a run-scoped package
+                # belongs.
+                row["is_subset"] and recorded_name == tile_dataset_name
+            ):
+                dataset_name = recorded_name
+            else:
+                dataset_name = _effective_h5_dataset_name(
+                    tile_dataset_name, bool(row["is_subset"])
+                )
         # Scoped to this one submission so _find_job_id_by_name can recover
         # it below — must match the job_name passed to submit_packaging_job
         # further down.
@@ -1748,23 +2878,40 @@ def start_packaging_job(
             # leaves nothing at this path — but a stale .h5 from an earlier
             # successful run would still be sitting there, and existence alone
             # would read that as "this attempt already completed."
-            prior_output = Path(row["h5_output_path"]) if row["h5_output_path"] else None
-            prior_state = _get_slurm_job_state(row["h5_job_id"])
-            if _job_output_ready(prior_output, prior_state, validator=_validate_h5):
-                raise HTTPException(400, "Packaging has already completed for this run.")
-            if prior_state in IN_FLIGHT_SLURM_STATES:
+            #
+            # The comparison is against the output *this* submission would
+            # write, not the one the row happens to remember. The row has a
+            # single h5_job_id/h5_output_path slot shared by both scopes, so a
+            # subset run that finished its own 30-slide .h5 was blocking a
+            # scope="tiled" request for a completely different, non-existent
+            # file. Only a recorded job pointing at the same target can say
+            # anything about this one.
+            target_output = hpl_h5_output_path(HPL_DATASETS_ROOT, dataset_name)
+            recorded_output = Path(row["h5_output_path"]) if row["h5_output_path"] else None
+
+            if recorded_output == target_output:
+                prior_state = _get_slurm_job_state(row["h5_job_id"])
+                if _job_output_ready(target_output, prior_state, validator=_validate_h5):
+                    raise HTTPException(400, "Packaging has already completed for this run.")
+                if prior_state in IN_FLIGHT_SLURM_STATES:
+                    raise HTTPException(
+                        400,
+                        f"Packaging is already running for this run "
+                        f"(Slurm state: {prior_state}).",
+                    )
+                # Otherwise the prior attempt failed/was cancelled/timed out (or
+                # its state is unknown) — fall through and submit a fresh one.
+            elif _job_output_ready(target_output, "", validator=_validate_h5):
+                # A different target, but a complete and readable .h5 is already
+                # sitting at it — from an earlier run, or an earlier scope. Slurm
+                # state is irrelevant (no job on this row produced it), so "" is
+                # passed deliberately: the file itself is the evidence. Refuse
+                # rather than silently overwrite something valid.
                 raise HTTPException(
                     400,
-                    f"Packaging is already running for this run (Slurm state: {prior_state}).",
+                    f"A complete .h5 already exists at {target_output}. Delete or move "
+                    f"it first if you want to rebuild it.",
                 )
-            # Otherwise the prior attempt failed/was cancelled/timed out (or its
-            # state is unknown) — fall through and let this submit a fresh one.
-
-        manifest_path = Path(row["manifest_path"]) if row["manifest_path"] else None
-        if not manifest_path or not manifest_path.is_file():
-            raise HTTPException(400, f"Manifest no longer exists on disk: {manifest_path}")
-
-        job_ids = [j for j in row["job_id"].split(",") if j]
 
         # With afterok, submitting while any tiling task has failed produces a
         # job whose dependency can never be satisfied. --kill-on-invalid-dep
@@ -1773,10 +2920,10 @@ def start_packaging_job(
         # with something actionable instead. Deliberately conservative: only
         # states we positively observed as failures count, so an unreachable
         # sacct (None) or an unparsed state never blocks a legitimate submit.
+        tiling_states = _get_slurm_array_state_counts(job_ids)
         if not allow_incomplete:
-            tiling_states = _get_slurm_array_state_counts(job_ids) or {}
             failed_states = {
-                state: n for state, n in tiling_states.items()
+                state: n for state, n in (tiling_states or {}).items()
                 if state != "COMPLETED" and state not in IN_FLIGHT_SLURM_STATES
             }
             if failed_states:
@@ -1795,6 +2942,48 @@ def start_packaging_job(
                     },
                 )
 
+        # Drop the dependency once tiling is terminal, because by then it can
+        # only hurt. sbatch resolves --dependency against slurmctld, which
+        # forgets a job MinJobAge seconds after it ends (default 300), whereas
+        # the state check above reads sacct, whose retention is days. Between
+        # those two windows sits the common case: tiling finished yesterday,
+        # sacct still reports every task COMPLETED so nothing above objects,
+        # and then sbatch rejects the whole submission with "Job dependency
+        # problem" because slurmctld no longer recognises the IDs. Packaging
+        # was unreachable for exactly the runs most ready to be packaged.
+        #
+        # This does not weaken the afterok guarantee. afterok exists to stop
+        # packaging from starting while tiling is still going or after it
+        # failed, and both of those are decided above from sacct state — the
+        # dependency is a redundant second opinion here, and a stale one.
+        #
+        # Conservative on purpose: None means sacct was unreachable, so the
+        # states are genuinely unknown and the dependency stays as the
+        # backstop. An empty dict is different — per
+        # _get_slurm_array_state_counts, that means sacct answered AND squeue
+        # confirms nothing is live, i.e. the run aged out of accounting
+        # retention entirely, which is the strongest evidence available that
+        # it is long finished (and guarantees slurmctld has forgotten it too).
+        if tiling_states is not None and not any(
+            state in IN_FLIGHT_SLURM_STATES for state in tiling_states
+        ):
+            job_ids = []
+        else:
+            # Either sacct couldn't be reached (None — state genuinely
+            # unknown) or it reports tasks still in flight. Neither is proof
+            # the dependency is submittable, because sacct is not the
+            # component that resolves it. Ask the controller, which is: any
+            # ID it no longer holds makes the dependency unsatisfiable no
+            # matter what sacct believes, while a genuinely running job is
+            # always known to it, so filtering here can never drop a
+            # dependency that was doing real work. If scontrol itself is
+            # unusable (None) nothing is known for certain and the IDs stay
+            # untouched — a rejected submit is a better failure than
+            # packaging that quietly starts before tiling has finished.
+            known_job_ids = _slurm_controller_known_jobs(job_ids)
+            if known_job_ids is not None:
+                job_ids = known_job_ids
+
         try:
             packaging_result = submit_packaging_job(
                 manifest_path=manifest_path,
@@ -1803,6 +2992,7 @@ def start_packaging_job(
                 tile_dataset_name=tile_dataset_name,
                 depends_on_job_ids=job_ids,
                 allow_incomplete=allow_incomplete,
+                resume=resume,
                 partition=row["partition"],
                 notify_email=row["notify_email"],
                 job_name=job_name,
@@ -1824,28 +3014,240 @@ def start_packaging_job(
             h5_job_id=packaging_result.get("h5_job_id"),
             h5_output_path=packaging_result.get("h5_output_path"),
         )
+        _record_run_job(
+            submission_id, "packaging", packaging_result.get("h5_job_id"),
+            output_path=packaging_result.get("h5_output_path"),
+            params={"scope": scope, "resume": resume, "allow_incomplete": allow_incomplete},
+        )
         return {"submission_id": submission_id, **packaging_result}
+
+
+def _count_lines(path: Path) -> int:
+    """Line count without holding the file in memory.
+
+    The completed-tiles checkpoint is one label per line and can reach
+    millions of lines / hundreds of MB on a full run, so this reads in
+    blocks rather than splitlines()-ing the lot.
+    """
+    total = 0
+    with path.open("rb") as f:
+        while True:
+            block = f.read(1024 * 1024)
+            if not block:
+                return total
+            total += block.count(b"\n")
+
+
+# How long a .partial can go untouched before it stops counting as evidence of
+# a live writer. Generous on purpose: packaging alternates between long decode
+# batches (a whole batch of tiles is decoded by the worker pool before anything
+# is written) and bursts of writes, so short gaps are normal and a tight window
+# would flap between "running" and "stalled" on an entirely healthy job.
+_PACKAGING_ACTIVE_WINDOW_SECONDS = 15 * 60
+
+
+def _packaging_write_activity(final_h5_path: Path) -> dict:
+    """Whether something is currently writing this run's .h5, judged from disk.
+
+    Exists because Slurm state is not always available (see
+    _get_slurm_job_state) and is never available *promptly* — a job submitted
+    seconds ago may have no accounting row at all. The .partial's mtime has
+    neither problem: packaging touches it continuously while it runs, and the
+    file only exists between the start of an attempt and the os.replace() that
+    completes it.
+
+    Costs one stat() on one file, which is what makes it safe to include in the
+    10s status poll. Returns partial_* as None/False rather than raising when
+    the file isn't there, since "no .partial" is a normal state (not started, or
+    already finished and renamed).
+    """
+    partial_path = final_h5_path.with_name(final_h5_path.name + ".partial")
+    try:
+        stat = partial_path.stat()
+    except OSError:
+        return {
+            "h5_partial_exists": False,
+            "h5_partial_bytes": 0,
+            "h5_partial_seconds_since_write": None,
+            "h5_packaging_active": False,
+        }
+    seconds_since_write = max(0.0, time.time() - stat.st_mtime)
+    return {
+        "h5_partial_exists": True,
+        "h5_partial_bytes": stat.st_size,
+        "h5_partial_seconds_since_write": round(seconds_since_write, 1),
+        "h5_packaging_active": seconds_since_write < _PACKAGING_ACTIVE_WINDOW_SECONDS,
+    }
+
+
+@app.get("/dataset-jobs/{submission_id}/packaging-progress")
+def packaging_progress(
+    submission_id: str,
+    exact: bool = Query(
+        True,
+        description="Count the completed-tiles checkpoint exactly (hundreds of MB on a "
+                    "large run). Pass false for live polling, which estimates tiles "
+                    "written from the .partial's size instead — one stat() rather than "
+                    "a full file read.",
+    ),
+):
+    """How far an interrupted packaging attempt actually got.
+
+    Deliberately a separate endpoint rather than more fields on
+    /status: answering it means counting the lines of a checkpoint file
+    that can be hundreds of MB, and /status is polled every 10s by every
+    open browser tab. This is only called when someone actually opens the
+    packaging step in the UI.
+
+    "resumable" is the question the UI is really asking — whether clicking
+    package again would continue the previous attempt or silently start
+    from zero. That's true exactly when a .partial and its checkpoint are
+    both still on disk; package_slides_to_h5 then validates the recorded
+    run identity itself and falls back to a fresh run if anything moved.
+    """
+    row = _get_dataset_run_row(submission_id)
+    output_path = row["h5_output_path"]
+    if not row["h5_job_id"] or not output_path:
+        return {"state": "not_started", "resumable": False}
+
+    final_path = Path(output_path)
+    partial_path = final_path.with_name(final_path.name + ".partial")
+    ckpt = _checkpoint_paths(final_path)
+    slurm_state = _get_slurm_job_state(row["h5_job_id"])
+
+    activity = _packaging_write_activity(final_path)
+
+    info = {
+        "output_path": str(final_path),
+        "slurm_state": slurm_state,
+        "partial_exists": activity["h5_partial_exists"],
+        "partial_bytes": activity["h5_partial_bytes"],
+        "seconds_since_write": activity["h5_partial_seconds_since_write"],
+        "writing_now": activity["h5_packaging_active"],
+        # The finished article, so the UI can distinguish "no output yet" from
+        # "output exists but hasn't validated".
+        "final_exists": final_path.is_file(),
+        "final_bytes": final_path.stat().st_size if final_path.is_file() else 0,
+        "resumable": False,
+        "tiles_done": None,
+        "tiles_done_is_estimate": False,
+        "tiles_total": None,
+        "percent": None,
+        "bytes_per_tile": None,
+        "skipped_tiles": None,
+    }
+
+    if _job_output_ready(final_path, slurm_state, validator=_validate_h5):
+        info["state"] = "complete"
+        return info
+    # Disk activity outranks a missing Slurm state. A job whose .partial was
+    # touched moments ago is running, whatever sacct does or doesn't know — this
+    # is what stops a freshly-started job from being reported as "interrupted".
+    if slurm_state in IN_FLIGHT_SLURM_STATES or info["writing_now"]:
+        info["state"] = "running"
+    else:
+        info["state"] = "interrupted"
+
+    # tiles_total comes from the run config the attempt itself wrote, so it
+    # reflects what that attempt was actually packaging rather than a count
+    # recomputed now from possibly-changed tile directories.
+    tile_size = None
+    img_compression = None
+    if ckpt["config"].is_file():
+        try:
+            config = json.loads(ckpt["config"].read_text())
+            info["tiles_total"] = config.get("total_tiles")
+            tile_size = config.get("tile_size")
+            img_compression = config.get("img_compression")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Every tile occupies exactly tile_size**2 * 3 bytes in the .h5 (uint8, one
+    # tile per chunk) ONLY when the img dataset is uncompressed — that fixed
+    # width is what makes the .partial's size a usable proxy for tiles
+    # written, costing one stat() instead of a full checkpoint read. Once
+    # img_compression is set (see make_hpl_hdf5.py's _IMG_COMPRESSION), each
+    # tile's compressed chunk size varies with how much actual detail is in
+    # that tile, so this proxy has no fixed divisor to use and is left unset
+    # rather than reported as a number that quietly drifts from reality.
+    if tile_size and not img_compression:
+        info["bytes_per_tile"] = int(tile_size) ** 2 * 3
+
+    if exact and ckpt["completed"].is_file():
+        try:
+            info["tiles_done"] = _count_lines(ckpt["completed"])
+        except OSError:
+            pass
+    elif info["bytes_per_tile"] and info["partial_bytes"]:
+        # Slightly low: HDF5's own metadata (b-tree nodes, the superblock)
+        # shares the file, so dividing overstates nothing. Flagged as an
+        # estimate so the UI never presents it as a tile-accurate figure.
+        info["tiles_done"] = info["partial_bytes"] // info["bytes_per_tile"]
+        info["tiles_done_is_estimate"] = True
+
+    # Tiles the attempt gave up on (unreadable/corrupt JPEGs). Small file, and
+    # worth surfacing: they count as done for resume purposes but never make it
+    # into the .h5, so a run can legitimately finish short of tiles_total.
+    if ckpt["skipped"].is_file():
+        try:
+            info["skipped_tiles"] = _count_lines(ckpt["skipped"])
+        except OSError:
+            pass
+
+    if info["tiles_done"] is not None and info["tiles_total"]:
+        info["percent"] = round(
+            100.0 * min(info["tiles_done"], info["tiles_total"]) / info["tiles_total"], 1
+        )
+
+    # Resumability is about the checkpoint, so it needs a real count — an
+    # estimate from file size says nothing about whether the checkpoint exists.
+    # When polling cheaply, fall back to the checkpoint merely being non-empty.
+    if info["tiles_done_is_estimate"]:
+        try:
+            checkpoint_has_content = (
+                ckpt["completed"].is_file() and ckpt["completed"].stat().st_size > 0
+            )
+        except OSError:
+            checkpoint_has_content = False
+    else:
+        checkpoint_has_content = bool(info["tiles_done"])
+    info["resumable"] = bool(info["partial_exists"] and checkpoint_has_content)
+    return info
 
 
 class PackagingTestRequest(BaseModel):
     sample_size: Optional[int] = None
     slide_names: Optional[list[str]] = None
     random_seed: Optional[int] = None
+    # Which pool the sample is drawn from. "run" keeps the original behaviour
+    # (this run's own manifest); "tiled" draws from every slide in the raw
+    # directory that has tiles on disk, whichever run produced them — mirroring
+    # the same option on /package. Without this a test run could never exceed
+    # its run's manifest, so a 30-slide subset run capped every test sample at
+    # 30 however large a number the UI offered to accept.
+    scope: str = "run"
 
 
 @app.post("/dataset-jobs/{submission_id}/package-test")
 def start_test_packaging_job(submission_id: str, req: PackagingTestRequest):
-    """Package only a subset of this run's slides into a separately-named
-    test .h5 — sanity-check packaging (and a downstream feature-extraction
-    checkpoint) against a handful of slides before committing to a
-    multi-hour run over the whole dataset. Deliberately NOT tracked on the
-    run's own h5_job_id/h5_output_path — a test run succeeding or failing
-    has no bearing on whether the real packaging run is allowed to
-    proceed, and vice versa (the retry-guard above only ever looks at
-    h5_job_id, which this never touches).
+    """Package a chosen subset of slides into a separately-named test .h5 —
+    sanity-check packaging (and a downstream feature-extraction checkpoint)
+    against a sample before committing to a multi-hour run over the whole
+    dataset. Deliberately NOT tracked on the run's own
+    h5_job_id/h5_output_path — a test run succeeding or failing has no
+    bearing on whether the real packaging run is allowed to proceed, and
+    vice versa (the retry-guard above only ever looks at h5_job_id, which
+    this never touches).
+
+    scope="tiled" widens the pool past this run's manifest to everything
+    tiled on disk. That is the difference between "test the pipeline on 3
+    slides" and "test it on 3500 of the 14,000 I actually have", and only
+    the former was previously possible from a subset run.
     """
     if not req.sample_size and not req.slide_names:
         raise HTTPException(400, "Provide sample_size or slide_names for a test run.")
+    if req.scope not in ("run", "tiled"):
+        raise HTTPException(400, f"scope must be 'run' or 'tiled', got '{req.scope}'.")
 
     with _slurm_submission_lock():
         row = _get_dataset_run_row(submission_id)
@@ -1861,18 +3263,107 @@ def start_test_packaging_job(submission_id: str, req: PackagingTestRequest):
             raise HTTPException(400, f"Manifest no longer exists on disk: {manifest_path}")
 
         job_ids = [j for j in row["job_id"].split(",") if j]
+        # Same slurmctld-forgot-the-job-IDs problem the real /package endpoint
+        # handles — see the long note there. afterany is no more resolvable
+        # than afterok once the IDs have aged out of the controller, so a test
+        # package against a finished run failed at sbatch for a dependency
+        # that had nothing left to wait for.
+        test_tiling_states = _get_slurm_array_state_counts(job_ids)
+        if test_tiling_states is not None and not any(
+            state in IN_FLIGHT_SLURM_STATES for state in test_tiling_states
+        ):
+            job_ids = []
+        else:
+            known_job_ids = _slurm_controller_known_jobs(job_ids)
+            if known_job_ids is not None:
+                job_ids = known_job_ids
+
         tile_dataset_name = _row_dataset_name(row)
-        base_dataset_name = _effective_h5_dataset_name(tile_dataset_name, bool(row["is_subset"]))
+
+        if req.scope == "tiled":
+            # Draw from what is on disk instead of this run's fixed manifest.
+            # Tiles already exist, so there is nothing to depend on — keeping
+            # this run's tiling job IDs would only expose the submission to
+            # slurmctld having forgotten them, same as /package's scope="tiled".
+            coverage = _tiled_coverage(
+                Path(row["raw_dir"]), Path(row["tile_dir"]), tile_dataset_name
+            )
+            if not coverage["slides_tiled"]:
+                raise HTTPException(
+                    400, f"No slide in {row['raw_dir']} has tiles on disk yet."
+                )
+            manifest_path = manifest_path.parent / (
+                f"wsi_manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"_testpool_{tile_dataset_name}.txt"
+            )
+            write_manifest([Path(p) for p in coverage["tiled_paths"]], manifest_path)
+            job_ids = []
+            pool_size = coverage["slides_tiled"]
+        else:
+            pool_size = sum(
+                1 for line in manifest_path.read_text().splitlines() if line.strip()
+            )
+
+        # Checked here, before the signature and the Slurm lookup, so an
+        # over-large request is rejected against the pool the user actually
+        # asked for rather than surfacing later from select_slides with no
+        # mention of which pool it measured.
+        if req.sample_size and req.sample_size > pool_size:
+            pool_label = (
+                "tiled-on-disk" if req.scope == "tiled" else "run's manifest"
+            )
+            widen_hint = (
+                ""
+                if req.scope == "tiled"
+                else (
+                    " Retry with scope='tiled' to draw from every slide tiled "
+                    "on disk instead of just this run's."
+                )
+            )
+            raise HTTPException(
+                400,
+                {
+                    "error": "sample_larger_than_pool",
+                    "submission_id": submission_id,
+                    "scope": req.scope,
+                    "pool_size": pool_size,
+                    "requested": req.sample_size,
+                    "message": (
+                        f"Asked for {req.sample_size} slides but the "
+                        f"{pool_label} pool holds {pool_size}.{widen_hint}"
+                    ),
+                },
+            )
+
+        # A random draw with no seed is a different set of slides every time, so
+        # leaving the seed out of the signature made two genuinely different
+        # attempts share one output path — and, because the Slurm lookup below
+        # treats a matching name as "already done", made re-rolling a random
+        # sample impossible: same N came back as "already completed" while never
+        # having packaged those slides. Resolving a seed here keeps the
+        # signature honest, and makes the draw reproducible, which it never was.
+        # The cost is that an unseeded double-click submits two jobs instead of
+        # being deduped; pass an explicit random_seed to get the old idempotency.
+        resolved_seed = req.random_seed
+        if resolved_seed is None and req.sample_size:
+            resolved_seed = random.randrange(1_000_000_000)
+
+        base_dataset_name = _effective_h5_dataset_name(
+            tile_dataset_name,
+            # scope="tiled" is drawn from full coverage rather than this run's
+            # subset, so it doesn't inherit the run's "_subset_N" naming.
+            False if req.scope == "tiled" else bool(row["is_subset"]),
+        )
         # Signature-suffixed rather than a fixed "_test_sample" name: this
         # endpoint has no DB row to guard against, so the *filename itself*
         # is what has to keep two different test attempts (different
-        # sample_size/slide_names/random_seed) from clobbering each other's
-        # output, and keeps a re-run of the exact same attempt idempotent
+        # scope/sample_size/slide_names/seed) from clobbering each other's
+        # output, and keeps a re-run of an explicitly-seeded attempt idempotent
         # (same signature -> same path -> caught by the Slurm lookup below)
         # rather than piling up duplicate jobs.
         signature = _attempt_signature(
-            "package-test", submission_id, req.sample_size,
-            sorted(req.slide_names or []), req.random_seed,
+            "package-test", submission_id, req.scope, req.sample_size,
+            sorted(req.slide_names or []), resolved_seed,
         )
         test_dataset_name = f"{base_dataset_name}_test_sample_{signature}"
         job_name = f"hpl_h5_package_test_{signature}"
@@ -1905,7 +3396,7 @@ def start_test_packaging_job(submission_id: str, req: PackagingTestRequest):
                 notify_email=row["notify_email"],
                 sample_size=req.sample_size,
                 slide_names=req.slide_names,
-                random_seed=req.random_seed,
+                random_seed=resolved_seed,
                 job_name=job_name,
                 # A test run packages a deliberately-chosen handful of slides,
                 # so a partial dataset is the entire point — afterok would
@@ -1917,10 +3408,76 @@ def start_test_packaging_job(submission_id: str, req: PackagingTestRequest):
                 # silently falling back to submit_packaging_job's own default.
                 output_root=HPL_DATASETS_ROOT,
             )
+        except ValueError as e:
+            # select_slides() rejecting the request — asking for more slides
+            # than this run's manifest holds, or naming slides that aren't in
+            # it. That's the caller's input, not a server fault, and it used to
+            # come back as a 500 the UI could only show as a generic failure.
+            raise HTTPException(
+                400,
+                {
+                    "error": "invalid_slide_selection",
+                    "submission_id": submission_id,
+                    "manifest_slides": row["total_slides"],
+                    "message": str(e),
+                },
+            )
         except Exception as e:
             raise HTTPException(500, f"Failed to submit test packaging job: {e}")
 
-        return {"submission_id": submission_id, **result}
+        # Recorded on the run so the job survives a page reload. Written to
+        # test_h5_* rather than h5_job_id/h5_output_path on purpose: those gate
+        # the packaging retry guard and stage 3's h5_ready, and a subset sample
+        # must not satisfy either. This only makes the test job *visible* — it
+        # still has no bearing on whether real packaging may proceed.
+        #
+        # Failure here is logged, not raised: the Slurm job is already submitted
+        # by this point, and turning a bookkeeping error into a 500 would leave
+        # the caller believing nothing was queued while the job ran anyway.
+        try:
+            _update_dataset_run(
+                submission_id,
+                test_h5_job_id=result.get("h5_job_id"),
+                test_h5_output_path=result.get("h5_output_path"),
+                test_h5_submitted_at=datetime.now(timezone.utc),
+                test_h5_params=json.dumps({
+                    "scope": req.scope,
+                    "sample_size": req.sample_size,
+                    "slide_names": req.slide_names,
+                    "random_seed": resolved_seed,
+                    "pool_size": pool_size,
+                }),
+            )
+        except Exception as e:
+            print(f"[warn] test packaging job {result.get('h5_job_id')} submitted "
+                  f"but not recorded on {submission_id}: {e}")
+
+        # The history row is what makes a *second* test packaging visible: the
+        # test_h5_* columns above hold only the latest attempt, so without this
+        # an earlier sample and its .h5 path disappear the moment another runs.
+        _record_run_job(
+            submission_id, "packaging_test", result.get("h5_job_id"),
+            output_path=result.get("h5_output_path"),
+            params={
+                "scope": req.scope,
+                "sample_size": req.sample_size,
+                "slide_names": req.slide_names,
+                "random_seed": resolved_seed,
+                "pool_size": pool_size,
+            },
+        )
+
+        # scope/pool_size/random_seed are echoed back so the UI can state what
+        # was actually drawn and from where. random_seed especially: it's the
+        # only record of which slides a random sample picked, and without it
+        # a test .h5 worth investigating couldn't be reproduced.
+        return {
+            "submission_id": submission_id,
+            "scope": req.scope,
+            "pool_size": pool_size,
+            "random_seed": resolved_seed,
+            **result,
+        }
 
 
 @app.get("/dataset-jobs/{submission_id}/package-test-status")
@@ -1999,7 +3556,11 @@ def start_feature_extraction_job(submission_id: str, req: FeatureExtractionReque
             # behind by a killed/timed-out attempt would otherwise look done.
             prior_output = Path(row["extraction_output_path"]) if row["extraction_output_path"] else None
             prior_state = _get_slurm_job_state(row["extraction_job_id"])
-            if _job_output_ready(prior_output, prior_state):
+            # Validated, not just existence-checked: the encoder creates its
+            # output file before encoding anything, so a killed attempt leaves
+            # one behind that would otherwise read as a completed extraction
+            # and permanently block this run at "already completed".
+            if _job_output_ready(prior_output, prior_state, validator=_validate_extraction_output):
                 raise HTTPException(400, "Feature extraction has already completed for this run.")
             if prior_state in IN_FLIGHT_SLURM_STATES:
                 raise HTTPException(
@@ -2064,7 +3625,10 @@ def start_feature_extraction_job(submission_id: str, req: FeatureExtractionReque
                 notify_email=row["notify_email"],
                 job_name=job_name,
             )
-        except NotADirectoryError as e:
+        except (NotADirectoryError, FileExistsError, FileNotFoundError) as e:
+            # Misconfiguration and already-done are user-fixable states, not
+            # server faults — 400 with the message the submitter composed.
+            # FileNotFoundError covers a missing Singularity SIF / binary.
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(500, f"Failed to submit feature extraction job: {e}")
@@ -2074,6 +3638,11 @@ def start_feature_extraction_job(submission_id: str, req: FeatureExtractionReque
             extraction_job_id=result.get("extraction_job_id"),
             extraction_output_path=result.get("expected_output_path"),
             extraction_checkpoint=checkpoint,
+        )
+        _record_run_job(
+            submission_id, "extraction", result.get("extraction_job_id"),
+            output_path=result.get("expected_output_path"),
+            params={"checkpoint": checkpoint, "model": req.model, "marker": req.marker},
         )
         return {"submission_id": submission_id, **result}
 
@@ -2122,7 +3691,7 @@ def start_test_feature_extraction_job(submission_id: str, req: FeatureExtraction
         if existing_job_id:
             existing_output = expected_extraction_output_path(HPL_REPO_DIR, req.model, dataset_name, h5_path)
             existing_state = _get_slurm_job_state(existing_job_id)
-            if _job_output_ready(existing_output, existing_state):
+            if _job_output_ready(existing_output, existing_state, validator=_validate_extraction_output):
                 raise HTTPException(
                     400, "A test feature-extraction run with these exact parameters has already completed."
                 )
@@ -2145,11 +3714,26 @@ def start_test_feature_extraction_job(submission_id: str, req: FeatureExtraction
                 notify_email=row["notify_email"],
                 job_name=job_name,
             )
-        except NotADirectoryError as e:
+        except (NotADirectoryError, FileExistsError, FileNotFoundError) as e:
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(500, f"Failed to submit test feature extraction job: {e}")
 
+        # Recorded even though this endpoint still writes nothing to
+        # slurm_dataset_runs. That invariant is about *gating* — a test attempt
+        # must not satisfy extraction_ready — and history does not gate
+        # anything, so the two are not in tension. Before this, a test
+        # extraction existed only in the caller's session state.
+        _record_run_job(
+            submission_id, "extraction_test", result.get("extraction_job_id"),
+            output_path=result.get("expected_output_path"),
+            params={
+                "h5_path": str(h5_path),
+                "checkpoint": checkpoint,
+                "model": req.model,
+                "marker": req.marker,
+            },
+        )
         return {"submission_id": submission_id, **result}
 
 
@@ -2158,8 +3742,153 @@ def test_feature_extraction_status(submission_id: str, job_id: str, output_path:
     """Status for one ad-hoc test extraction job — same pattern as
     /package-test-status, nothing persisted server-side."""
     state = _get_slurm_job_state(job_id)
-    ready = _job_output_ready(Path(output_path), state)
-    return {"job_id": job_id, "slurm_state": state, "ready": ready, "output_path": output_path}
+    out_path = Path(output_path)
+    ready = _job_output_ready(out_path, state, validator=_validate_extraction_output)
+    payload = {"job_id": job_id, "slurm_state": state, "ready": ready, "output_path": output_path}
+    if not ready and out_path.is_file():
+        # The file existing while the job is finished means an attempt died
+        # partway. Surfacing the reason here is what stops the UI showing a
+        # bare "not ready" for a job Slurm already called done.
+        payload["extraction_invalid_reason"] = _validate_extraction_output(out_path)[1] or None
+    return payload
+
+
+class ClusterAssignmentRequest(BaseModel):
+    # Optional so the UI can just say "go": the reference is a deployment-level
+    # setting, not a per-run choice, and defaulting to the configured one keeps
+    # the common case a single click. Overridable because comparing two
+    # references is a real thing to want to do.
+    reference: str | None = None
+    backend: str = "auto"
+    k: int | None = None
+    overwrite: bool = False
+
+
+class ClusterAssignmentTestRequest(ClusterAssignmentRequest):
+    # An arbitrary projections .h5, typically the one a test extraction wrote.
+    projections_h5: str
+
+
+def _assignment_output_path(projections_h5: Path, dataset_name: str) -> Path:
+    """Where a run's assignment CSV goes: beside its projections file.
+
+    Not in backend/ or a shared results dir — the CSV is only meaningful
+    together with the embeddings it was computed from, and keeping the two
+    adjacent is what makes a stale pair obvious instead of plausible.
+    """
+    return projections_h5.parent / f"{dataset_name}_hpc_assignments.csv"
+
+
+@app.post("/dataset-jobs/{submission_id}/assign-clusters")
+def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentRequest):
+    """Stage 4: assign HPL cluster IDs to this run's embeddings by k-NN vote.
+
+    Gated on extraction having produced a *valid* output rather than merely
+    having run. Assigning clusters to a projections file that extraction left
+    half-written would read zero rows as embeddings and return cluster IDs for
+    them — confidently, since every tile gets a nearest neighbour however
+    meaningless the vector.
+    """
+    with _slurm_submission_lock():
+        row = _get_dataset_run_row(submission_id)
+        if not row["extraction_job_id"] or not row["extraction_output_path"]:
+            raise HTTPException(400, "Feature extraction hasn't been started for this run yet.")
+
+        projections = Path(row["extraction_output_path"])
+        ok, reason = _validate_extraction_output(projections)
+        if not ok:
+            raise HTTPException(
+                400,
+                f"Feature extraction has not produced a usable output yet ({reason}). "
+                f"Cluster assignment reads those embeddings, so it would produce IDs "
+                f"for rows the encoder never wrote.",
+            )
+
+        if row.get("assignment_job_id") and not req.overwrite:
+            state = _get_slurm_job_state(row["assignment_job_id"])
+            if state in _SLURM_IN_FLIGHT:
+                raise HTTPException(
+                    400,
+                    f"Cluster assignment is already running for this run "
+                    f"(job {row['assignment_job_id']}, state {state}).",
+                )
+
+        dataset_name = projections.parent.name if projections.parent.name else submission_id
+        out_csv = _assignment_output_path(projections, _row_dataset_name(row) or dataset_name)
+
+        try:
+            result = submit_cluster_assignment_job(
+                projections_h5=projections,
+                out_csv=out_csv,
+                reference=Path(req.reference) if req.reference else None,
+                backend=req.backend,
+                k=req.k,
+                notify_email=row["notify_email"],
+                job_name=f"hpl_assign_{submission_id}",
+                overwrite=True,  # decided above; the stage is cheap to redo
+            )
+        except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+            # Same split as the other stages: a missing reference or an input
+            # that isn't a projections file is the user's to fix, not a fault.
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(500, f"Failed to submit cluster assignment job: {e}")
+
+        _update_dataset_run(
+            submission_id,
+            assignment_job_id=result.get("assignment_job_id"),
+            assignment_output_path=result.get("out_csv"),
+            assignment_reference=result.get("reference_path"),
+        )
+        _record_run_job(
+            submission_id, "assignment", result.get("assignment_job_id"),
+            output_path=result.get("out_csv"),
+            params={
+                "reference": result.get("reference_path"),
+                "reference_rows": result.get("reference_rows"),
+                "n_clusters": result.get("n_clusters"),
+                "backend": req.backend,
+            },
+        )
+        return {"submission_id": submission_id, **result}
+
+
+@app.post("/dataset-jobs/{submission_id}/assign-clusters-test")
+def start_test_cluster_assignment_job(submission_id: str, req: ClusterAssignmentTestRequest):
+    """Assign clusters for an arbitrary projections .h5 — typically the output
+    of a test extraction — without touching this run's tracked Stage 4 state.
+
+    Deliberately writes nothing to slurm_dataset_runs, for the same reason
+    /extract-features-test does not: a test attempt must never satisfy
+    assignment_ready and let the run look further along than it is.
+    """
+    projections = Path(req.projections_h5)
+    ok, reason = _validate_extraction_output(projections)
+    if not ok:
+        raise HTTPException(400, f"{projections} is not a usable projections file ({reason}).")
+
+    out_csv = projections.with_name(f"{projections.stem}_hpc_assignments.csv")
+    try:
+        result = submit_cluster_assignment_job(
+            projections_h5=projections,
+            out_csv=out_csv,
+            reference=Path(req.reference) if req.reference else None,
+            backend=req.backend,
+            k=req.k,
+            job_name=f"hpl_assign_test_{submission_id}",
+            overwrite=True,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to submit test cluster assignment job: {e}")
+
+    _record_run_job(
+        submission_id, "assignment_test", result.get("assignment_job_id"),
+        output_path=result.get("out_csv"),
+        params={"projections_h5": str(projections), "reference": result.get("reference_path")},
+    )
+    return {"submission_id": submission_id, **result}
 
 
 @app.post("/dataset-jobs/{submission_id}/cancel")
@@ -2207,13 +3936,228 @@ def cancel_dataset_job(submission_id: str):
 
 
 @app.get("/dataset-jobs")
-def list_dataset_jobs():
-    """Past/active dataset job submissions, most recent first."""
+def list_dataset_jobs(
+    with_state: bool = Query(
+        False,
+        description="Also resolve each run's live Slurm state (one sacct call for "
+                    "the whole list). Off by default so the plain listing stays a "
+                    "single DB query.",
+    ),
+    limit: int = Query(
+        25, ge=1, le=200,
+        description="How many recent runs to resolve state for. Only applies with "
+                    "with_state=true.",
+    ),
+):
+    """Past/active dataset job submissions, most recent first.
+
+    with_state=true adds, per run:
+      stage        which pipeline stage it has reached, from the row alone
+      slurm_state  running / pending / complete / failed / no record / unknown
+
+    Resolved for the whole list in ONE sacct call (see _slurm_states_by_job) —
+    a per-run lookup would be one call each, and this endpoint is what draws the
+    "Recent dataset jobs" list on every page render.
+    """
     eng = _get_engine()
     df = pd.read_sql(
         "SELECT * FROM slurm_dataset_runs ORDER BY submitted_at DESC", eng
     )
-    return json.loads(df.to_json(orient="records", date_format="iso"))
+    rows = json.loads(df.to_json(orient="records", date_format="iso"))
+    if not with_state:
+        return rows
+
+    considered = rows[:limit]
+    wanted: list[str] = []
+    for row in considered:
+        # The stage each run has reached decides which job ID says whether it is
+        # busy. Reporting the tiling array's state for a run that finished
+        # tiling hours ago and is now packaging would describe the wrong job.
+        for field in ("extraction_job_id", "h5_job_id", "job_id"):
+            value = row.get(field)
+            if value:
+                wanted.extend(j for j in str(value).split(",") if j)
+                break
+
+    states = _slurm_states_by_job(sorted(set(wanted)))
+
+    for row in considered:
+        stage, job_ids = None, []
+        if row.get("extraction_job_id"):
+            stage, job_ids = "extracting features", [row["extraction_job_id"]]
+        elif row.get("h5_job_id"):
+            stage, job_ids = "packaging", [row["h5_job_id"]]
+        elif row.get("job_id"):
+            stage = "tiling"
+            job_ids = [j for j in str(row["job_id"]).split(",") if j]
+
+        row["stage"] = stage or (row.get("status") or "queued")
+
+        # A row status of error/cancelled is a decision already recorded about
+        # the run and outranks whatever Slurm remembers about its jobs — a
+        # cancelled run's batches may well read COMPLETED.
+        if row.get("status") in ("error", "cancelled"):
+            row["slurm_state"] = row["status"]
+        elif not job_ids:
+            row["slurm_state"] = row.get("status") or "queued"
+        elif states is None:
+            row["slurm_state"] = "unknown"
+        else:
+            seen: set[str] = set()
+            for job_id in job_ids:
+                for part in str(job_id).split(","):
+                    if part:
+                        seen |= states.get(part.split("_", 1)[0], set())
+            # seen passed as-is: empty means sacct ran and had no rows for these
+            # jobs ("no record" — aged out, or too fresh), which is a different
+            # answer from sacct being unreachable ("unknown") handled above.
+            row["slurm_state"] = _coarse_run_state(seen)
+
+    return rows
+
+
+def _packaging_scopes_by_run() -> dict[str, set[str]]:
+    """Which packaging scopes each run has used, from the job history.
+
+    Needed because "did this run package the whole dataset?" is not answerable
+    from slurm_dataset_runs alone. A run flagged is_subset normally produces a
+    `_subset_N` .h5, but the same run packaged with scope="tiled" packages
+    every slide with tiles on disk and gets the plain, unsuffixed name — a full
+    dataset .h5 produced by a subset run. Only the recorded params say which
+    happened.
+
+    One query for the whole table: it holds a handful of rows per run, and the
+    alternative is a lookup per dataset on an endpoint the UI polls.
+    """
+    scopes: dict[str, set[str]] = {}
+    try:
+        eng = _get_engine()
+        with eng.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT submission_id, params FROM slurm_dataset_run_jobs "
+                    "WHERE stage = 'packaging'"
+                )
+            ).mappings().fetchall()
+    except Exception as e:
+        # Same degradation as _run_job_history: the table may not exist yet if
+        # the code is deployed before migrate_dataset_run_jobs.sql is run. No
+        # history means no scope overrides, which lands on is_subset alone —
+        # conservative (a subset run's .h5 won't be claimed as the dataset's).
+        print(f"[warn] could not read packaging scopes: {e}")
+        return scopes
+
+    for row in rows:
+        params = row["params"]
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(params, dict):
+            continue
+        scope = params.get("scope")
+        if scope:
+            scopes.setdefault(str(row["submission_id"]), set()).add(str(scope))
+    return scopes
+
+
+@app.get("/datasets")
+def list_datasets(
+    dataset_name: Optional[str] = Query(
+        None,
+        description="Return only this dataset. Required alongside raw_dir when "
+                    "asking for coverage.",
+    ),
+    raw_dir: Optional[str] = Query(
+        None,
+        description="Return only the dataset tiled from this directory. Two runs "
+                    "can share a dataset_name from different raw directories.",
+    ),
+    coverage: bool = Query(
+        False,
+        description="Also walk the filesystem for the authoritative count of how "
+                    "many slides actually have tiles. Stats two files per slide "
+                    "over cephfs, so this is a button, not a poll — and only "
+                    "allowed for a single named dataset.",
+    ),
+):
+    """Every dataset, with all of its runs rolled up into one pipeline state.
+
+    This is the dataset-level counterpart to /dataset-jobs, which lists runs.
+    The distinction matters because a resume does not continue a run, it starts
+    a new one (see POST /dataset-jobs/{id}/resume) — so a dataset that took
+    three resumes to tile is four rows there, none of which can say whether the
+    dataset is finished. Here they are one entry with one answer and one
+    next_action.
+
+    Cost: one query for the runs, one for the packaging scopes, and a bounded
+    Slurm lookup (see _listing_job_states) — squeue for everything, sacct only
+    for recent jobs and only within a time budget. That is what makes it safe
+    to poll. coverage=true is the exception and is deliberately restricted to a
+    single dataset.
+    """
+    if coverage and not (dataset_name and raw_dir):
+        raise HTTPException(
+            400,
+            "coverage=true needs both dataset_name and raw_dir — it walks the "
+            "filesystem per slide, so it is not run across every dataset at once.",
+        )
+
+    eng = _get_engine()
+    df = pd.read_sql(
+        "SELECT * FROM slurm_dataset_runs ORDER BY submitted_at ASC", eng
+    )
+    rows = json.loads(df.to_json(orient="records", date_format="iso"))
+
+    grouped = group_runs_by_dataset(rows)
+    if dataset_name:
+        grouped = [d for d in grouped if d["dataset_name"] == dataset_name]
+    if raw_dir:
+        wanted = raw_dir.rstrip("/")
+        grouped = [d for d in grouped if d["raw_dir"].rstrip("/") == wanted]
+
+    job_states, states_complete = _listing_job_states(grouped)
+
+    scopes = _packaging_scopes_by_run()
+
+    resolved = []
+    for dataset in grouped:
+        dataset_coverage = None
+        if coverage:
+            runs = dataset["runs"]
+            # tile_dir is recorded per run and PROCESSED_TILES_DIR may have
+            # moved since; the run's own value is what its tiles were written
+            # under. Newest run wins, matching what a resume would use.
+            tile_dir = Path(runs[-1]["tile_dir"]) if runs and runs[-1].get("tile_dir") else PROCESSED_TILES_DIR
+            dataset_coverage = _tiling_readiness(
+                Path(dataset["raw_dir"]), tile_dir, dataset["dataset_name"]
+            )
+        resolved.append(
+            rollup_dataset(
+                dataset["raw_dir"],
+                dataset["dataset_name"],
+                dataset["runs"],
+                job_states=job_states,
+                # One stat per artifact (not per slide), which is what keeps
+                # this pollable. See _artifact_status for why existence at the
+                # final path is trustworthy: packaging stages to `.partial`
+                # and only os.replace()s on success.
+                path_exists=lambda p: bool(p) and Path(p).is_file(),
+                packaging_scopes=scopes,
+                coverage=dataset_coverage,
+            )
+        )
+
+    return {
+        "datasets": resolved,
+        "slurm_reachable": job_states is not None,
+        # False means some jobs were answered by the live queue alone, so a
+        # recent failure can be showing here as "no longer queued". Open the run
+        # for the precise answer — /dataset-jobs/{id}/status asks accounting
+        # about that one run and can afford to.
+        "slurm_states_complete": states_complete,
+    }
 
 
 @app.get("/dataset-jobs/{submission_id}/status")
@@ -2266,6 +4210,27 @@ def dataset_job_status(submission_id: str):
         "raw_dir": row["raw_dir"],
         "job_id": row["job_id"],
         "total_slides": row["total_slides"],
+        # Whether this run's manifest is itself a subset of the raw directory
+        # (submitted with sample_size / slide_names) rather than every slide in
+        # it. Exposed because the packaging step's "Full dataset" option means
+        # "every slide in *this run's manifest*", which for a subset run is not
+        # the full dataset at all — without this the UI had no way to say so,
+        # and a run created as a 30-slide sample looked identical to one over
+        # the whole directory right up until the .h5 came out short.
+        "is_subset": bool(row["is_subset"]),
+        # Needed by the UI to offer "run the whole directory" as a *new* run
+        # that reuses this one's tile output folder — the already-tiled slides
+        # are only skipped when the dataset name matches (the skip check in
+        # submit_mask_tile_slurm.py is scoped to tile_dir/<dataset_name>/).
+        "dataset_name": _row_dataset_name(row),
+        "partition": row["partition"],
+        "notify_email": row["notify_email"],
+        # What this run tiled with, so a derived submission (resume, or the
+        # packaging step's full-directory run) can reuse it instead of asking
+        # the user to retype settings it has no way to verify. None means the
+        # run predates the tiling_params column — the UI must say so rather
+        # than presenting the current defaults as this run's settings.
+        "tiling_params": _row_tiling_params(row),
         "h5_job_id": row["h5_job_id"],
         "h5_output_path": row["h5_output_path"],
         "extraction_job_id": row["extraction_job_id"],
@@ -2290,12 +4255,69 @@ def dataset_job_status(submission_id: str):
         # isn't usable, rather than showing a silent "not ready" forever.
         if not base["h5_ready"] and h5_path and h5_path.is_file():
             base["h5_invalid_reason"] = _validate_h5(h5_path)[1] or None
+        # Slurm-independent evidence that packaging is alive: the .partial is
+        # being written to right now. This is the only thing that answers "did
+        # my job actually start?" when sacct/squeue can't be reached — without
+        # it, h5_slurm_state comes back None and a job that had been running
+        # happily for an hour was reported as "interrupted (no Slurm record)".
+        # One stat() on one file, so it's cheap enough for the 10s poll.
+        if not base["h5_ready"] and h5_path:
+            base.update(_packaging_write_activity(h5_path))
+
+    # Test packaging, reported the same way as the real thing so the UI can
+    # show a Slurm state ticking and then a finished .h5, rather than the
+    # nothing it had once a reload discarded its session_state.
+    #
+    # row.get() rather than row[...]: this reads columns added by
+    # migrate_dataset_runs_test_packaging.sql, and the code may well be deployed
+    # before the migration is run. A missing column should degrade to "no test
+    # job recorded", not 500 every status poll for every run.
+    test_job_id = row.get("test_h5_job_id")
+    if test_job_id:
+        test_path = Path(row["test_h5_output_path"]) if row.get("test_h5_output_path") else None
+        test_state = _get_slurm_job_state(test_job_id)
+        base["test_h5_job_id"] = test_job_id
+        base["test_h5_output_path"] = row.get("test_h5_output_path")
+        base["test_h5_slurm_state"] = test_state
+        # Same three-condition test as real packaging (present, COMPLETED,
+        # actually readable) — a test .h5 that cannot be opened is no more
+        # usable for a checkpoint trial than a real one.
+        base["test_h5_ready"] = _job_output_ready(
+            test_path, test_state, validator=_validate_h5
+        )
+        base["test_h5_params"] = _row_test_packaging_params(row)
+        if not base["test_h5_ready"] and test_path and test_path.is_file():
+            base["test_h5_invalid_reason"] = _validate_h5(test_path)[1] or None
+        if not base["test_h5_ready"] and test_path:
+            # Prefixed, so a test job's write activity can't be mistaken for the
+            # real packaging job's in the same payload.
+            activity = _packaging_write_activity(test_path)
+            base.update({f"test_{k}": v for k, v in activity.items()})
 
     if row["extraction_job_id"]:
         ext_path = Path(row["extraction_output_path"]) if row["extraction_output_path"] else None
         ext_state = _get_slurm_job_state(row["extraction_job_id"])
-        base["extraction_ready"] = _job_output_ready(ext_path, ext_state)
+        base["extraction_ready"] = _job_output_ready(
+            ext_path, ext_state, validator=_validate_extraction_output
+        )
         base["extraction_slurm_state"] = ext_state
+        if not base["extraction_ready"] and ext_path and ext_path.is_file():
+            # Mirrors h5_invalid_reason / test_h5_invalid_reason above: an
+            # output that exists but doesn't validate is the single most
+            # confusing state to show without a reason attached.
+            base["extraction_invalid_reason"] = _validate_extraction_output(ext_path)[1] or None
+
+    if row.get("assignment_job_id"):
+        asg_path = Path(row["assignment_output_path"]) if row.get("assignment_output_path") else None
+        asg_state = _get_slurm_job_state(row["assignment_job_id"])
+        base["assignment_ready"] = _job_output_ready(
+            asg_path, asg_state, validator=_validate_assignment_output
+        )
+        base["assignment_slurm_state"] = asg_state
+        base["assignment_output_path"] = row.get("assignment_output_path")
+        base["assignment_reference"] = row.get("assignment_reference")
+        if not base["assignment_ready"] and asg_path and asg_path.is_file():
+            base["assignment_invalid_reason"] = _validate_assignment_output(asg_path)[1] or None
 
     if not row["job_id"] or not row["manifest_path"]:
         return base
@@ -2395,6 +4417,12 @@ def dataset_job_status(submission_id: str):
 
     base.update({
         "tiling_complete": tiling_complete,
+        # Distinguishes "tiling is genuinely still running" from "we could not
+        # ask Slurm". Both used to arrive at the UI as tiling_complete=False,
+        # which it rendered as "waiting on tiling" — a positive claim the
+        # server had no evidence for, and one that left packaging blocked with
+        # no way forward for as long as sacct stayed unreachable.
+        "slurm_unreachable": sacct_unreachable,
         "slurm_state_counts": slurm_state_counts,
         "attempted": len(succeeded) + len(zero_tile),
         "succeeded": len(succeeded),

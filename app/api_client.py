@@ -1,0 +1,526 @@
+"""
+API client for the HPC Tile Server.
+
+Streamlit imports this instead of calling OpenSlide / psycopg2 directly.
+Every image method returns a PIL Image; every metadata method returns a
+dict or DataFrame. A local disk cache avoids repeated network fetches.
+
+Usage in Streamlit:
+    from api_client import TileServerClient
+    client = TileServerClient("http://localhost:8000")
+    thumb = client.get_thumbnail("TCGA-55-7574-01Z-00-DX1")
+"""
+
+import io
+from typing import Optional
+
+import pandas as pd
+import requests
+from PIL import Image
+
+from local_cache import LocalImageCache
+
+
+class TileServerClient:
+    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 30):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.cache = LocalImageCache()
+        self._session = requests.Session()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get(self, path: str, params: dict | None = None, stream: bool = False, timeout: int | None = None):
+        url = f"{self.base_url}{path}"
+        r = self._session.get(url, params=params, timeout=timeout or self.timeout, stream=stream)
+        r.raise_for_status()
+        return r
+
+    def _get_json(self, path: str, params: dict | None = None, timeout: int | None = None) -> dict | list:
+        return self._get(path, params, timeout=timeout).json()
+
+    def _post_json(self, path: str, json_body: dict, timeout: int | None = None,
+                   params: dict | None = None) -> dict | list:
+        r = self._session.post(
+            f"{self.base_url}{path}", json=json_body, params=params,
+            timeout=timeout or self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def _get_image(self, path: str, params: dict | None = None,
+                   cache_key: tuple | None = None) -> Image.Image:
+        if cache_key:
+            cached = self.cache.get_image(*cache_key)
+            if cached:
+                return cached
+
+        r = self._get(path, params, stream=True)
+        data = r.content
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+
+        if cache_key:
+            self.cache.put_bytes(data, *cache_key)
+        return img
+
+    # ------------------------------------------------------------------
+    # Health / slide list
+    # ------------------------------------------------------------------
+
+    def health(self) -> dict:
+        return self._get_json("/health")
+
+    def list_slides(self) -> list[str]:
+        return self._get_json("/slides")["slides"]
+
+    # ------------------------------------------------------------------
+    # Upload endpoints
+    # ------------------------------------------------------------------
+
+    def upload_slide(self, uploaded_file, slide_id: str | None = None,
+                      confirm_overwrite: bool = False) -> dict:
+        """Upload a WSI file to the FastAPI tile server.
+
+        The server queues tissue masking + tiling as a background task right
+        after saving the file; poll get_processing_status() for progress.
+
+        Raises requests.HTTPError on any non-2xx response, same as every
+        other method here — including a 409 when slide_id already exists
+        from a previous upload. That 409's body is a structured dict
+        ({"error": "slide_id_exists", ...} or {"error": "slide_id_conflict",
+        ...}), not a plain message, specifically so a caller can catch
+        requests.HTTPError, inspect e.response.json()["detail"]["error"],
+        and — only for "slide_id_exists" — offer the user a confirmation
+        before retrying with confirm_overwrite=True. Silently retrying here
+        would defeat that; this method never overwrites without the caller
+        explicitly asking it to.
+        """
+        files = {
+            "file": (
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                getattr(uploaded_file, "type", None) or "application/octet-stream",
+            )
+        }
+        data = {
+            "slide_id": (slide_id or "").strip(),
+            "confirm_overwrite": "true" if confirm_overwrite else "false",
+        }
+
+        r = self._session.post(
+            f"{self.base_url}/upload-slide",
+            files=files,
+            data=data,
+            timeout=max(self.timeout, 600),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_processing_status(self, slide_id: str) -> dict:
+        """Background mask/tiling status for a slide: queued/masking/tiling/done/error."""
+        return self._get_json(f"/slide/{slide_id}/processing-status")
+
+    # ------------------------------------------------------------------
+    # Dataset-wide Slurm jobs
+    # ------------------------------------------------------------------
+
+    def get_dataset_roots(self) -> list[str]:
+        """Top-level directories under long-term-scratch, for reference only."""
+        return self._get_json("/dataset-roots")["datasets"]
+
+    def get_tile_dataset_names(self) -> list[str]:
+        """Existing dataset folders under processed_tiles (e.g. TCGA,
+        Radiogenomics), so the UI can offer reusing one instead of everyone
+        retyping the name by hand."""
+        return self._get_json("/tile-dataset-names")["dataset_names"]
+
+    def submit_dataset_job(
+        self,
+        dataset_path: str,
+        max_concurrent: int = 10,
+        min_tissue: float | None = 30.0,
+        sample_size: int | None = None,
+        slide_names: list[str] | None = None,
+        partition: str | None = None,
+        notify_email: str | None = None,
+        dataset_name: str | None = None,
+        tiling_params: dict | None = None,
+    ) -> dict:
+        """Queues the job and returns immediately with a submission_id to
+        poll via get_dataset_job_status — slide discovery + sbatch submission
+        happen server-side in the background, not within this request.
+
+        dataset_name is the folder tiles land in under processed_tiles (e.g.
+        "TCGA" or "Radiogenomics"). Leave it None to fall back to
+        dataset_path's own folder name.
+
+        tiling_params reproduces an earlier run's tiling exactly (as returned by
+        that run's status under the same key). Pass min_tissue=None alongside
+        it: the server treats an explicitly-sent min_tissue as an override of
+        the block, and it cannot distinguish a deliberate 30.0 from this
+        argument's default unless the key is absent from the request entirely.
+        """
+        body = {
+            "dataset_path": dataset_path,
+            "max_concurrent": max_concurrent,
+            "sample_size": sample_size,
+            "slide_names": slide_names,
+            "partition": partition,
+            "notify_email": notify_email,
+            "dataset_name": dataset_name,
+        }
+        # Omitted rather than sent as null, so it stays out of the server's
+        # model_fields_set and leaves tiling_params authoritative.
+        if min_tissue is not None:
+            body["min_tissue"] = min_tissue
+        if tiling_params:
+            body["tiling_params"] = tiling_params
+        return self._post_json("/dataset-jobs", body)
+
+    def list_dataset_jobs(self, with_state: bool = False) -> list[dict]:
+        """Recent dataset runs, newest first.
+
+        with_state=True adds "stage" and "slurm_state" (running / pending /
+        complete / failed / no record / unknown) per run. The server resolves
+        the whole list in one sacct call, so this costs one cluster round-trip
+        for the list rather than one per row — but it is a cluster round-trip,
+        hence the longer timeout.
+        """
+        if not with_state:
+            return self._get_json("/dataset-jobs")
+        return self._get_json("/dataset-jobs", params={"with_state": "true"},
+                              timeout=60)
+
+    def list_datasets(self) -> dict:
+        """Every dataset, with all of its runs rolled up into one pipeline state.
+
+        The dataset-level counterpart to list_dataset_jobs(), which lists runs.
+        Worth having both because a resume does not continue a run — it starts a
+        new one — so a dataset that took three resumes to tile is four rows in
+        the job list, none of which can say whether the dataset is finished.
+        Here they arrive as one entry with one set of three step states and one
+        next_action naming the single thing left to do.
+
+        Pollable: the server answers it with two queries and a bounded Slurm
+        lookup — squeue for every job, sacct only for recent ones and only
+        within a time budget. Longer timeout than a plain query because even
+        bounded, that is a cluster round-trip.
+
+        Returns the whole payload rather than just the list, because
+        slurm_states_complete belongs to the response as a whole: when it is
+        False some jobs were answered by the live queue alone, so a recent
+        failure can be showing as merely "no longer queued". Callers that
+        display these states must pass that on.
+        """
+        return self._get_json("/datasets", timeout=60)
+
+    def get_dataset_coverage(self, dataset_name: str, raw_dir: str) -> dict:
+        """One dataset's rollup with the authoritative on-disk tiling count.
+
+        Separate from list_datasets() because of what it costs: the server
+        stats two files per slide across the whole directory over cephfs, which
+        is minutes on a 14,000-slide dataset. Call it when someone opens a
+        dataset or asks "how much is actually tiled", never on the poll.
+
+        This is the only thing that can confirm tiling is genuinely finished.
+        Without it the rollup reports what Slurm says about the runs' own
+        manifests, and a directory tiled only by subset runs can have every job
+        COMPLETED while most of it sits untouched.
+        """
+        return self._get_json(
+            "/datasets",
+            params={
+                "dataset_name": dataset_name,
+                "raw_dir": raw_dir,
+                "coverage": "true",
+            },
+            timeout=300,
+        )["datasets"]
+
+    def get_dataset_job_history(self, submission_id: str) -> dict:
+        """Every Slurm job this run has submitted, all stages, newest first.
+
+        Separate call from get_dataset_job_status because it costs an sacct
+        round-trip and answers a different question: status says what the run
+        can do next, this says what it has already tried — including repackaging
+        and repeated test runs, which the status fields overwrite.
+        """
+        return self._get_json(f"/dataset-jobs/{submission_id}/jobs", timeout=60)
+
+    def get_dataset_job_status(self, submission_id: str) -> dict:
+        # Longer than the default timeout — this endpoint runs sacct
+        # against the cluster's accounting DB, which can take a while for
+        # a large dataset's array jobs even after batching it into one
+        # call server-side (see tile_server_v2_'s _get_slurm_array_state_counts).
+        return self._get_json(f"/dataset-jobs/{submission_id}/status", timeout=60)
+
+    def resume_dataset_job(self, submission_id: str) -> dict:
+        """Finds whatever slides from this run never got tiled (checked
+        against the filesystem) and queues a new submission for just those."""
+        return self._post_json(f"/dataset-jobs/{submission_id}/resume", {})
+
+    def cancel_dataset_job(self, submission_id: str) -> dict:
+        """scancels every Slurm job for this run (all tiling batches, the
+        packaging job, and the feature-extraction job, if any) and marks it
+        cancelled."""
+        return self._post_json(f"/dataset-jobs/{submission_id}/cancel", {})
+
+    def get_tiled_coverage(self, submission_id: str) -> dict:
+        """How much of this run's raw directory has tiles on disk right now.
+
+        Separate from get_dataset_job_status() on purpose — it stats two files
+        per slide over the network filesystem, so it must not ride along on the
+        10s status poll. Call it when the user is deciding what to package.
+        """
+        return self._get_json(f"/dataset-jobs/{submission_id}/tiled-coverage")
+
+    def start_packaging_job(
+        self,
+        submission_id: str,
+        allow_incomplete: bool = False,
+        scope: str = "run",
+        resume: bool | None = None,
+    ) -> dict:
+        """User-triggered: package this run's tiles into a .h5 now. Only
+        valid once tiling has been submitted; the server still adds its own
+        Slurm --dependency on the tiling jobs as a safety net.
+
+        Also resumes: if a previous attempt left a .partial and its
+        checkpoint on disk, the packaging job picks up from there rather
+        than re-decoding everything. Call get_packaging_progress() first to
+        tell the user which of the two is about to happen.
+
+        allow_incomplete=False means the server refuses (400
+        "tiling_incomplete") when any tiling task failed, because the
+        packaging job's Slurm dependency is afterok and could never be
+        satisfied. Pass True to package the dataset with those slides
+        missing — a deliberate choice, hence not the default.
+        """
+        params = {
+            "allow_incomplete": "true" if allow_incomplete else "false",
+            # "run" packages this run's own manifest; "tiled" packages every
+            # slide in the raw directory that has tiles on disk right now,
+            # whichever run produced them.
+            "scope": scope,
+        }
+        # Omitted when None so the server keeps its "continue a checkpoint if
+        # one exists" fallback for non-interactive callers. The UI always sends
+        # True or False, because resuming silently is the behaviour this
+        # parameter exists to remove.
+        if resume is not None:
+            params["resume"] = "true" if resume else "false"
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/package", {}, params=params,
+        )
+
+    def get_packaging_progress(self, submission_id: str, exact: bool = True) -> dict:
+        """How far a packaging attempt has got: state, tiles_done / tiles_total,
+        bytes written, time since the last write, and whether it's resumable.
+
+        Not part of get_dataset_job_status() on purpose — with exact=True it
+        counts lines in a checkpoint file that can be hundreds of MB, so that
+        form is meant to be called when the user opens the packaging step, not
+        on every poll.
+
+        exact=False is the pollable form: tiles_done is estimated from the
+        .partial's size (one stat, since every tile occupies an identical number
+        of bytes) and comes back flagged as tiles_done_is_estimate. Use it for
+        live progress; use exact=True when the number drives a decision, such as
+        telling the user how much a resume would skip.
+        """
+        return self._get_json(
+            f"/dataset-jobs/{submission_id}/packaging-progress",
+            params={"exact": "true" if exact else "false"},
+            timeout=60,
+        )
+
+    def start_feature_extraction(
+        self,
+        submission_id: str,
+        checkpoint: str,
+        model: str = "BarlowTwins_3",
+        marker: str = "he",
+    ) -> dict:
+        """User-triggered: run the packaged .h5 through Kai's frozen
+        self-supervised encoder. Only valid once packaging's .h5 is ready."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/extract-features",
+            {"checkpoint": checkpoint, "model": model, "marker": marker},
+        )
+
+    def start_cluster_assignment(
+        self,
+        submission_id: str,
+        reference: str | None = None,
+        backend: str = "auto",
+        k: int | None = None,
+        overwrite: bool = False,
+    ) -> dict:
+        """User-triggered: assign HPL cluster IDs to this run's embeddings by
+        k-NN vote against the reference. Only valid once extraction's
+        projections .h5 validates."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/assign-clusters",
+            {"reference": reference, "backend": backend, "k": k, "overwrite": overwrite},
+        )
+
+    def start_test_cluster_assignment(
+        self,
+        submission_id: str,
+        projections_h5: str,
+        reference: str | None = None,
+        backend: str = "auto",
+        k: int | None = None,
+    ) -> dict:
+        """Assign clusters for an arbitrary projections .h5 without recording
+        it against the run — so a test attempt can never make the run look
+        further along than it is."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/assign-clusters-test",
+            {"projections_h5": projections_h5, "reference": reference,
+             "backend": backend, "k": k},
+        )
+
+    def start_test_packaging(
+        self,
+        submission_id: str,
+        sample_size: int | None = None,
+        slide_names: list[str] | None = None,
+        random_seed: int | None = None,
+        scope: str = "run",
+    ) -> dict:
+        """Package a chosen subset of slides into a separate test .h5 — for
+        trying packaging (and a checkpoint) on a sample before committing to
+        the full multi-hour run. Not tracked against the run's own packaging
+        state, so it can be run any number of times without affecting (or
+        being blocked by) the real one.
+
+        scope="run" draws from this run's own manifest; "tiled" draws from
+        every slide with tiles on disk, which is the only way to test a
+        sample larger than the run itself.
+
+        Leave random_seed None for a fresh random draw each time. Pass the
+        seed echoed back in the response to reproduce a specific draw — and
+        note that re-sending the same explicit seed and count is treated as
+        the same attempt, so it will be refused as a duplicate rather than
+        packaged twice.
+        """
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/package-test",
+            {
+                "sample_size": sample_size,
+                "slide_names": slide_names,
+                "random_seed": random_seed,
+                "scope": scope,
+            },
+        )
+
+    def get_test_packaging_status(self, submission_id: str, job_id: str, output_path: str) -> dict:
+        return self._get_json(
+            f"/dataset-jobs/{submission_id}/package-test-status",
+            params={"job_id": job_id, "output_path": output_path},
+        )
+
+    def start_test_feature_extraction(
+        self,
+        submission_id: str,
+        h5_path: str,
+        checkpoint: str,
+        model: str = "BarlowTwins_3",
+        marker: str = "he",
+    ) -> dict:
+        """Run feature extraction against an arbitrary .h5 (typically a
+        test-sample .h5 from start_test_packaging) instead of this run's
+        own tracked one — validate a checkpoint on a small sample first."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/extract-features-test",
+            {"h5_path": h5_path, "checkpoint": checkpoint, "model": model, "marker": marker},
+        )
+
+    def get_test_feature_extraction_status(self, submission_id: str, job_id: str, output_path: str) -> dict:
+        return self._get_json(
+            f"/dataset-jobs/{submission_id}/extract-features-test-status",
+            params={"job_id": job_id, "output_path": output_path},
+        )
+
+    # ------------------------------------------------------------------
+    # Slide-level endpoints
+    # ------------------------------------------------------------------
+
+    def get_slide_info(self, slide_id: str) -> dict:
+        return self._get_json(f"/slide/{slide_id}/info")
+
+    def get_thumbnail(self, slide_id: str, max_width: int = 3000,
+                      quality: int = 85) -> Image.Image:
+        return self._get_image(
+            f"/slide/{slide_id}/thumbnail",
+            params={"max_width": max_width, "quality": quality},
+            cache_key=("thumb", slide_id, max_width),
+        )
+
+    def get_tile(self, slide_id: str, level: int, x: int, y: int,
+                 w: int = 256, h: int = 256, quality: int = 85) -> Image.Image:
+        return self._get_image(
+            f"/slide/{slide_id}/tile",
+            params={"level": level, "x": x, "y": y, "w": w, "h": h, "quality": quality},
+            cache_key=("tile", slide_id, level, x, y, w, h),
+        )
+
+    def get_region(self, slide_id: str, x: int, y: int,
+                   w: int, h: int, level: int = 0,
+                   quality: int = 85) -> Image.Image:
+        return self._get_image(
+            f"/slide/{slide_id}/region",
+            params={"x": x, "y": y, "w": w, "h": h, "level": level, "quality": quality},
+            cache_key=("region", slide_id, level, x, y, w, h),
+        )
+
+    # ------------------------------------------------------------------
+    # Tile metadata
+    # ------------------------------------------------------------------
+
+    def get_tiles_meta(self, slide_id: str) -> pd.DataFrame:
+        """All tile coords + HPC labels + heatmap probs for a slide."""
+        records = self._get_json(f"/slide/{slide_id}/tiles_meta")
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records)
+
+    def get_adjacency(self, slide_id: str) -> dict:
+        return self._get_json(f"/slide/{slide_id}/adjacency")
+
+    # ------------------------------------------------------------------
+    # HPC endpoints
+    # ------------------------------------------------------------------
+
+    def get_hpc_info(self, hpc_id: int) -> dict:
+        return self._get_json(f"/hpc/{hpc_id}/info")
+
+    def get_hpc_survival(self, hpc_id: int) -> dict:
+        return self._get_json(f"/hpc/{hpc_id}/survival")
+
+    # ------------------------------------------------------------------
+    # H5 tile image by slide_tile key
+    # ------------------------------------------------------------------
+
+    def get_tile_image(self, slide_tile: str, quality: int = 85) -> Image.Image:
+        return self._get_image(
+            f"/tile_image/{slide_tile}",
+            params={"quality": quality},
+            cache_key=("h5tile", slide_tile),
+        )
+
+    # ------------------------------------------------------------------
+    # Full query (Phase 2: move NL pipeline to server)
+    # ------------------------------------------------------------------
+
+    def query(self, query_text: str, slide_id: Optional[str] = None) -> dict:
+        r = self._session.post(
+            f"{self.base_url}/query",
+            json={"query": query_text, "slide_id": slide_id},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()

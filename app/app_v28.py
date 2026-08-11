@@ -2313,14 +2313,9 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
         # depend on that at all, and returning here would have made embeddings
         # that already exist on disk unreachable from the UI — the exact case of a
         # subset encoded before the run was being tracked.
-        st.caption(
-            "This run has no finished feature extraction yet, so there is nothing "
-            "tracked to assign. If you already have a projections .h5 on disk, "
-            "assign it directly:"
-        )
         _render_assign_clusters_form(
             status, submission_id, key_prefix,
-            button_label="Assign clusters for this .h5", test_only=True,
+            button_label="Start cluster classification", full_available=False,
         )
         return
 
@@ -2344,7 +2339,7 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
 
 def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: str,
                                  button_label: str = "Start cluster assignment",
-                                 test_only: bool = False):
+                                 full_available: bool = True):
     """Reference + backend inputs for Stage 4.
 
     The reference is left blank by default on purpose: it is a deployment-level
@@ -2353,17 +2348,18 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
     real thing to want, and because a run assigned against the wrong one looks
     completely healthy.
     """
-    # test_only when the run has no tracked projections file: offering "Full
-    # dataset" there would be a button whose only outcome is a 400.
-    if test_only:
-        mode = "Test on a sample .h5"
-    else:
-        mode = st.radio(
-            "Run",
-            ["Full dataset", "Test on a sample .h5"],
-            horizontal=True,
-            key=f"{key_prefix}assign_mode_{submission_id}",
-        )
+    # Both modes are always offered, matching Stages 2 and 3 — a stage that
+    # silently drops one of its options reads as a different stage. What varies
+    # is whether "Full dataset" can actually run: it needs this run's tracked
+    # extraction output, which full_available reports. Rather than a dead button,
+    # choosing it without that says why and points at the other mode.
+    mode = st.radio(
+        "Run",
+        ["Full dataset", "Test on a sample .h5"],
+        horizontal=True,
+        index=0 if full_available else 1,
+        key=f"{key_prefix}assign_mode_{submission_id}",
+    )
 
     with st.expander("Options", expanded=False):
         reference = st.text_input(
@@ -2389,6 +2385,15 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
             help="Typically what a test feature extraction wrote. Results are not "
                  "recorded against this run.",
         )
+
+    if mode == "Full dataset" and not full_available:
+        st.info(
+            "This run has no finished feature extraction, so there is no tracked "
+            "projections file to assign. Either finish Stage 3, or switch to "
+            "\"Test on a sample .h5\" above and give the path to a projections .h5 "
+            "you already have."
+        )
+        return
 
     if not st.button(button_label, key=f"{key_prefix}assign_start_{submission_id}"):
         return

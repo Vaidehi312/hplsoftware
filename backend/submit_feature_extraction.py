@@ -110,9 +110,21 @@ GPU_GRES = os.getenv("HPL_GPU_GRES", "gpu:nvidia_h200:1")
 # H200 first, then whatever is next best, so a busy H200 queue does not stall a
 # run that an H100 or A100 would serve just as well — see select_gpu_gres for
 # why "just as well" is close to literal here.
+# This cluster's actual GRES type names, from `sinfo -p gpu -o "%N %G %t %D"`.
+# They matter exactly: an earlier version guessed "nvidia_h100"/"nvidia_a100",
+# neither of which exists here, so the fallback silently never engaged and every
+# run queued for the busy H200s just as before. A preference list that does not
+# match the cluster is inert, not approximate — hence _match_gpu_type's
+# substring fallback and the warning when a listed type is absent.
+#
+# Ordered by memory bandwidth, what a decode-bound encoder would notice first:
+# H200 (HBM3e) > H100 SXM (HBM3) > H100 PCIe (HBM2e) > A100 PCIe. All four
+# exceed the ~1.4k tiles/s the read path sustains, so the ordering is close to
+# academic and the real point is availability.
 GPU_PREFERENCE = tuple(
     t.strip() for t in os.getenv(
-        "HPL_GPU_PREFERENCE", "nvidia_h200,nvidia_h100,nvidia_a100"
+        "HPL_GPU_PREFERENCE",
+        "nvidia_h200,nvidia_h100_80gb_hbm3,nvidia_h100_pcie,nvidia_a100_80gb_pcie",
     ).split(",") if t.strip()
 )
 SINGULARITY_BIN = os.getenv("HPL_SINGULARITY_BIN", "/usr/bin/singularity")
@@ -224,6 +236,11 @@ def discover_gpu_types(partition: str, timeout: int = 20) -> dict[str, dict[str,
         except ValueError:
             continue
         # "gpu:nvidia_h200:4(S:0-1),gpu:nvidia_h100:2" and "(null)" both occur.
+        # So does the same type listed twice on one line — this cluster reports
+        # both "gpu:X:4(S:0-1)" and "gpu:X:X:4" — so types are collected per line
+        # and counted once. Without that every node is tallied twice and the
+        # printed "N idle node(s)" overstates what is actually free.
+        line_types = set()
         for spec in gres_field.split(","):
             spec = spec.strip()
             if not spec.startswith("gpu:"):
@@ -232,6 +249,9 @@ def discover_gpu_types(partition: str, timeout: int = 20) -> dict[str, dict[str,
             if len(fields) < 3:
                 continue  # bare "gpu:4" names no type, so it cannot be preferred
             gpu_type = fields[1]
+            if gpu_type in line_types:
+                continue
+            line_types.add(gpu_type)
             entry = found.setdefault(gpu_type, {"total": 0, "idle": 0, "mix": 0})
             entry["total"] += nodes
             # sinfo suffixes carry the part that matters most here. '*' means
@@ -248,6 +268,22 @@ def discover_gpu_types(partition: str, timeout: int = 20) -> dict[str, dict[str,
             elif base in ("mix", "mixed"):
                 entry["mix"] += nodes
     return found
+
+
+def _match_gpu_type(preferred: str, available: dict) -> str | None:
+    """Resolve a preference entry against the cluster's actual type names.
+
+    Exact match first. Failing that, a *unique* substring match, so a list
+    written as "nvidia_a100" still finds "nvidia_a100_80gb_pcie" on a cluster
+    that spells it out. Ambiguous substrings resolve to nothing rather than
+    guessing between cards of different speeds — "nvidia_h100" against both
+    nvidia_h100_pcie and nvidia_h100_80gb_hbm3 is a tie this cannot break, and
+    picking either would be a silent performance decision.
+    """
+    if preferred in available:
+        return preferred
+    matches = [name for name in available if preferred in name]
+    return matches[0] if len(matches) == 1 else None
 
 
 def select_gpu_gres(
@@ -287,17 +323,28 @@ def select_gpu_gres(
             f"sinfo unavailable — requesting {preference[0]} without checking",
         )
 
+    resolved = [(p, _match_gpu_type(p, available)) for p in preference]
+    absent = [p for p, name in resolved if name is None]
+    if absent:
+        # Loud, because this is exactly how the feature goes inert: a list naming
+        # types the cluster does not have falls straight through to "queue for
+        # the first one", which is the behaviour the fallback exists to replace.
+        print(
+            f"NOTE: {absent} not present on partition {partition!r}, which has "
+            f"{sorted(available)}. Set HPL_GPU_PREFERENCE to match.",
+            file=sys.stderr,
+        )
+
     for stage, key in (("idle", "idle"), ("partly free", "mix")):
-        for gpu_type in preference:
-            entry = available.get(gpu_type)
-            if entry and entry[key] > 0:
+        for _, gpu_type in resolved:
+            if gpu_type and available[gpu_type][key] > 0:
                 return (
                     f"gpu:{gpu_type}:{count}",
-                    f"{gpu_type}: {entry[key]} {stage} node(s)",
+                    f"{gpu_type}: {available[gpu_type][key]} {stage} node(s)",
                 )
 
-    for gpu_type in preference:
-        if gpu_type in available:
+    for _, gpu_type in resolved:
+        if gpu_type:
             return (
                 f"gpu:{gpu_type}:{count}",
                 f"{gpu_type} exists but nothing is free — queueing for it",

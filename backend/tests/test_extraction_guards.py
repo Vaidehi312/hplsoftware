@@ -477,20 +477,20 @@ def _select_with_sinfo(monkeypatched_output, *, returncode=0, raises=None):
 def test_best_free_gpu_is_chosen(tmp_path):
     del tmp_path
     # H200 free -> take it.
-    gres, _ = _select_with_sinfo("gpu:nvidia_h200:4|idle|2\ngpu:nvidia_a100:8|idle|3\n")
+    gres, _ = _select_with_sinfo("gpu:nvidia_h200:4|idle|2\ngpu:nvidia_a100_80gb_pcie:8|idle|3\n")
     assert gres == "gpu:nvidia_h200:1", gres
 
     # H200 fully allocated -> next preference that is free.
     gres, _ = _select_with_sinfo(
-        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_h100:4|idle|1\ngpu:nvidia_a100:8|idle|3\n"
+        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_h100_80gb_hbm3:4|idle|1\ngpu:nvidia_a100_80gb_pcie:8|idle|3\n"
     )
-    assert gres == "gpu:nvidia_h100:1", gres
+    assert gres == "gpu:nvidia_h100_80gb_hbm3:1", gres
 
     # Nothing idle, but an A100 node is partly free -> better than waiting.
     gres, _ = _select_with_sinfo(
-        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_h100:4|alloc|1\ngpu:nvidia_a100:8|mix|3\n"
+        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_h100_80gb_hbm3:4|alloc|1\ngpu:nvidia_a100_80gb_pcie:8|mix|3\n"
     )
-    assert gres == "gpu:nvidia_a100:1", gres
+    assert gres == "gpu:nvidia_a100_80gb_pcie:1", gres
 
 
 def test_nothing_free_queues_for_the_best(tmp_path):
@@ -498,7 +498,7 @@ def test_nothing_free_queues_for_the_best(tmp_path):
     this cannot compare queue depths."""
     del tmp_path
     gres, reason = _select_with_sinfo(
-        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_a100:8|alloc|3\n"
+        "gpu:nvidia_h200:4|alloc|2\ngpu:nvidia_a100_80gb_pcie:8|alloc|3\n"
     )
     assert gres == "gpu:nvidia_h200:1", gres
     assert "queueing" in reason
@@ -509,8 +509,8 @@ def test_unresponsive_nodes_do_not_count_as_free(tmp_path):
     unschedulable. Counting it would keep picking a dead H200 over a live
     A100 — a job that queues forever rather than one that runs."""
     del tmp_path
-    gres, _ = _select_with_sinfo("gpu:nvidia_h200:4|idle*|2\ngpu:nvidia_a100:8|idle|3\n")
-    assert gres == "gpu:nvidia_a100:1", gres
+    gres, _ = _select_with_sinfo("gpu:nvidia_h200:4|idle*|2\ngpu:nvidia_a100_80gb_pcie:8|idle|3\n")
+    assert gres == "gpu:nvidia_a100_80gb_pcie:1", gres
 
 
 def test_unknown_cluster_types_are_used_rather_than_invented(tmp_path):
@@ -531,6 +531,101 @@ def test_missing_sinfo_is_not_read_as_no_gpus(tmp_path):
         gres, reason = _select_with_sinfo("", **kwargs)
         assert gres == "gpu:nvidia_h200:1", gres
         assert "unavailable" in reason
+
+
+# Verbatim `sinfo -p gpu -o "%N %G %t %D"` from the cluster, including the
+# duplicated type entries and the shard: lines. Kept literal because both of
+# those broke a first attempt at this: the duplicates double-counted nodes, and
+# guessed type names ("nvidia_h100") matched nothing here, which made the whole
+# fallback inert while looking like it worked.
+REAL_SINFO = (
+    "gpu:nvidia_h100_80gb_hbm3:4(S:0-1),shard:nvidia_h100_80gb_hbm3:240(S:0-1),"
+    "gpu:nvidia_h100_80gb_hbm3:nvidia_h100_80gb_hbm3:4|mix|1\n"
+    "gpu:nvidia_h200:8(S:0-1),shard:nvidia_h200:1144(S:0-1),"
+    "gpu:nvidia_h200:nvidia_h200:8|alloc|2\n"
+    "gpu:nvidia_h100_pcie:3(S:0-1),shard:nvidia_h100_pcie:240(S:0-1),"
+    "gpu:nvidia_h100_pcie:nvidia_h100_pcie:3|idle|1\n"
+    "gpu:nvidia_a100_80gb_pcie:2(S:0),shard:nvidia_a100_80gb_pcie:160(S:0),"
+    "gpu:nvidia_a100_80gb_pcie:nvidia_a100_80gb_pcie:2|idle|1\n"
+)
+
+
+def test_real_cluster_types_are_the_defaults(tmp_path):
+    """Every default preference must exist on the cluster, or the fallback is
+    inert: a list of absent names falls through to "queue for the first one",
+    which is precisely the behaviour it was added to replace."""
+    del tmp_path
+    from submit_feature_extraction import discover_gpu_types
+    import submit_feature_extraction as sfe
+
+    original = sfe.subprocess.run
+
+    class _R:
+        stdout, stderr, returncode = REAL_SINFO, "", 0
+
+    try:
+        sfe.subprocess.run = lambda *a, **k: _R()
+        available = discover_gpu_types("gpu")
+    finally:
+        sfe.subprocess.run = original
+
+    for gpu_type in GPU_PREFERENCE:
+        assert gpu_type in available, (
+            f"{gpu_type} is in the default preference but not on the cluster; "
+            f"it has {sorted(available)}"
+        )
+
+
+def test_node_counts_are_not_doubled_by_duplicate_gres_entries(tmp_path):
+    """This cluster lists each type twice per line ("gpu:X:4" and "gpu:X:X:4").
+    Counting both would report two idle nodes where there is one, so the reason
+    printed at submit time would overstate what is free."""
+    del tmp_path
+    import submit_feature_extraction as sfe
+
+    original = sfe.subprocess.run
+
+    class _R:
+        stdout, stderr, returncode = REAL_SINFO, "", 0
+
+    try:
+        sfe.subprocess.run = lambda *a, **k: _R()
+        available = sfe.discover_gpu_types("gpu")
+    finally:
+        sfe.subprocess.run = original
+
+    # Straight from the NODES column of the sinfo output above.
+    assert available["nvidia_h100_80gb_hbm3"]["total"] == 1
+    assert available["nvidia_h200"]["total"] == 2
+    assert available["nvidia_h100_pcie"]["total"] == 1
+    assert available["nvidia_a100_80gb_pcie"]["total"] == 1
+    # shard: entries are MPS slices, not whole GPUs, and must never be requested.
+    assert not any("shard" in name for name in available)
+
+
+def test_busy_h200_falls_back_on_the_real_cluster(tmp_path):
+    """The case that prompted this: both H200 nodes allocated, an H100 PCIe node
+    idle. Queueing for the H200 was the old behaviour and the thing to avoid."""
+    del tmp_path
+    gres, reason = _select_with_sinfo(REAL_SINFO)
+    assert gres == "gpu:nvidia_h100_pcie:1", gres
+    assert "idle" in reason
+
+    # And when the H200s free up it goes straight back to them.
+    gres, _ = _select_with_sinfo(REAL_SINFO.replace("|alloc|2", "|idle|2"))
+    assert gres == "gpu:nvidia_h200:1", gres
+
+
+def test_ambiguous_type_name_is_not_guessed(tmp_path):
+    """"nvidia_h100" matches both the SXM and PCIe cards here, which differ in
+    bandwidth. Resolving it either way would be a silent performance decision."""
+    del tmp_path
+    from submit_feature_extraction import _match_gpu_type
+    available = {"nvidia_h100_pcie": {}, "nvidia_h100_80gb_hbm3": {}, "nvidia_h200": {}}
+    assert _match_gpu_type("nvidia_h100", available) is None
+    # Unambiguous substrings still resolve, so a loosely-written list works.
+    assert _match_gpu_type("h200", available) == "nvidia_h200"
+    assert _match_gpu_type("nvidia_h200", available) == "nvidia_h200"
 
 
 def test_explicit_gres_is_never_second_guessed(tmp_path):

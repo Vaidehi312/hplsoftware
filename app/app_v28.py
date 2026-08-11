@@ -2371,9 +2371,14 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
             "Search backend",
             ["auto", "faiss", "faiss-ivf", "numpy"],
             key=f"{key_prefix}assign_backend_{submission_id}",
-            help="auto uses faiss when installed and falls back to an exact NumPy "
-                 "search otherwise. faiss-ivf is approximate: much faster on a large "
-                 "reference, and the only option here that can change an assignment.",
+            help="auto, faiss and numpy all return the SAME assignments — they are "
+                 "exact searches that differ only in speed (faiss ~2,500 tiles/s, "
+                 "numpy ~59). auto uses faiss when installed and falls back to numpy "
+                 "otherwise, so it is the safe default. faiss-ivf is the exception: "
+                 "it is approximate and CHANGES cluster labels. Measured against the "
+                 "real reference it matched only 23% of the 250 neighbours and agreed "
+                 "on the nearest one 33% of the time, for no speed gain. Use it only "
+                 "after validating against known labels.",
         )
 
     projections = ""

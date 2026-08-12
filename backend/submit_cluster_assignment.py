@@ -61,11 +61,10 @@ ASSIGN_SCRIPT = "assign_hpc_clusters.py"
 # module scope would make this file unimportable wherever it is absent.
 _REFERENCE_ENV = "HPC_REFERENCE_PATH"
 
-# Modules assign_hpc_clusters.py needs at runtime. faiss is deliberately not in
-# here: the script falls back to an exact NumPy path without it, more slowly
-# but with identical results, and refusing to run would turn an optimisation
-# into a hard dependency. Whether it was actually used is reported by the job.
-_REQUIRED_MODULES = ("numpy", "pandas", "h5py")
+# Modules assign_hpc_clusters.py needs at runtime. faiss is a hard requirement
+# — there is no fallback search path — so it belongs here rather than in a
+# separate optional probe.
+_REQUIRED_MODULES = ("numpy", "pandas", "h5py", "faiss")
 
 # Exactly what build_hpc_reference.save() writes. Listed rather than guessed:
 # an earlier version of this check looked for a "labels" key that the builder
@@ -212,13 +211,9 @@ def _import_check_python(reference_in_job: str) -> str:
         "    print('FATAL: packages missing inside the container: ' + ', '.join(missing),\n"
         "          file=sys.stderr)\n"
         "    sys.exit(1)\n"
-        "try:\n"
-        "    import faiss\n"
-        "    print('faiss:', faiss.__version__ if hasattr(faiss, '__version__') else 'present',\n"
-        "          flush=True)\n"
-        "except ImportError:\n"
-        "    print('faiss: not installed - falling back to the exact NumPy path, '\n"
-        "          'which is slower but returns identical assignments.', flush=True)\n"
+        "import faiss\n"
+        "print('faiss:', faiss.__version__ if hasattr(faiss, '__version__') else 'present',\n"
+        "      flush=True)\n"
         "print('container packages: ok', flush=True)\n"
     )
 
@@ -234,7 +229,6 @@ def _build_assignment_command(
     out_csv: Path,
     rep_key: str,
     k: int | None,
-    backend: str,
     batch_size: int,
     validate_against: Path | None,
     query_mean: Path | None = None,
@@ -257,7 +251,6 @@ def _build_assignment_command(
         f"--h5 {shlex.quote(real(projections_h5))}",
         f"--out {shlex.quote(real(out_csv))}",
         f"--rep-key {shlex.quote(rep_key)}",
-        f"--backend {shlex.quote(backend)}",
         f"--batch-size {batch_size}",
         # Progress every N tiles, so a long run is visibly alive in the log
         # rather than silent until it finishes.
@@ -348,7 +341,6 @@ def submit_cluster_assignment_job(
     depends_on_job_id: str | None = None,
     rep_key: str = "z_latent",
     k: int | None = None,
-    backend: str = "auto",
     batch_size: int = 16_384,
     validate_against: Path | None = None,
     shards: int = 1,
@@ -472,7 +464,6 @@ def submit_cluster_assignment_job(
         out_csv=out_csv,
         rep_key=rep_key,
         k=k,
-        backend=backend,
         batch_size=batch_size,
         validate_against=validate_against,
         query_mean=mean_path,
@@ -588,8 +579,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
-    parser.add_argument("--backend", type=str, default="auto",
-                        choices=["auto", "faiss", "faiss-ivf", "numpy"])
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--validate-against", type=Path, default=None,
                         help="A CSV of known labels to check the assignment reproduces. "
@@ -620,7 +609,6 @@ def main() -> None:
             depends_on_job_id=args.depends_on_job_id,
             rep_key=args.rep_key,
             k=args.k,
-            backend=args.backend,
             batch_size=args.batch_size,
             validate_against=args.validate_against,
             shards=args.shards,

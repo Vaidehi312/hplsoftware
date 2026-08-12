@@ -20,11 +20,12 @@ morphology: high margin, high distance), or close to the manifold but between
 two clusters (low margin, low distance). One scalar cannot say which, and
 collapsing them is how a "confidence" column stops being interpretable.
 
-Speed note, measured on a 360,667 x 128 reference at k=250: 89% of the runtime
-of the NumPy path is top-k selection, not distance computation, and it scales
+Speed note, measured on a 360,667 x 128 reference at k=250: 89% of an exact
+search's runtime is top-k selection, not distance computation, and it scales
 with reference size only — float16 is ~30x slower (no native fp16 BLAS), and
-truncating dimensions or lowering k changes nothing. So faiss is worth having
-for its selection kernels, and the only other lever is fewer candidates.
+truncating dimensions or lowering k changes nothing. So faiss's selection
+kernels are why this is fast at all, and the only other lever is fewer
+candidates.
 
 Usage:
     python assign_hpc_clusters.py \
@@ -253,83 +254,35 @@ def project(embeddings: np.ndarray, components: np.ndarray,
 # Neighbour search
 # --------------------------------------------------------------------------- #
 
-def _search_numpy(reference: np.ndarray, queries: np.ndarray, k: int,
-                  chunk: int = 40_000) -> tuple[np.ndarray, np.ndarray]:
-    """Exact search, chunked over the reference.
-
-    Chunked because the full distance block is len(queries) x len(reference):
-    at 5,000 queries against 360k references that is 7.2 GB in float32, which
-    thrashes long before it finishes. Chunking bounds it to chunk-width.
-    """
-    n = reference.shape[0]
-    ref_sq = (reference ** 2).sum(axis=1)
-    best_d = np.full((len(queries), k), np.inf, dtype=np.float32)
-    best_i = np.zeros((len(queries), k), dtype=np.int64)
-
-    for start in range(0, n, chunk):
-        block = reference[start:start + chunk]
-        # Squared distance without the per-query term, which is constant across
-        # the row and so cannot affect the ranking. Added back by the caller.
-        partial = ref_sq[start:start + chunk] - 2.0 * (queries @ block.T)
-        width = min(k, partial.shape[1])
-        idx = np.argpartition(partial, width - 1, axis=1)[:, :width]
-        merged_d = np.concatenate([best_d, np.take_along_axis(partial, idx, 1)], axis=1)
-        merged_i = np.concatenate([best_i, idx + start], axis=1)
-        keep = np.argpartition(merged_d, k - 1, axis=1)[:, :k]
-        best_d = np.take_along_axis(merged_d, keep, 1)
-        best_i = np.take_along_axis(merged_i, keep, 1)
-
-    query_sq = (queries ** 2).sum(axis=1, keepdims=True)
-    return best_i, np.maximum(best_d + query_sq, 0.0)
-
-
 class Searcher:
-    """k-NN search over the reference, faiss-backed when available."""
+    """Exact k-NN search over the reference via a faiss flat index.
 
-    def __init__(self, reference: np.ndarray, backend: str, nlist: int, nprobe: int):
+    No approximate index is offered: faiss-ivf was measured against this
+    reference to agree with the true nearest neighbour only 33% of the time,
+    for no speed gain, which means it changes cluster labels rather than just
+    trading accuracy for speed. faiss is required rather than optional so that
+    choice cannot be made by accident.
+    """
+
+    def __init__(self, reference: np.ndarray):
         self.reference = np.ascontiguousarray(reference, dtype=np.float32)
-        self.index = None
-        self.backend = "numpy"
-
-        if backend == "numpy":
-            return
-
         try:
             import faiss
-        except ImportError:
-            if backend != "auto":
-                raise SystemExit(
-                    f"--backend {backend} needs faiss, which is not installed. "
-                    f"Use --backend numpy (exact, ~191 tiles/s at 360k reference)."
-                )
-            print("[info] faiss not installed; using the exact NumPy path.",
-                  file=sys.stderr)
-            return
+        except ImportError as e:
+            raise SystemExit(
+                "faiss is required (pip install faiss-cpu) — there is no "
+                "fallback search path."
+            ) from e
 
-        dim = self.reference.shape[1]
-        if backend == "faiss-ivf":
-            quantiser = faiss.IndexFlatL2(dim)
-            index = faiss.IndexIVFFlat(quantiser, dim, nlist)
-            index.train(self.reference)
-            index.add(self.reference)
-            index.nprobe = nprobe
-            self.backend = f"faiss-ivf(nlist={nlist},nprobe={nprobe})"
-        else:
-            # Exact by default: an approximate index would put an approximation
-            # inside the one number this script is judged on (agreement with the
-            # labels already in the KB), for a speedup that is not needed until
-            # measured to be.
-            index = faiss.IndexFlatL2(dim)
-            index.add(self.reference)
-            self.backend = "faiss-flat"
+        index = faiss.IndexFlatL2(self.reference.shape[1])
+        index.add(self.reference)
         self.index = index
+        self.backend = "faiss-flat"
 
     def search(self, queries: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         queries = np.ascontiguousarray(queries, dtype=np.float32)
-        if self.index is None:
-            return _search_numpy(self.reference, queries, k)
         distances, indices = self.index.search(queries, k)
-        # faiss can return -1 when an IVF probe finds fewer than k candidates.
+        # faiss returns -1 when k exceeds the number of vectors in the index.
         # Left as -1 would silently index the last reference row and vote for
         # whatever cluster it belongs to.
         return indices, distances
@@ -462,7 +415,7 @@ def assign(args) -> dict:
     with h5py.File(args.h5, "r") as content:
         _, meta_keys = _resolve_datasets(content, args.rep_key)
 
-    searcher = Searcher(reference, args.backend, args.nlist, args.nprobe)
+    searcher = Searcher(reference)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
 
     out_path = args.out
@@ -604,12 +557,6 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
-    parser.add_argument("--backend", default="auto",
-                        choices=["auto", "faiss", "faiss-ivf", "numpy"])
-    parser.add_argument("--nlist", type=int, default=600,
-                        help="faiss-ivf only: number of coarse cells.")
-    parser.add_argument("--nprobe", type=int, default=32,
-                        help="faiss-ivf only: cells probed per query.")
     parser.add_argument("--centering", default="query",
                         choices=["query", "reference", "none"],
                         help="How queries are centred before projection. 'query' "

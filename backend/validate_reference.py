@@ -50,7 +50,7 @@ from assign_hpc_clusters import Searcher, vote  # noqa: E402
 
 # Enough for a tight confidence interval on an accuracy near 0.9 (±0.4% at
 # 20k), while staying seconds rather than minutes. The full 2.5M reference
-# would be ~17 minutes with faiss and ~12 hours without.
+# would be ~17 minutes.
 _DEFAULT_SAMPLE = 20_000
 
 
@@ -74,7 +74,7 @@ def load_reference(path: Path) -> dict:
     }
 
 
-def leave_one_out(reference: dict, sample: int, k: int, backend: str,
+def leave_one_out(reference: dict, sample: int, k: int,
                   batch: int, seed: int) -> dict:
     vectors, codes = reference["vectors"], reference["codes"]
     n_clusters = len(reference["categories"])
@@ -86,7 +86,7 @@ def leave_one_out(reference: dict, sample: int, k: int, backend: str,
     else:
         query_index = np.sort(rng.choice(total, size=sample, replace=False))
 
-    searcher = Searcher(vectors, backend, nlist=600, nprobe=32)
+    searcher = Searcher(vectors)
     print(f"Backend   : {searcher.backend}")
     print(f"Reference : {total:,} tiles, {vectors.shape[1]} comps, "
           f"{n_clusters} clusters ({reference['groupby']})")
@@ -190,8 +190,6 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what assignment uses.")
-    parser.add_argument("--backend", default="auto",
-                        choices=["auto", "faiss", "faiss-ivf", "numpy"])
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0,
                         help="Sampling seed, so a number can be reproduced.")
@@ -205,7 +203,7 @@ def main() -> None:
     k = args.k or reference["n_neighbors"]
     sample = args.sample if args.sample > 0 else len(reference["vectors"])
 
-    result = leave_one_out(reference, sample, k, args.backend, args.batch_size, args.seed)
+    result = leave_one_out(reference, sample, k, args.batch_size, args.seed)
     report(result, args.worst)
 
     print(

@@ -51,11 +51,19 @@ dedicated `submit_*.py` modules that build and run their own `sbatch`. Stage 1 a
 wrapper, `submit_dataset_tiling.sh`, which expects a `mask_and_tile_array.sbatch` alongside it that is
 not in this repo — it lives on the cluster. Stage 2's submission is
 driven by the server's `/package` endpoint, and `make_hpl_hdf5.package_slides_to_h5` is additionally
-imported and called in-process on the single-slide upload path. Stage 5 is CLI-only so far.
+imported and called in-process on the single-slide upload path. Stage 5 submits no Slurm job at all —
+`load_hpc_assignments.py`'s functions run in-process inside `tile_server_v2_.py`
+(`/kb-load-preview`, `/kb-load`), so `slurm_dataset_runs.kb_load_done` is the only state tracked for it
+(`migrate_dataset_runs_kb_load.sql`), with no job_id/slurm_state pair.
 
-Adding a stage means touching four places: the submitter, endpoints in `tile_server_v2_.py`, methods in
-`app/api_client.py`, and a step entry + render function in `app/app_v28.py`. Stage 4 is the cleanest
-model to copy — see `_pipeline_steps` and `_render_assignment_step`.
+Adding a stage means touching four places: the submitter (or, for a non-Slurm stage like 5, the
+in-process functions it calls), endpoints in `tile_server_v2_.py`, methods in `app/api_client.py`, and a
+step entry + render function in `app/app_v28.py`. Stage 4 is the cleanest Slurm-backed model to copy —
+see `_pipeline_steps` and `_render_assignment_step`. Stage 5 (`_render_kb_load_step`) is the model for a
+stage that writes straight to the KB: it never auto-commits — a `/kb-load-preview` dry run has to be
+pulled up in the UI first, and `/kb-load` enforces the exact same guards (95% match rate, unknown
+cluster IDs) the CLI's `--commit` does, because it calls the same functions rather than reimplementing
+them.
 
 ### Two repositories
 
@@ -113,10 +121,14 @@ attempt makes every retry fail in seconds with an error pointing nowhere near th
 `mean`).** There is no `labels` key. `build_hpc_reference.save()` is the authority;
 `test_reference_keys_match_the_builder` round-trips through it so readers cannot drift.
 
-**`faiss-ivf` is approximate and changes cluster labels.** Measured against the real reference it
-matched 23% of the 250 neighbours and agreed on the nearest one 33% of the time, for no speed gain at
-this reference size. `auto`, `faiss` and `numpy` are all exact and differ only in speed (~2,500 vs ~59
-tiles/s). Default to `auto`.
+**k-NN search is faiss-only, exact, with no backend choice.** `Searcher` in `assign_hpc_clusters.py`
+requires `faiss` and always builds an exact flat index (`IndexFlatL2`) — there is no numpy fallback and
+no approximate (`faiss-ivf`) option anymore. An approximate index was tried and measured against the
+real reference: it agreed on the nearest neighbour only 33% of the time, for no speed gain at this
+reference size, which would have put an approximation inside the one number this pipeline is judged on.
+`faiss-cpu` is in `backend/requirements.txt` and in the container's `CONTAINER_EXTRAS`
+(`submit_feature_extraction.py`), so it's expected to always be present; if it's missing, that's a setup
+defect to fix, not something to route around.
 
 ## The failure mode this codebase is written against
 

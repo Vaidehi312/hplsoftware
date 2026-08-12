@@ -354,7 +354,6 @@ class TileServerClient:
         self,
         submission_id: str,
         reference: str | None = None,
-        backend: str = "auto",
         k: int | None = None,
         overwrite: bool = False,
     ) -> dict:
@@ -363,7 +362,7 @@ class TileServerClient:
         projections .h5 validates."""
         return self._post_json(
             f"/dataset-jobs/{submission_id}/assign-clusters",
-            {"reference": reference, "backend": backend, "k": k, "overwrite": overwrite},
+            {"reference": reference, "k": k, "overwrite": overwrite},
         )
 
     def start_test_cluster_assignment(
@@ -371,7 +370,6 @@ class TileServerClient:
         submission_id: str,
         projections_h5: str,
         reference: str | None = None,
-        backend: str = "auto",
         k: int | None = None,
     ) -> dict:
         """Assign clusters for an arbitrary projections .h5 without recording
@@ -379,8 +377,32 @@ class TileServerClient:
         further along than it is."""
         return self._post_json(
             f"/dataset-jobs/{submission_id}/assign-clusters-test",
-            {"projections_h5": projections_h5, "reference": reference,
-             "backend": backend, "k": k},
+            {"projections_h5": projections_h5, "reference": reference, "k": k},
+        )
+
+    def preview_kb_load(self, submission_id: str) -> dict:
+        """Stage 5 dry run: what loading this run's assignment CSV into the
+        Knowledge Bank would do. Read-only, safe to call as often as the UI
+        wants — mirrors load_hpc_assignments.py's default --dry-run posture."""
+        return self._post_json(f"/dataset-jobs/{submission_id}/kb-load-preview", {})
+
+    def commit_kb_load(
+        self,
+        submission_id: str,
+        cancer_type: str | None = None,
+        allow_unknown_clusters: bool = False,
+        skip_profiles: bool = False,
+    ) -> dict:
+        """User-triggered: write this run's cluster assignments into
+        tile_registry plus the per-slide aggregates, after the same guards
+        load_hpc_assignments.py --commit enforces on the CLI."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/kb-load",
+            {
+                "cancer_type": cancer_type,
+                "allow_unknown_clusters": allow_unknown_clusters,
+                "skip_profiles": skip_profiles,
+            },
         )
 
     def start_test_packaging(

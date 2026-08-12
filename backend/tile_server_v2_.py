@@ -86,6 +86,14 @@ from submit_feature_extraction import (
 
 from submit_cluster_assignment import submit_cluster_assignment_job
 
+from load_hpc_assignments import (
+    read_assignments as _read_kb_assignments,
+    inspect as _inspect_kb_load,
+    load as _write_kb_load,
+    compute_profiles as _compute_kb_profiles,
+    _MIN_MATCH_RATE as _KB_MIN_MATCH_RATE,
+)
+
 # Columns assign_hpc_clusters.py writes. The cluster column itself is named
 # after the reference's groupby (e.g. 'leiden_2.5'), so it is matched by
 # elimination rather than by name — hardcoding a name here would break the
@@ -3759,7 +3767,6 @@ class ClusterAssignmentRequest(BaseModel):
     # the common case a single click. Overridable because comparing two
     # references is a real thing to want to do.
     reference: str | None = None
-    backend: str = "auto"
     k: int | None = None
     overwrite: bool = False
 
@@ -3821,7 +3828,6 @@ def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentReque
                 projections_h5=projections,
                 out_csv=out_csv,
                 reference=Path(req.reference) if req.reference else None,
-                backend=req.backend,
                 k=req.k,
                 notify_email=row["notify_email"],
                 job_name=f"hpl_assign_{submission_id}",
@@ -3847,7 +3853,6 @@ def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentReque
                 "reference": result.get("reference_path"),
                 "reference_rows": result.get("reference_rows"),
                 "n_clusters": result.get("n_clusters"),
-                "backend": req.backend,
             },
         )
         return {"submission_id": submission_id, **result}
@@ -3873,7 +3878,6 @@ def start_test_cluster_assignment_job(submission_id: str, req: ClusterAssignment
             projections_h5=projections,
             out_csv=out_csv,
             reference=Path(req.reference) if req.reference else None,
-            backend=req.backend,
             k=req.k,
             job_name=f"hpl_assign_test_{submission_id}",
             overwrite=True,
@@ -3889,6 +3893,138 @@ def start_test_cluster_assignment_job(submission_id: str, req: ClusterAssignment
         params={"projections_h5": str(projections), "reference": result.get("reference_path")},
     )
     return {"submission_id": submission_id, **result}
+
+
+def _kb_load_source_csv(row: dict) -> Path:
+    """This run's assignment CSV, the only input Stage 5 reads.
+
+    Gated on the same validator the /status endpoint uses for
+    assignment_ready — a CSV that exists but is a stub (interrupted run, half
+    the columns) is not a state Stage 5 can load from, whatever the DB row's
+    assignment_job_id says.
+    """
+    path = row.get("assignment_output_path")
+    if not path:
+        raise HTTPException(400, "Cluster assignment hasn't been run for this dataset yet.")
+    csv_path = Path(path)
+    ok, reason = _validate_assignment_output(csv_path)
+    if not ok:
+        raise HTTPException(
+            400,
+            f"This run's assignment output isn't usable yet ({reason}). Stage 5 "
+            f"loads exactly what Stage 4 wrote, so it refuses to read a partial "
+            f"or missing CSV rather than loading whatever rows happen to be there.",
+        )
+    return csv_path
+
+
+@app.post("/dataset-jobs/{submission_id}/kb-load-preview")
+def preview_kb_load(submission_id: str):
+    """Stage 5, dry-run half: what loading this run's assignment CSV into the
+    Knowledge Bank would do, computed without changing anything.
+
+    Same report load_hpc_assignments.py prints for --dry-run (its default
+    posture), just returned as JSON instead of stdout — this endpoint calls
+    the identical read_assignments()/inspect() pair the CLI does, so the two
+    can never disagree about what a load would do.
+    """
+    row = _get_dataset_run_row(submission_id)
+    csv_path = _kb_load_source_csv(row)
+
+    try:
+        frame, cluster_column = _read_kb_assignments(csv_path)
+    except SystemExit as e:
+        raise HTTPException(400, str(e))
+
+    report = _inspect_kb_load(_get_engine(), frame, cluster_column)
+    match_rate = report["matched"] / report["rows"] if report["rows"] else 0.0
+    report.update({
+        "cluster_column": cluster_column,
+        "match_rate": match_rate,
+        "min_match_rate": _KB_MIN_MATCH_RATE,
+        "would_refuse_low_match": match_rate < _KB_MIN_MATCH_RATE,
+        "already_loaded": bool(row.get("kb_load_done")),
+        "kb_load_at": row["kb_load_at"].isoformat() if row.get("kb_load_at") else None,
+        "kb_load_rows": row.get("kb_load_rows"),
+        "kb_load_reference": row.get("kb_load_reference"),
+    })
+    return report
+
+
+class KbLoadRequest(BaseModel):
+    # Mirrors load_hpc_assignments.py's CLI flags. cancer_type stays optional
+    # rather than guessed — hpl_profile_summary.cancer_type is left unset when
+    # omitted, same as the CLI, rather than this endpoint inventing a value the
+    # CLI never would.
+    cancer_type: str | None = None
+    allow_unknown_clusters: bool = False
+    skip_profiles: bool = False
+
+
+@app.post("/dataset-jobs/{submission_id}/kb-load")
+def commit_kb_load(submission_id: str, req: KbLoadRequest):
+    """Stage 5: write this run's cluster assignments into tile_registry, plus
+    the hpl_profile_proportion/summary aggregates the chatbot and HPC panels
+    actually read.
+
+    This is load_hpc_assignments.py's --commit path, called in-process rather
+    than reimplemented — every guard the CLI enforces (95% match rate, unknown
+    cluster IDs) applies here unchanged, because it runs the same function.
+    That is deliberate: the one script that mutates the shared KB should have
+    exactly one implementation of what makes a load safe to commit, not one
+    for the terminal and a looser one for the UI.
+    """
+    row = _get_dataset_run_row(submission_id)
+    csv_path = _kb_load_source_csv(row)
+
+    try:
+        frame, cluster_column = _read_kb_assignments(csv_path)
+    except SystemExit as e:
+        raise HTTPException(400, str(e))
+
+    eng = _get_engine()
+    report = _inspect_kb_load(eng, frame, cluster_column)
+    match_rate = report["matched"] / report["rows"] if report["rows"] else 0.0
+
+    problems = []
+    if match_rate < _KB_MIN_MATCH_RATE:
+        problems.append(
+            f"only {match_rate * 100:.1f}% of rows match tile_registry (need "
+            f"{_KB_MIN_MATCH_RATE * 100:.0f}%). The usual cause is a slide-naming "
+            f"difference between the .h5 and the registry, not missing tiles."
+        )
+    if report["unknown_clusters"] and not req.allow_unknown_clusters:
+        problems.append(
+            f"{len(report['unknown_clusters'])} cluster ID(s) have no hpc_dictionary "
+            f"row: {report['unknown_clusters'][:10]}. Those tiles would show a cluster "
+            f"with no pattern or malignancy annotation. Pass allow_unknown_clusters if "
+            f"that is intended."
+        )
+    if problems:
+        raise HTTPException(400, "Refusing to load: " + "; ".join(problems))
+
+    profiles = None
+    if not req.skip_profiles:
+        profiles = _compute_kb_profiles(frame, cluster_column, req.cancer_type)
+
+    updated = _write_kb_load(eng, frame, cluster_column, profiles=profiles)
+    reference = report["reference"]
+
+    _update_dataset_run(
+        submission_id,
+        kb_load_done=True,
+        kb_load_at=datetime.now(timezone.utc),
+        kb_load_rows=updated,
+        kb_load_reference=reference,
+    )
+
+    return {
+        "submission_id": submission_id,
+        "updated_rows": updated,
+        "matched": report["matched"],
+        "reference": reference,
+        "profiles_written": profiles is not None,
+    }
 
 
 @app.post("/dataset-jobs/{submission_id}/cancel")
@@ -4318,6 +4454,14 @@ def dataset_job_status(submission_id: str):
         base["assignment_reference"] = row.get("assignment_reference")
         if not base["assignment_ready"] and asg_path and asg_path.is_file():
             base["assignment_invalid_reason"] = _validate_assignment_output(asg_path)[1] or None
+
+    # Stage 5. No job_id/slurm_state pair here — the load runs in-process and
+    # either commits in one transaction or doesn't, so kb_load_done is the
+    # single fact worth tracking (see migrate_dataset_runs_kb_load.sql).
+    base["kb_load_done"] = bool(row.get("kb_load_done"))
+    base["kb_load_at"] = row["kb_load_at"].isoformat() if row.get("kb_load_at") else None
+    base["kb_load_rows"] = row.get("kb_load_rows")
+    base["kb_load_reference"] = row.get("kb_load_reference")
 
     if not row["job_id"] or not row["manifest_path"]:
         return base

@@ -1349,11 +1349,24 @@ def _pipeline_steps(status: dict) -> list[dict]:
     else:
         assignment = ("blocked", "waiting on feature extraction")
 
+    # --- 5. Knowledge Bank load --------------------------------------------
+    # Gated on assignment_ready, not assignment_job_id, for the same reason
+    # Stage 4 gates on extraction_ready: this stage reads the CSV Stage 4
+    # wrote, so a finished-but-unusable one is not a state it can load from.
+    if status.get("kb_load_done"):
+        rows = status.get("kb_load_rows")
+        kb_load = ("done", f"{rows:,} tiles in the KB" if rows is not None else "loaded")
+    elif status.get("assignment_ready"):
+        kb_load = ("action", "ready to load")
+    else:
+        kb_load = ("blocked", "waiting on cluster classification")
+
     return [
         {"key": "tiling", "title": "1. Tiling", "state": tiling[0], "summary": tiling[1]},
         {"key": "packaging", "title": "2. Packaging (.h5)", "state": packaging[0], "summary": packaging[1]},
         {"key": "extraction", "title": "3. Feature extraction", "state": extraction[0], "summary": extraction[1]},
         {"key": "assignment", "title": "4. Cluster classification", "state": assignment[0], "summary": assignment[1]},
+        {"key": "kb_load", "title": "5. Knowledge Bank load", "state": kb_load[0], "summary": kb_load[1]},
     ]
 
 
@@ -2370,19 +2383,6 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
                  "it is built from. Leave blank unless you are deliberately "
                  "comparing two references.",
         )
-        backend = st.selectbox(
-            "Search backend",
-            ["auto", "faiss", "faiss-ivf", "numpy"],
-            key=f"{key_prefix}assign_backend_{submission_id}",
-            help="auto, faiss and numpy all return the SAME assignments — they are "
-                 "exact searches that differ only in speed (faiss ~2,500 tiles/s, "
-                 "numpy ~59). auto uses faiss when installed and falls back to numpy "
-                 "otherwise, so it is the safe default. faiss-ivf is the exception: "
-                 "it is approximate and CHANGES cluster labels. Measured against the "
-                 "real reference it matched only 23% of the 250 neighbours and agreed "
-                 "on the nearest one 33% of the time, for no speed gain. Use it only "
-                 "after validating against known labels.",
-        )
 
     projections = ""
     if mode == "Test on a sample .h5":
@@ -2413,12 +2413,12 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
                 st.error("Enter the projections .h5 to assign.")
                 return
             client.start_test_cluster_assignment(
-                submission_id, projections.strip(), reference=ref, backend=backend
+                submission_id, projections.strip(), reference=ref
             )
             st.success("Test cluster assignment queued (not recorded against this run).")
         else:
             client.start_cluster_assignment(
-                submission_id, reference=ref, backend=backend, overwrite=True
+                submission_id, reference=ref, overwrite=True
             )
             st.success("Cluster assignment job queued.")
         st.rerun()
@@ -2427,6 +2427,122 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
         st.error(f"Failed to start cluster assignment: {detail}")
     except Exception as e:
         st.error(f"Failed to start cluster assignment: {e}")
+
+
+def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, state: str):
+    """Stage 5: load this run's cluster-assignment CSV into the Knowledge Bank.
+
+    Mirrors load_hpc_assignments.py's own shape — a dry-run preview, then an
+    explicit commit — rather than a single button. This is the one stage that
+    mutates the shared KB every other view (slide viewer, chatbot, HPC panels)
+    reads from, so it never auto-commits: a preview has to be pulled up first,
+    and the numbers it shows are exactly what /kb-load would act on.
+    """
+    if status.get("kb_load_done"):
+        rows = status.get("kb_load_rows")
+        reference = status.get("kb_load_reference")
+        st.success(
+            "Loaded into the Knowledge Bank"
+            + (f": {rows:,} tiles" if rows is not None else "")
+            + (f" (reference `{reference}`)" if reference else "")
+        )
+        if status.get("kb_load_at"):
+            st.caption(f"Last loaded: {status['kb_load_at']}")
+        st.caption("If Stage 4 has been re-run since, preview below and reload.")
+
+    if state == "blocked":
+        st.info(
+            "Waiting on cluster classification (Stage 4) to finish with a usable "
+            "assignment CSV."
+        )
+        return
+
+    preview_key = f"{key_prefix}kb_load_preview_{submission_id}"
+    if st.button("Preview Knowledge Bank load", key=f"{key_prefix}kb_load_preview_btn_{submission_id}"):
+        try:
+            st.session_state[preview_key] = client.preview_kb_load(submission_id)
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Preview failed: {_error_detail(e)[1]}")
+            st.session_state.pop(preview_key, None)
+        except Exception as e:
+            st.error(f"Preview failed: {e}")
+            st.session_state.pop(preview_key, None)
+
+    report = st.session_state.get(preview_key)
+    if not report:
+        return
+
+    st.write(
+        f"**{report['rows']:,}** rows in the CSV · cluster column "
+        f"`{report['cluster_column']}` · reference `{report['reference']}`"
+    )
+    st.write(
+        f"Matched **{report['matched']:,}/{report['rows']:,}** "
+        f"({report['match_rate'] * 100:.1f}%) tiles in `tile_registry`"
+    )
+    if report["unmatched"]:
+        st.warning(f"{report['unmatched']:,} unmatched, e.g. {report['unmatched_examples']}")
+    if report["overwriting"]:
+        note = f"Will overwrite {report['overwriting']:,} tile(s) that already carry a cluster ID"
+        if report["overwriting_other_reference"]:
+            note += f" ({report['overwriting_other_reference']:,} from a different reference)"
+        st.info(note)
+    if report["unknown_clusters"]:
+        st.warning(
+            f"{len(report['unknown_clusters'])} cluster ID(s) have no `hpc_dictionary` "
+            f"row: {report['unknown_clusters'][:10]}. Those tiles would show a cluster "
+            f"with no pattern or malignancy annotation unless allowed below."
+        )
+    if report["low_margin"]:
+        st.caption(f"{report['low_margin']:,} tile(s) have vote_margin below 0.1")
+
+    if report["would_refuse_low_match"]:
+        st.error(
+            f"Match rate {report['match_rate'] * 100:.1f}% is below the required "
+            f"{report['min_match_rate'] * 100:.0f}% — committing would be refused "
+            f"the same way the CLI refuses it."
+        )
+
+    with st.expander("Commit options", expanded=False):
+        cancer_type = st.text_input(
+            "Cancer type (optional — fills hpl_profile_summary.cancer_type)",
+            key=f"{key_prefix}kb_load_cancer_{submission_id}",
+            placeholder="LUAD",
+            help="Left blank leaves it unset rather than guessing, same as the CLI.",
+        )
+        allow_unknown = st.checkbox(
+            "Load cluster IDs with no hpc_dictionary row anyway",
+            value=False,
+            key=f"{key_prefix}kb_load_allow_unknown_{submission_id}",
+            disabled=not report["unknown_clusters"],
+        )
+        skip_profiles = st.checkbox(
+            "Skip refreshing the per-slide aggregates (tile_registry only)",
+            value=False,
+            key=f"{key_prefix}kb_load_skip_profiles_{submission_id}",
+            help="Leaves hpl_profile_proportion/summary disagreeing with the new "
+                 "tile_registry values. Off unless you have a specific reason.",
+        )
+
+    if st.button(
+        "Commit to Knowledge Bank",
+        key=f"{key_prefix}kb_load_commit_{submission_id}",
+        disabled=report["would_refuse_low_match"],
+    ):
+        try:
+            result = client.commit_kb_load(
+                submission_id,
+                cancer_type=cancer_type.strip() or None,
+                allow_unknown_clusters=allow_unknown,
+                skip_profiles=skip_profiles,
+            )
+            st.success(f"Committed {result['updated_rows']:,} tile(s) to the Knowledge Bank.")
+            st.session_state.pop(preview_key, None)
+            st.rerun()
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Load failed: {_error_detail(e)[1]}")
+        except Exception as e:
+            st.error(f"Load failed: {e}")
 
 
 def _render_job_progress(job: dict, key_prefix: str = ""):
@@ -2474,6 +2590,7 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
         "packaging": lambda s: _render_packaging_step(status, submission_id, key_prefix, s["state"]),
         "extraction": lambda s: _render_extraction_step(status, submission_id, key_prefix, s["state"]),
         "assignment": lambda s: _render_assignment_step(status, submission_id, key_prefix, s["state"]),
+        "kb_load": lambda s: _render_kb_load_step(status, submission_id, key_prefix, s["state"]),
     }
     for step in steps:
         icon = _STEP_ICON.get(step["state"], "•")

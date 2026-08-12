@@ -38,6 +38,7 @@ from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy import inspect as sqlalchemy_inspect
 
 # Same defaults and env names as tile_server_v2_.py, so a shell configured for
 # the server needs no extra setup here. Duplicated rather than imported: that
@@ -164,7 +165,8 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str) -> dict:
     }
 
 
-def load(engine, frame: pd.DataFrame, cluster_column: str, *, batch: int = 5000) -> int:
+def load(engine, frame: pd.DataFrame, cluster_column: str, *, batch: int = 5000,
+         profiles: tuple[pd.DataFrame, pd.DataFrame] | None = None) -> int:
     """Write the assignments. One transaction: a half-loaded registry, with some
     tiles on the new reference and some on the old, is not a state anything
     downstream can interpret."""
@@ -204,13 +206,108 @@ def load(engine, frame: pd.DataFrame, cluster_column: str, *, batch: int = 5000)
     """)
 
     updated = 0
+    # One transaction covering the tiles and both aggregates. Splitting them
+    # would allow a registry whose per-tile clusters and per-slide proportions
+    # came from different runs, which is worse than either being stale: nothing
+    # downstream can tell that has happened.
     with engine.begin() as conn:
         for start in range(0, len(records), batch):
             chunk = records[start:start + batch]
             result = conn.execute(statement, chunk)
             updated += result.rowcount if result.rowcount is not None else 0
-            print(f"  {min(start + batch, len(records)):,}/{len(records):,}", flush=True)
+            print(f"  tiles {min(start + batch, len(records)):,}/{len(records):,}", flush=True)
+
+        if profiles is not None:
+            proportions, summary = profiles
+            written = replace_profiles(conn, proportions, summary)
+            for table, count in written.items():
+                print(f"  {table}: {count:,} rows", flush=True)
     return updated
+
+
+def compute_profiles(frame: pd.DataFrame, cluster_column: str,
+                     cancer_type: str | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The two per-slide aggregates, from the same CSV the tiles came from.
+
+    Definitions taken from the scripts that first populated these tables
+    (Filling_out_kb.ipynb and csv_files/For_KB/filling_out_kb_hs.py) so the rows
+    this writes are the same shape as the rows already there:
+
+      hpl_profile_proportion  per (samples, slides, hpc_id): that cluster's share
+                              of the slide's tiles, summing to 1 per slide.
+      hpl_profile_summary     per (samples, slides): tile count and modal cluster.
+
+    They matter because they are what the chatbot and the HPC panels read — not
+    tile_registry. Loading per-tile assignments without refreshing these leaves
+    the UI showing new clusters per tile and old proportions per slide, with
+    nothing to indicate the two disagree.
+
+    `id` is left to the tables' sequences. The original scripts assigned
+    range(1, n+1), which is correct exactly once and collides with every
+    existing row afterwards.
+    """
+    work = frame[["samples", "slides", cluster_column]].copy()
+    work.columns = ["samples", "slides", "hpc_id"]
+    work["hpc_id"] = work["hpc_id"].astype(str).str.strip()
+
+    proportions = work.groupby(["samples", "slides", "hpc_id"], as_index=False).size()
+    proportions["proportion"] = proportions.groupby(["samples", "slides"])["size"].transform(
+        lambda x: x / x.sum()
+    )
+    proportions = proportions.drop(columns=["size"])
+
+    summary = work.groupby(["samples", "slides"], as_index=False).agg(
+        total_tiles=("hpc_id", "count"),
+        dominant_hpc=("hpc_id", lambda x: x.value_counts().idxmax()),
+    )
+    if cancer_type is not None:
+        summary["cancer_type"] = cancer_type
+    return proportions, summary
+
+
+def _existing_columns(conn, table: str) -> set[str]:
+    """Columns the live table actually has.
+
+    Inspected rather than assumed: these tables predate this script and were
+    filled by hand from notebooks, so an insert naming a column that is not
+    there fails the whole transaction — including the tile_registry update that
+    had nothing to do with it.
+    """
+    return {c["name"] for c in sqlalchemy_inspect(conn).get_columns(table)}
+
+
+def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> dict:
+    """Swap in the aggregates for just the slides being loaded.
+
+    Scoped by slide, not a whole-table rebuild: loading ten slides must not
+    delete the proportions for every other slide in the KB. Delete-then-insert
+    rather than upsert because a slide's cluster set changes between references —
+    a cluster that no longer appears must lose its row, and an upsert would leave
+    it behind at its old proportion.
+    """
+    slides = sorted(set(summary["slides"].astype(str)))
+    written = {}
+    for table, frame in (("hpl_profile_proportion", proportions),
+                         ("hpl_profile_summary", summary)):
+        columns = _existing_columns(conn, table)
+        usable = [c for c in frame.columns if c in columns]
+        skipped = [c for c in frame.columns if c not in columns]
+        if skipped:
+            print(f"  {table}: no column(s) {skipped}; not writing them", file=sys.stderr)
+
+        conn.execute(
+            text(f"DELETE FROM {table} WHERE TRIM(slides) IN :slides").bindparams(
+                bindparam("slides", expanding=True)
+            ),
+            {"slides": slides},
+        )
+        placeholders = ", ".join(f":{c}" for c in usable)
+        conn.execute(
+            text(f"INSERT INTO {table} ({', '.join(usable)}) VALUES ({placeholders})"),
+            frame[usable].to_dict("records"),
+        )
+        written[table] = len(frame)
+    return written
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -224,6 +321,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-match-rate", type=float, default=_MIN_MATCH_RATE,
                         help="Refuse to commit below this share of CSV rows matching "
                              "tile_registry.")
+    parser.add_argument("--cancer-type", type=str, default=None,
+                        help="Value for hpl_profile_summary.cancer_type (e.g. LUAD). "
+                             "Omitted leaves it unset rather than guessing.")
+    parser.add_argument("--skip-profiles", action="store_true",
+                        help="Only update tile_registry. The per-slide aggregates the "
+                             "chatbot and HPC panels read will then disagree with it.")
     parser.add_argument("--allow-unknown-clusters", action="store_true",
                         help="Load cluster IDs that have no hpc_dictionary row. They "
                              "will show in the viewer with no annotations.")
@@ -249,6 +352,16 @@ def main() -> None:
     print(f"  clusters     {report['known_clusters']} in hpc_dictionary; "
           f"largest here: " + ", ".join(f"{k}={v:,}" for k, v in report["distribution"].items()))
     print(f"  low margin   {report['low_margin']:,} tiles below 0.1")
+
+    profiles = None
+    if not args.skip_profiles:
+        profiles = compute_profiles(frame, cluster_column, args.cancer_type)
+        proportions, summary = profiles
+        print(f"  aggregates   {len(proportions):,} proportion rows and "
+              f"{len(summary):,} summary rows across "
+              f"{summary['slides'].nunique()} slide(s)")
+        if args.cancer_type is None:
+            print("               (cancer_type not set — pass --cancer-type to fill it)")
 
     match_rate = report["matched"] / report["rows"]
     problems = []
@@ -279,7 +392,7 @@ def main() -> None:
         return
 
     print(f"\nLoading into {DB_NAME}.tile_registry ...")
-    updated = load(engine, frame, cluster_column)
+    updated = load(engine, frame, cluster_column, profiles=profiles)
     print(f"Updated {updated:,} rows.")
     if updated != report["matched"]:
         print(

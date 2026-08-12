@@ -203,6 +203,130 @@ def test_lookup_chunking_does_not_lose_tiles(tmp_path):
         loader._LOOKUP_CHUNK = original
 
 
+# --- the per-slide aggregates --------------------------------------------
+# hpl_profile_proportion and hpl_profile_summary are what the chatbot and the
+# HPC panels actually read — not tile_registry. Loading tiles without refreshing
+# these leaves the UI showing new clusters per tile and old proportions per
+# slide, with nothing to indicate the two came from different runs.
+
+def _add_profile_tables(engine, rows=()):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_proportion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, hpc_id TEXT, proportion REAL)"""))
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, cancer_type TEXT,
+                total_tiles INTEGER, dominant_hpc TEXT)"""))
+        for slide, hpc, prop in rows:
+            conn.execute(
+                text("INSERT INTO hpl_profile_proportion (samples, slides, hpc_id, "
+                     "proportion) VALUES ('S1', :s, :h, :p)"),
+                {"s": slide, "h": hpc, "p": prop},
+            )
+
+
+def test_proportions_sum_to_one_per_slide(tmp_path):
+    csv = _make_csv(tmp_path, n=30, clusters=("0", "1", "2"))
+    frame, column = loader.read_assignments(csv)
+    proportions, summary = loader.compute_profiles(frame, column, "LUAD")
+
+    totals = proportions.groupby(["samples", "slides"])["proportion"].sum()
+    assert all(abs(t - 1.0) < 1e-9 for t in totals), totals.to_dict()
+    # 30 tiles cycling through three clusters -> a third each.
+    assert sorted(proportions["proportion"].round(6)) == [round(1 / 3, 6)] * 3
+
+
+def test_summary_counts_and_dominant_cluster(tmp_path):
+    # 10 tiles: cluster "0" six times, "1" four times -> dominant is "0".
+    rows = [{
+        "samples": "S1", "slides": SLIDE, "tiles": f"{i}_{i}.jpeg",
+        "leiden_2.5": "0" if i < 6 else "1",
+        "vote_margin": 0.9, "neighbor_distance": 1.0, "hpc_reference": REFERENCE,
+    } for i in range(10)]
+    csv = tmp_path / "dom.csv"
+    pd.DataFrame(rows).to_csv(csv, index=False)
+
+    frame, column = loader.read_assignments(csv)
+    _, summary = loader.compute_profiles(frame, column, "LUAD")
+    assert len(summary) == 1
+    assert summary["total_tiles"].iloc[0] == 10
+    assert summary["dominant_hpc"].iloc[0] == "0"
+    assert summary["cancer_type"].iloc[0] == "LUAD"
+
+
+def test_cancer_type_is_not_invented(tmp_path):
+    """The original script hardcoded 'LUAD'. Guessing a cancer type into a KB
+    that may hold several would be a quiet data error."""
+    csv = _make_csv(tmp_path)
+    frame, column = loader.read_assignments(csv)
+    _, summary = loader.compute_profiles(frame, column, None)
+    assert "cancer_type" not in summary.columns
+
+
+def test_profiles_replace_only_the_loaded_slides(tmp_path):
+    """Loading ten slides must not delete the proportions of every other slide."""
+    csv = _make_csv(tmp_path, n=9, clusters=("0", "1", "2"))
+    engine = _make_kb(tmp_path, _registry_tiles(n=9))
+    _add_profile_tables(engine, rows=[
+        (SLIDE, "7", 1.0),              # stale row for the slide being loaded
+        ("SOME-OTHER-SLIDE", "3", 1.0),  # must survive
+    ])
+
+    frame, column = loader.read_assignments(csv)
+    loader.load(engine, frame, column,
+                profiles=loader.compute_profiles(frame, column, "LUAD"))
+
+    with engine.connect() as conn:
+        got = pd.read_sql(text("SELECT * FROM hpl_profile_proportion"), conn)
+    assert "SOME-OTHER-SLIDE" in set(got["slides"]), "unrelated slide was deleted"
+    mine = got[got["slides"] == SLIDE]
+    # The stale cluster-7 row is gone, replaced by the three real clusters.
+    assert set(mine["hpc_id"]) == {"0", "1", "2"}, set(mine["hpc_id"])
+    assert abs(mine["proportion"].sum() - 1.0) < 1e-9
+
+
+def test_ids_come_from_the_sequence_not_a_range(tmp_path):
+    """The notebooks assigned id = range(1, n+1), which is right exactly once and
+    collides with every existing row afterwards."""
+    csv = _make_csv(tmp_path, n=9)
+    engine = _make_kb(tmp_path, _registry_tiles(n=9))
+    _add_profile_tables(engine, rows=[("OTHER", "3", 1.0)])
+
+    frame, column = loader.read_assignments(csv)
+    loader.load(engine, frame, column,
+                profiles=loader.compute_profiles(frame, column, "LUAD"))
+    with engine.connect() as conn:
+        ids = pd.read_sql(text("SELECT id FROM hpl_profile_proportion"), conn)["id"]
+    assert ids.is_unique, "ids collided with the pre-existing row"
+
+
+def test_missing_aggregate_column_does_not_abort_the_load(tmp_path):
+    """These tables were filled by hand from notebooks, so a column may not be
+    there. Inserting a name that does not exist would fail the whole
+    transaction, taking the tile_registry update with it."""
+    csv = _make_csv(tmp_path, n=9)
+    engine = _make_kb(tmp_path, _registry_tiles(n=9))
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_proportion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, hpc_id TEXT, proportion REAL)"""))
+        # No cancer_type column here.
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, total_tiles INTEGER, dominant_hpc TEXT)"""))
+
+    frame, column = loader.read_assignments(csv)
+    assert loader.load(engine, frame, column,
+                       profiles=loader.compute_profiles(frame, column, "LUAD")) == 9
+    with engine.connect() as conn:
+        assert len(pd.read_sql(text("SELECT * FROM hpl_profile_summary"), conn)) == 1
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

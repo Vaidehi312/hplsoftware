@@ -26,6 +26,7 @@ Writes five columns, all added by migrate_tile_registry_confidence.sql:
 Usage:
     python load_hpc_assignments.py --csv DS_hpc_assignments.csv --dry-run
     python load_hpc_assignments.py --csv DS_hpc_assignments.csv --commit
+    python load_hpc_assignments.py --csv DS_hpc_assignments.csv --commit --min-margin 0.25
 """
 
 from __future__ import annotations
@@ -109,12 +110,19 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     return frame, cluster_columns[0]
 
 
-def inspect(engine, frame: pd.DataFrame, cluster_column: str) -> dict:
+def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float = 0.0) -> dict:
     """What loading this CSV would do, computed without changing anything.
 
     Deliberately a separate pass rather than a count taken during the write:
     the point is to be able to look before committing, and a preview derived
     from the write path would only exist after the write.
+
+    min_margin previews compute_profiles()'s own exclusion: leave-one-out
+    validation against the reference put tiles below 0.1 vote_margin at 57%
+    correct and 0.1-0.25 at 76%, against 92%+ once margin clears 0.25 — so a
+    tile below threshold is disproportionately likely to be wrong, and
+    "excluded_from_aggregates" is how many of those exist in this CSV before
+    anything is decided.
     """
     tiles = frame["slide_tile"].tolist()
     # Looked up in chunks with an expanding IN rather than one ANY(array): a
@@ -162,6 +170,8 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str) -> dict:
         "distribution": assigned.value_counts().head(5).to_dict(),
         "low_margin": int((frame["vote_margin"] < 0.1).sum()),
         "reference": str(frame["hpc_reference"].iloc[0]),
+        "min_margin": min_margin,
+        "excluded_from_aggregates": int((frame["vote_margin"] < min_margin).sum()) if min_margin > 0 else 0,
     }
 
 
@@ -226,7 +236,7 @@ def load(engine, frame: pd.DataFrame, cluster_column: str, *, batch: int = 5000,
 
 
 def compute_profiles(frame: pd.DataFrame, cluster_column: str,
-                     cancer_type: str | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                     cancer_type: str | None, min_margin: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """The two per-slide aggregates, from the same CSV the tiles came from.
 
     Definitions taken from the scripts that first populated these tables
@@ -242,12 +252,18 @@ def compute_profiles(frame: pd.DataFrame, cluster_column: str,
     the UI showing new clusters per tile and old proportions per slide, with
     nothing to indicate the two disagree.
 
-    `id` is left to the tables' sequences. The original scripts assigned
-    range(1, n+1), which is correct exactly once and collides with every
-    existing row afterwards.
+    min_margin drops tiles below that vote_margin before either aggregate is
+    computed. tile_registry is untouched either way — every tile keeps its own
+    hpc_id and margin regardless — this only decides what counts toward the
+    per-slide numbers people actually read. total_tiles shrinks along with it
+    rather than staying at the slide's full tile count: the alternative, a
+    total_tiles that counts tiles the proportions and dominant_hpc never saw,
+    would report a number next to a composition it does not match.
     """
-    work = frame[["samples", "slides", cluster_column]].copy()
-    work.columns = ["samples", "slides", "hpc_id"]
+    work = frame[["samples", "slides", cluster_column, "vote_margin"]].copy()
+    work.columns = ["samples", "slides", "hpc_id", "vote_margin"]
+    if min_margin > 0:
+        work = work[work["vote_margin"] >= min_margin]
     work["hpc_id"] = work["hpc_id"].astype(str).str.strip()
 
     proportions = work.groupby(["samples", "slides", "hpc_id"], as_index=False).size()
@@ -330,6 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-unknown-clusters", action="store_true",
                         help="Load cluster IDs that have no hpc_dictionary row. They "
                              "will show in the viewer with no annotations.")
+    parser.add_argument("--min-margin", type=float, default=0.0,
+                        help="Exclude tiles below this vote_margin from "
+                             "hpl_profile_proportion/summary. tile_registry keeps every "
+                             "tile's hpc_id and margin regardless of this flag — it only "
+                             "changes what counts toward the per-slide aggregates. "
+                             "0 (default) excludes nothing.")
     return parser
 
 
@@ -337,7 +359,7 @@ def main() -> None:
     args = build_parser().parse_args()
     frame, cluster_column = read_assignments(args.csv)
     engine = make_engine()
-    report = inspect(engine, frame, cluster_column)
+    report = inspect(engine, frame, cluster_column, min_margin=args.min_margin)
 
     print(f"CSV            : {args.csv}")
     print(f"  rows         {report['rows']:,}   cluster column '{cluster_column}'")
@@ -352,10 +374,14 @@ def main() -> None:
     print(f"  clusters     {report['known_clusters']} in hpc_dictionary; "
           f"largest here: " + ", ".join(f"{k}={v:,}" for k, v in report["distribution"].items()))
     print(f"  low margin   {report['low_margin']:,} tiles below 0.1")
+    if args.min_margin > 0:
+        print(f"  min margin   {args.min_margin} — excludes "
+              f"{report['excluded_from_aggregates']:,} tile(s) from the aggregates below")
 
     profiles = None
     if not args.skip_profiles:
-        profiles = compute_profiles(frame, cluster_column, args.cancer_type)
+        profiles = compute_profiles(frame, cluster_column, args.cancer_type,
+                                    min_margin=args.min_margin)
         proportions, summary = profiles
         print(f"  aggregates   {len(proportions):,} proportion rows and "
               f"{len(summary):,} summary rows across "

@@ -2755,7 +2755,16 @@ def start_packaging_job(
         tile_dataset_name = _row_dataset_name(row)
 
         manifest_path = Path(row["manifest_path"]) if row["manifest_path"] else None
-        if not manifest_path or not manifest_path.is_file():
+        if not manifest_path:
+            raise HTTPException(400, "This run never got far enough to have a manifest.")
+        # Only scope="run" actually reads this file (below, for the sbatch job
+        # and the pool-size count). scope="tiled" writes a brand new manifest
+        # from live disk coverage a few lines down, using only this path's
+        # parent directory — checking the original file exists here refused a
+        # "package the whole directory" request over a manifest it was never
+        # going to open, whenever the run's own manifest had since been
+        # deleted or moved.
+        if scope != "tiled" and not manifest_path.is_file():
             raise HTTPException(400, f"Manifest no longer exists on disk: {manifest_path}")
         job_ids = [j for j in row["job_id"].split(",") if j]
 
@@ -3267,7 +3276,13 @@ def start_test_packaging_job(submission_id: str, req: PackagingTestRequest):
             raise HTTPException(400, "Tiling hasn't been submitted yet for this run.")
 
         manifest_path = Path(row["manifest_path"]) if row["manifest_path"] else None
-        if not manifest_path or not manifest_path.is_file():
+        if not manifest_path:
+            raise HTTPException(400, "This run never got far enough to have a manifest.")
+        # Same reasoning as /package: scope="tiled" writes its own fresh
+        # manifest from live disk coverage below and only needs this path's
+        # parent directory, so the original file's existence is irrelevant to
+        # it — only scope="run" actually opens it.
+        if req.scope != "tiled" and not manifest_path.is_file():
             raise HTTPException(400, f"Manifest no longer exists on disk: {manifest_path}")
 
         job_ids = [j for j in row["job_id"].split(",") if j]
@@ -3895,32 +3910,56 @@ def start_test_cluster_assignment_job(submission_id: str, req: ClusterAssignment
     return {"submission_id": submission_id, **result}
 
 
-def _kb_load_source_csv(row: dict) -> Path:
-    """This run's assignment CSV, the only input Stage 5 reads.
+def _kb_load_source_csv(row: dict, override_path: str | None = None) -> Path:
+    """This run's assignment CSV, or an explicit override path.
+
+    The override exists for output from Stage 4's "Test on a sample .h5"
+    mode: that mode deliberately never records an output path on
+    slurm_dataset_runs (see start_test_cluster_assignment_job), so there is no
+    tracked path here to fall back to for it. Given one explicitly, it is
+    validated exactly the same way — Stage 5 does not get a looser bar just
+    because the CSV did not come from this run's own tracking.
 
     Gated on the same validator the /status endpoint uses for
     assignment_ready — a CSV that exists but is a stub (interrupted run, half
     the columns) is not a state Stage 5 can load from, whatever the DB row's
     assignment_job_id says.
     """
-    path = row.get("assignment_output_path")
-    if not path:
-        raise HTTPException(400, "Cluster assignment hasn't been run for this dataset yet.")
-    csv_path = Path(path)
+    if override_path:
+        csv_path = Path(override_path)
+    else:
+        path = row.get("assignment_output_path")
+        if not path:
+            raise HTTPException(400, "Cluster assignment hasn't been run for this dataset yet.")
+        csv_path = Path(path)
+
     ok, reason = _validate_assignment_output(csv_path)
     if not ok:
+        source = "This CSV" if override_path else "This run's assignment output"
         raise HTTPException(
             400,
-            f"This run's assignment output isn't usable yet ({reason}). Stage 5 "
-            f"loads exactly what Stage 4 wrote, so it refuses to read a partial "
-            f"or missing CSV rather than loading whatever rows happen to be there.",
+            f"{source} isn't usable ({reason}). Stage 5 loads exactly what's there, "
+            f"so it refuses to read a partial or missing CSV rather than loading "
+            f"whatever rows happen to be there.",
         )
     return csv_path
 
 
+class KbLoadPreviewRequest(BaseModel):
+    # min_margin previews compute_profiles()'s own exclusion (see
+    # load_hpc_assignments.py) — leave-one-out validation put tiles below 0.1
+    # vote_margin at 57% correct and 0.1-0.25 at 76%, against 92%+ once margin
+    # clears 0.25, so this is how many of those the CSV actually holds before
+    # anyone decides whether to exclude them.
+    min_margin: float = 0.0
+    # See _kb_load_source_csv — output from Stage 4's "Test on a sample .h5"
+    # mode has no tracked path, so it has to be given explicitly.
+    csv_path: str | None = None
+
+
 @app.post("/dataset-jobs/{submission_id}/kb-load-preview")
-def preview_kb_load(submission_id: str):
-    """Stage 5, dry-run half: what loading this run's assignment CSV into the
+def preview_kb_load(submission_id: str, req: KbLoadPreviewRequest = KbLoadPreviewRequest()):
+    """Stage 5, dry-run half: what loading an assignment CSV into the
     Knowledge Bank would do, computed without changing anything.
 
     Same report load_hpc_assignments.py prints for --dry-run (its default
@@ -3929,24 +3968,29 @@ def preview_kb_load(submission_id: str):
     can never disagree about what a load would do.
     """
     row = _get_dataset_run_row(submission_id)
-    csv_path = _kb_load_source_csv(row)
+    csv_path = _kb_load_source_csv(row, override_path=req.csv_path)
 
     try:
         frame, cluster_column = _read_kb_assignments(csv_path)
     except SystemExit as e:
         raise HTTPException(400, str(e))
 
-    report = _inspect_kb_load(_get_engine(), frame, cluster_column)
+    report = _inspect_kb_load(_get_engine(), frame, cluster_column, min_margin=req.min_margin)
     match_rate = report["matched"] / report["rows"] if report["rows"] else 0.0
     report.update({
         "cluster_column": cluster_column,
         "match_rate": match_rate,
         "min_match_rate": _KB_MIN_MATCH_RATE,
         "would_refuse_low_match": match_rate < _KB_MIN_MATCH_RATE,
-        "already_loaded": bool(row.get("kb_load_done")),
-        "kb_load_at": row["kb_load_at"].isoformat() if row.get("kb_load_at") else None,
-        "kb_load_rows": row.get("kb_load_rows"),
-        "kb_load_reference": row.get("kb_load_reference"),
+        # Tracked run state is meaningless for an explicit csv_path — it may
+        # be a completely different run's test output, so showing this run's
+        # own kb_load_done/at/rows next to it would claim a connection that
+        # is not there.
+        "already_loaded": bool(row.get("kb_load_done")) if not req.csv_path else None,
+        "kb_load_at": (row["kb_load_at"].isoformat() if row.get("kb_load_at") else None)
+                      if not req.csv_path else None,
+        "kb_load_rows": row.get("kb_load_rows") if not req.csv_path else None,
+        "kb_load_reference": row.get("kb_load_reference") if not req.csv_path else None,
     })
     return report
 
@@ -3959,12 +4003,20 @@ class KbLoadRequest(BaseModel):
     cancer_type: str | None = None
     allow_unknown_clusters: bool = False
     skip_profiles: bool = False
+    # See KbLoadPreviewRequest.min_margin — this is the value that actually
+    # gets applied to hpl_profile_proportion/summary, not just previewed.
+    min_margin: float = 0.0
+    # See _kb_load_source_csv. This still performs a real write to the KB —
+    # unlike Stage 4's own test mode, there is no throwaway version of
+    # "filling the knowledge bank". What it skips is recording kb_load_done
+    # against this particular run, since the CSV may not be this run's own.
+    csv_path: str | None = None
 
 
 @app.post("/dataset-jobs/{submission_id}/kb-load")
 def commit_kb_load(submission_id: str, req: KbLoadRequest):
-    """Stage 5: write this run's cluster assignments into tile_registry, plus
-    the hpl_profile_proportion/summary aggregates the chatbot and HPC panels
+    """Stage 5: write cluster assignments into tile_registry, plus the
+    hpl_profile_proportion/summary aggregates the chatbot and HPC panels
     actually read.
 
     This is load_hpc_assignments.py's --commit path, called in-process rather
@@ -3975,7 +4027,7 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
     for the terminal and a looser one for the UI.
     """
     row = _get_dataset_run_row(submission_id)
-    csv_path = _kb_load_source_csv(row)
+    csv_path = _kb_load_source_csv(row, override_path=req.csv_path)
 
     try:
         frame, cluster_column = _read_kb_assignments(csv_path)
@@ -3983,7 +4035,7 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
         raise HTTPException(400, str(e))
 
     eng = _get_engine()
-    report = _inspect_kb_load(eng, frame, cluster_column)
+    report = _inspect_kb_load(eng, frame, cluster_column, min_margin=req.min_margin)
     match_rate = report["matched"] / report["rows"] if report["rows"] else 0.0
 
     problems = []
@@ -4005,18 +4057,24 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
 
     profiles = None
     if not req.skip_profiles:
-        profiles = _compute_kb_profiles(frame, cluster_column, req.cancer_type)
+        profiles = _compute_kb_profiles(frame, cluster_column, req.cancer_type,
+                                        min_margin=req.min_margin)
 
     updated = _write_kb_load(eng, frame, cluster_column, profiles=profiles)
     reference = report["reference"]
 
-    _update_dataset_run(
-        submission_id,
-        kb_load_done=True,
-        kb_load_at=datetime.now(timezone.utc),
-        kb_load_rows=updated,
-        kb_load_reference=reference,
-    )
+    if not req.csv_path:
+        # Only this run's own tracked assignment marks the run's KB-load
+        # state. An explicit csv_path may be a different run's test output
+        # entirely (see _kb_load_source_csv), so recording it here would
+        # claim progress this run never actually made.
+        _update_dataset_run(
+            submission_id,
+            kb_load_done=True,
+            kb_load_at=datetime.now(timezone.utc),
+            kb_load_rows=updated,
+            kb_load_reference=reference,
+        )
 
     return {
         "submission_id": submission_id,
@@ -4024,6 +4082,9 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
         "matched": report["matched"],
         "reference": reference,
         "profiles_written": profiles is not None,
+        "min_margin": req.min_margin,
+        "excluded_from_aggregates": report["excluded_from_aggregates"],
+        "recorded_on_run": req.csv_path is None,
     }
 
 

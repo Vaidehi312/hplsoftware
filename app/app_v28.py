@@ -2450,23 +2450,69 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
             st.caption(f"Last loaded: {status['kb_load_at']}")
         st.caption("If Stage 4 has been re-run since, preview below and reload.")
 
-    if state == "blocked":
-        st.info(
-            "Waiting on cluster classification (Stage 4) to finish with a usable "
-            "assignment CSV."
+    # "blocked" only means *this run's* tracked assignment (Stage 4's "Full
+    # dataset" mode) has not produced a usable output. Loading from an
+    # explicit path does not depend on that at all — it is how output from
+    # Stage 4's "Test on a sample .h5" mode gets into the KB, since that mode
+    # deliberately never records a path against any run (same reasoning as
+    # Stage 4 itself still offering its test form while "blocked").
+    use_manual_path = state == "blocked"
+    if not use_manual_path:
+        source = st.radio(
+            "Source",
+            ["This run's tracked assignment", "A specific CSV path"],
+            horizontal=True,
+            key=f"{key_prefix}kb_load_source_{submission_id}",
+            help="Use \"A specific CSV path\" for output from Stage 4's \"Test on "
+                 "a sample .h5\" mode — that mode never records a path against "
+                 "this run, so there's nothing tracked to load from automatically.",
         )
-        return
+        use_manual_path = source != "This run's tracked assignment"
+
+    manual_csv_path = ""
+    if use_manual_path:
+        if state == "blocked":
+            st.info(
+                "This run has no tracked assignment yet. Load from a specific CSV "
+                "instead — typically output from Stage 4's \"Test on a sample .h5\" "
+                "mode — or finish Stage 4's \"Full dataset\" option first."
+            )
+        manual_csv_path = st.text_input(
+            "Assignment CSV path",
+            key=f"{key_prefix}kb_load_csv_path_{submission_id}",
+            placeholder="/path/to/DS_hpc_assignments.csv",
+            help="This still writes to the Knowledge Bank for real — it just isn't "
+                 "recorded against this run's own KB-load status, since the CSV "
+                 "may not be this run's tracked output.",
+        )
+
+    min_margin = st.number_input(
+        "Exclude tiles below this vote_margin from the aggregates",
+        min_value=0.0, max_value=1.0, value=0.0, step=0.05,
+        key=f"{key_prefix}kb_load_min_margin_{submission_id}",
+        help="Leave-one-out validation against the reference: margin below 0.1 was "
+             "57% correct, 0.1-0.25 was 76%, 0.25+ was 92%+. tile_registry keeps every "
+             "tile's own hpc_id and margin regardless of this — it only changes what "
+             "counts toward the per-slide composition the chatbot and HPC panels read. "
+             "0 (default) excludes nothing.",
+    )
 
     preview_key = f"{key_prefix}kb_load_preview_{submission_id}"
     if st.button("Preview Knowledge Bank load", key=f"{key_prefix}kb_load_preview_btn_{submission_id}"):
-        try:
-            st.session_state[preview_key] = client.preview_kb_load(submission_id)
-        except requests.exceptions.HTTPError as e:
-            st.error(f"Preview failed: {_error_detail(e)[1]}")
-            st.session_state.pop(preview_key, None)
-        except Exception as e:
-            st.error(f"Preview failed: {e}")
-            st.session_state.pop(preview_key, None)
+        if use_manual_path and not manual_csv_path.strip():
+            st.error("Enter the assignment CSV path.")
+        else:
+            try:
+                st.session_state[preview_key] = client.preview_kb_load(
+                    submission_id, min_margin=min_margin,
+                    csv_path=manual_csv_path.strip() or None,
+                )
+            except requests.exceptions.HTTPError as e:
+                st.error(f"Preview failed: {_error_detail(e)[1]}")
+                st.session_state.pop(preview_key, None)
+            except Exception as e:
+                st.error(f"Preview failed: {e}")
+                st.session_state.pop(preview_key, None)
 
     report = st.session_state.get(preview_key)
     if not report:
@@ -2495,6 +2541,12 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
         )
     if report["low_margin"]:
         st.caption(f"{report['low_margin']:,} tile(s) have vote_margin below 0.1")
+    if report["min_margin"] > 0:
+        st.info(
+            f"At the {report['min_margin']} threshold above, "
+            f"**{report['excluded_from_aggregates']:,}** tile(s) would be excluded "
+            f"from the per-slide aggregates (tile_registry keeps them regardless)."
+        )
 
     if report["would_refuse_low_match"]:
         st.error(
@@ -2535,8 +2587,17 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
                 cancer_type=cancer_type.strip() or None,
                 allow_unknown_clusters=allow_unknown,
                 skip_profiles=skip_profiles,
+                min_margin=min_margin,
+                csv_path=manual_csv_path.strip() or None,
             )
-            st.success(f"Committed {result['updated_rows']:,} tile(s) to the Knowledge Bank.")
+            msg = f"Committed {result['updated_rows']:,} tile(s) to the Knowledge Bank."
+            if result.get("excluded_from_aggregates"):
+                msg += (f" {result['excluded_from_aggregates']:,} tile(s) below "
+                        f"margin {result['min_margin']} were excluded from the aggregates.")
+            if not result.get("recorded_on_run", True):
+                msg += (" Not recorded against this run's own KB-load status, since "
+                        "the CSV wasn't this run's tracked output.")
+            st.success(msg)
             st.session_state.pop(preview_key, None)
             st.rerun()
         except requests.exceptions.HTTPError as e:

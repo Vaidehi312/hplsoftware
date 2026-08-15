@@ -380,11 +380,20 @@ class TileServerClient:
             {"projections_h5": projections_h5, "reference": reference, "k": k},
         )
 
-    def preview_kb_load(self, submission_id: str) -> dict:
-        """Stage 5 dry run: what loading this run's assignment CSV into the
+    def preview_kb_load(self, submission_id: str, min_margin: float = 0.0,
+                        csv_path: str | None = None) -> dict:
+        """Stage 5 dry run: what loading an assignment CSV into the
         Knowledge Bank would do. Read-only, safe to call as often as the UI
-        wants — mirrors load_hpc_assignments.py's default --dry-run posture."""
-        return self._post_json(f"/dataset-jobs/{submission_id}/kb-load-preview", {})
+        wants — mirrors load_hpc_assignments.py's default --dry-run posture.
+        min_margin previews how many tiles compute_profiles() would exclude
+        from the per-slide aggregates at that vote_margin threshold. csv_path
+        overrides this run's tracked assignment output — needed for output
+        from Stage 4's "Test on a sample .h5" mode, which has no tracked
+        path of its own."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/kb-load-preview",
+            {"min_margin": min_margin, "csv_path": csv_path},
+        )
 
     def commit_kb_load(
         self,
@@ -392,16 +401,25 @@ class TileServerClient:
         cancer_type: str | None = None,
         allow_unknown_clusters: bool = False,
         skip_profiles: bool = False,
+        min_margin: float = 0.0,
+        csv_path: str | None = None,
     ) -> dict:
-        """User-triggered: write this run's cluster assignments into
-        tile_registry plus the per-slide aggregates, after the same guards
-        load_hpc_assignments.py --commit enforces on the CLI."""
+        """User-triggered: write cluster assignments into tile_registry plus
+        the per-slide aggregates, after the same guards load_hpc_assignments.py
+        --commit enforces on the CLI. min_margin excludes tiles below that
+        vote_margin from the aggregates only — tile_registry keeps every
+        tile's own hpc_id and margin regardless. csv_path loads from an
+        explicit path instead of this run's tracked output (see
+        preview_kb_load) — this still writes to the KB for real, it just
+        skips marking this particular run as having loaded it."""
         return self._post_json(
             f"/dataset-jobs/{submission_id}/kb-load",
             {
                 "cancer_type": cancer_type,
                 "allow_unknown_clusters": allow_unknown_clusters,
                 "skip_profiles": skip_profiles,
+                "csv_path": csv_path,
+                "min_margin": min_margin,
             },
         )
 

@@ -254,6 +254,9 @@ def project(embeddings: np.ndarray, components: np.ndarray,
 # Neighbour search
 # --------------------------------------------------------------------------- #
 
+_COSINE_EPS = 1e-12  # guards a zero-norm vector, which cosine has no direction for
+
+
 class Searcher:
     """Exact k-NN search over the reference via a faiss flat index.
 
@@ -262,9 +265,19 @@ class Searcher:
     for no speed gain, which means it changes cluster labels rather than just
     trading accuracy for speed. faiss is required rather than optional so that
     choice cannot be made by accident.
+
+    metric="cosine" normalises reference and query vectors to unit length and
+    searches with IndexFlatIP (inner product), then converts the returned
+    similarity back to a squared-Euclidean-equivalent distance —
+    ||a-b||^2 = 2 - 2cos(theta) for unit vectors — so vote()'s sqrt(distance),
+    margin, and neighbor_distance need no changes downstream. Still exact:
+    this is a different metric on the same flat index, not an approximation.
     """
 
-    def __init__(self, reference: np.ndarray):
+    def __init__(self, reference: np.ndarray, metric: str = "l2"):
+        if metric not in ("l2", "cosine"):
+            raise ValueError(f"Unknown metric: {metric!r}. Use 'l2' or 'cosine'.")
+        self.metric = metric
         self.reference = np.ascontiguousarray(reference, dtype=np.float32)
         try:
             import faiss
@@ -274,14 +287,36 @@ class Searcher:
                 "fallback search path."
             ) from e
 
-        index = faiss.IndexFlatL2(self.reference.shape[1])
-        index.add(self.reference)
+        if metric == "cosine":
+            normed = self._normalize(self.reference)
+            index = faiss.IndexFlatIP(normed.shape[1])
+            index.add(normed)
+        else:
+            index = faiss.IndexFlatL2(self.reference.shape[1])
+            index.add(self.reference)
         self.index = index
-        self.backend = "faiss-flat"
+        self.backend = "faiss-flat" if metric == "l2" else "faiss-flat-cosine"
+
+    @staticmethod
+    def _normalize(vectors: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        return np.ascontiguousarray(vectors / np.maximum(norms, _COSINE_EPS), dtype=np.float32)
 
     def search(self, queries: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         queries = np.ascontiguousarray(queries, dtype=np.float32)
-        distances, indices = self.index.search(queries, k)
+        if self.metric == "cosine":
+            similarities, indices = self.index.search(self._normalize(queries), k)
+            # faiss pads a missing neighbour (index -1, see below) with a
+            # sentinel similarity near float32's minimum, which overflows
+            # 2 - 2*sim before the clip below. Harmless — those slots are
+            # masked out downstream by index >= 0 — but errstate keeps the
+            # overflow from printing a warning on every such (valid) call.
+            with np.errstate(over="ignore"):
+                # Clip for float error near cos(theta)=1 (distance 0), not
+                # because a real cosine similarity can exceed 1.
+                distances = np.clip(2.0 - 2.0 * similarities, 0.0, None)
+        else:
+            distances, indices = self.index.search(queries, k)
         # faiss returns -1 when k exceeds the number of vectors in the index.
         # Left as -1 would silently index the last reference row and vote for
         # whatever cluster it belongs to.
@@ -292,19 +327,54 @@ class Searcher:
 # Voting
 # --------------------------------------------------------------------------- #
 
+_WEIGHT_EPS = 1e-6  # avoids a divide-by-zero for a duplicate-vector neighbour at distance 0
+
 def vote(neighbour_indices: np.ndarray, neighbour_distances: np.ndarray,
-         codes: np.ndarray, n_clusters: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Majority label, margin, and mean neighbour distance per query."""
+         codes: np.ndarray, n_clusters: int,
+         distance_weighted: bool = False, distance_power: float = 1.0,
+         class_weights: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Majority (or weighted) label, margin, and mean neighbour distance.
+
+    distance_weighted gives neighbour i a vote of 1/(distance_i + eps)**power
+    instead of one vote each — the fix for a boundary tile where an unweighted
+    count among k neighbours ties or nearly ties between two clusters that are
+    not actually equally close. distance_power > 1 (e.g. 2) makes the nearest
+    few neighbours matter much more than the rest; 1.0 is the default weighting.
+
+    class_weights, one entry per cluster code (pass 1/reference_count), further
+    scales each neighbour's vote by its cluster's weight — the fix for a large
+    cluster winning a boundary tile simply by having more points nearby, not by
+    being genuinely closer. It composes with distance_weighted rather than
+    replacing it: a neighbour's final weight is the distance term times its
+    cluster's weight.
+
+    All three are opt-in and independent. With none, every valid neighbour's
+    weight is exactly 1, so counts and margin come out bit-for-bit what this
+    returned before any of them existed.
+    """
     rows, k = neighbour_indices.shape
     valid = neighbour_indices >= 0
     safe = np.where(valid, neighbour_indices, 0)
     labels = codes[safe]
+    distances = np.sqrt(np.maximum(neighbour_distances, 0.0))
+
+    if distance_weighted:
+        weights = np.where(valid, 1.0 / (distances + _WEIGHT_EPS) ** distance_power, 0.0)
+    else:
+        weights = valid.astype(np.float64)
+
+    if class_weights is not None:
+        # Invalid slots already carry weight 0 above, so multiplying by
+        # whatever class_weights[labels] resolves to there (a placeholder
+        # cluster, since safe replaced -1 with 0) stays 0 rather than leaking
+        # a spurious weight in.
+        weights = weights * class_weights[labels]
 
     # One bincount over row-offset label ids beats a per-row loop; at 250
     # neighbours x 71 clusters the dense count matrix is small.
     offsets = labels + (np.arange(rows, dtype=np.int64)[:, None] * n_clusters)
     counts = np.bincount(
-        offsets[valid].ravel(), minlength=rows * n_clusters
+        offsets[valid].ravel(), weights=weights[valid].ravel(), minlength=rows * n_clusters
     ).reshape(rows, n_clusters)
 
     order = np.argsort(counts, axis=1)
@@ -313,12 +383,15 @@ def vote(neighbour_indices: np.ndarray, neighbour_distances: np.ndarray,
     runner_up = np.take_along_axis(counts, order[:, -2][:, None], 1).ravel() if n_clusters > 1 else 0
 
     found = valid.sum(axis=1)
-    # Divide by neighbours actually found, not the requested k, so an IVF probe
-    # that returned fewer does not read as a weaker margin than it is.
-    denominator = np.maximum(found, 1)
-    margin = (top - runner_up) / denominator
+    # Divide by total vote weight, not neighbour count, so margin means the
+    # same thing in both modes: the winner's share of the vote over the
+    # runner-up. In unweighted mode weight sums to found, so this is
+    # unchanged from before — a faiss result padded with -1 (k larger than
+    # the index) still doesn't read as a weaker margin than it is.
+    total_weight = np.maximum(weights.sum(axis=1), 1e-12)
+    margin = (top - runner_up) / total_weight
 
-    distances = np.sqrt(np.maximum(neighbour_distances, 0.0))
+    denominator = np.maximum(found, 1)
     mean_distance = np.where(
         found > 0,
         np.sum(np.where(valid, distances, 0.0), axis=1) / denominator,
@@ -415,8 +488,15 @@ def assign(args) -> dict:
     with h5py.File(args.h5, "r") as content:
         _, meta_keys = _resolve_datasets(content, args.rep_key)
 
-    searcher = Searcher(reference)
+    searcher = Searcher(reference, metric=args.metric)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
+
+    class_weights = None
+    if args.class_weighted:
+        # 1/count so a cluster with more reference points gets less weight per
+        # neighbour — correcting for a large cluster winning a boundary tile by
+        # being more numerous nearby, not by being genuinely closer.
+        class_weights = 1.0 / np.maximum(np.bincount(codes, minlength=len(categories)), 1)
 
     out_path = args.out
     if sharded:
@@ -447,7 +527,10 @@ def assign(args) -> dict:
             for bstart in range(0, len(queries), args.batch_size):
                 bstop = min(bstart + args.batch_size, len(queries))
                 idx, dist = searcher.search(queries[bstart:bstop], k)
-                w, m, d = vote(idx, dist, codes, len(categories))
+                w, m, d = vote(idx, dist, codes, len(categories),
+                               distance_weighted=args.distance_weighted,
+                               distance_power=args.distance_power,
+                               class_weights=class_weights)
                 margins[offset + bstart:offset + bstop] = m
                 distances[offset + bstart:offset + bstop] = d
                 np.add.at(cluster_counts, w, 1)
@@ -557,6 +640,28 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
+    parser.add_argument("--metric", default="l2", choices=["l2", "cosine"],
+                        help="l2 (default): Euclidean distance, what ingest uses. "
+                             "cosine: direction only, ignoring magnitude — validate "
+                             "with validate_reference.py --metric cosine before using "
+                             "this for a real assignment, same as k or the weighting "
+                             "flags — it changes cluster labels.")
+    parser.add_argument("--distance-weighted", action="store_true",
+                        help="Weight each neighbour's vote by 1/distance instead of "
+                             "one vote each. Validate with validate_reference.py "
+                             "--distance-weighted before using this for a real "
+                             "assignment — it changes cluster labels, same as k does.")
+    parser.add_argument("--distance-power", type=float, default=1.0,
+                        help="Exponent on the distance-weighted vote: "
+                             "1/(distance+eps)**power. 2.0 makes the nearest few "
+                             "neighbours matter much more. Only used with "
+                             "--distance-weighted.")
+    parser.add_argument("--class-weighted", action="store_true",
+                        help="Scale each neighbour's vote by 1/(its cluster's "
+                             "reference count), so a large cluster's neighbours don't "
+                             "win a boundary tile just by being more numerous nearby. "
+                             "Composes with --distance-weighted. Validate first, same "
+                             "as that flag.")
     parser.add_argument("--centering", default="query",
                         choices=["query", "reference", "none"],
                         help="How queries are centred before projection. 'query' "

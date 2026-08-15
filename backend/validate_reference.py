@@ -75,25 +75,63 @@ def load_reference(path: Path) -> dict:
 
 
 def leave_one_out(reference: dict, sample: int, k: int,
-                  batch: int, seed: int) -> dict:
+                  batch: int, seed: int, distance_weighted: bool = False,
+                  distance_power: float = 1.0, class_weighted: bool = False,
+                  metric: str = "l2", query_index: np.ndarray | None = None) -> dict:
+    """Leave-one-out over `sample` random reference rows (or exactly
+    `query_index`, when given).
+
+    query_index lets a caller re-query a *specific* set of rows — e.g. re-running
+    the low-margin tiles from an earlier call at a different k — rather than a
+    fresh random sample. `sample` and `seed` are ignored in that case: the
+    caller already knows exactly which rows it wants, and re-deriving them from
+    a seed would risk silently drifting from the set the caller actually meant.
+    """
     vectors, codes = reference["vectors"], reference["codes"]
     n_clusters = len(reference["categories"])
     total = len(vectors)
 
-    rng = np.random.default_rng(seed)
-    if sample >= total:
-        query_index = np.arange(total)
+    if query_index is not None:
+        query_index = np.asarray(query_index, dtype=np.int64)
+        if query_index.size and (query_index.min() < 0 or query_index.max() >= total):
+            raise ValueError(
+                f"query_index has values outside [0, {total}) — not rows of "
+                f"this reference."
+            )
     else:
-        query_index = np.sort(rng.choice(total, size=sample, replace=False))
+        rng = np.random.default_rng(seed)
+        if sample >= total:
+            query_index = np.arange(total)
+        else:
+            query_index = np.sort(rng.choice(total, size=sample, replace=False))
 
-    searcher = Searcher(vectors)
+    searcher = Searcher(vectors, metric=metric)
     print(f"Backend   : {searcher.backend}")
     print(f"Reference : {total:,} tiles, {vectors.shape[1]} comps, "
           f"{n_clusters} clusters ({reference['groupby']})")
-    print(f"Queries   : {len(query_index):,} sampled, k={k} (self excluded)")
+    vote_desc = "+".join(filter(None, [
+        f"distance^{distance_power:g}" if distance_weighted else None,
+        "class" if class_weighted else None,
+    ])) or "unweighted"
+    print(f"Queries   : {len(query_index):,} sampled, k={k} (self excluded), "
+          f"{vote_desc} vote")
+
+    class_weights = None
+    if class_weighted:
+        # Same 1/count correction as assign_hpc_clusters.py --class-weighted:
+        # a large cluster's neighbours count for less per neighbour, so it
+        # can't win a boundary tile purely by being more numerous nearby.
+        class_weights = 1.0 / np.maximum(np.bincount(codes, minlength=n_clusters), 1)
 
     predicted = np.empty(len(query_index), dtype=np.int64)
     margins = np.empty(len(query_index), dtype=np.float32)
+    # How many of the k neighbours actually carry the tile's true label. This
+    # is what separates a fixable error from an unfixable one: zero means the
+    # true cluster never appeared among the neighbours at all, so no vote rule
+    # — weighting, class weights, a bigger k — can recover it. One or more
+    # means the right answer was present and lost the vote, which is exactly
+    # what those knobs can change.
+    truth_neighbours = np.empty(len(query_index), dtype=np.int32)
     started = time.perf_counter()
 
     for start in range(0, len(query_index), batch):
@@ -104,10 +142,11 @@ def leave_one_out(reference: dict, sample: int, k: int,
         idx, dist = searcher.search(np.ascontiguousarray(vectors[rows]), k + 1)
 
         # Mask the self-match rather than assuming it is column 0: with
-        # duplicate vectors, ties, or an approximate backend it need not be.
+        # duplicate vectors or ties it need not be.
         self_mask = idx == rows[:, None]
-        # A row with no self-match (possible under IVF) would otherwise keep an
-        # extra neighbour; drop its last column so every row votes on k.
+        # A row with no self-match (possible if k+1 exceeds the reference size)
+        # would otherwise keep an extra neighbour; drop its last column so
+        # every row votes on k.
         no_self = ~self_mask.any(axis=1)
         if no_self.any():
             self_mask[no_self, -1] = True
@@ -115,9 +154,15 @@ def leave_one_out(reference: dict, sample: int, k: int,
         trimmed_idx = idx[keep].reshape(len(rows), k)
         trimmed_dist = dist[keep].reshape(len(rows), k)
 
-        winners, margin, _ = vote(trimmed_idx, trimmed_dist, codes, n_clusters)
+        winners, margin, _ = vote(trimmed_idx, trimmed_dist, codes, n_clusters,
+                                  distance_weighted=distance_weighted,
+                                  distance_power=distance_power,
+                                  class_weights=class_weights)
         predicted[start:stop] = winners
         margins[start:stop] = margin
+        truth_neighbours[start:stop] = (
+            codes[trimmed_idx] == codes[rows][:, None]
+        ).sum(axis=1)
 
     elapsed = time.perf_counter() - started
     truth = codes[query_index]
@@ -126,10 +171,12 @@ def leave_one_out(reference: dict, sample: int, k: int,
     return {
         "accuracy": float(correct.mean()),
         "n": len(query_index),
+        "query_index": query_index,
         "correct": correct,
         "truth": truth,
         "predicted": predicted,
         "margins": margins,
+        "truth_neighbours": truth_neighbours,
         "categories": reference["categories"],
         "n_clusters": n_clusters,
         "rate": len(query_index) / max(elapsed, 1e-9),
@@ -150,25 +197,131 @@ def report(result: dict, worst: int) -> None:
 
     # Per-cluster accuracy. A low overall number caused by two bad clusters is a
     # different problem from one spread evenly, and only this distinguishes them.
-    truth, correct = result["truth"], result["correct"]
+    #
+    # For each cluster's wrong tiles, also the single most common wrong vote and
+    # its share of those errors. Two clusters at 85% recovery are not the same
+    # problem if one's errors scatter across a dozen neighbours and the other's
+    # all land on one specific cluster — only the second is a merge candidate,
+    # and neither guess is distinguishable from overall accuracy alone.
+    truth, predicted, correct = result["truth"], result["predicted"], result["correct"]
+    margins = result["margins"]
+    truth_neighbours = result["truth_neighbours"]
+    categories, n_clusters = result["categories"], result["n_clusters"]
+
+    # The ceiling. Errors where the true cluster never appeared among the k
+    # neighbours cannot be recovered by any vote rule; they need a different
+    # embedding space, a bigger k, or a merge. Everything else is a vote that
+    # was lost with the right answer present — that is the addressable share,
+    # and the honest upper bound on what tuning the vote can still buy.
+    wrong_all = ~correct
+    n_wrong_all = int(wrong_all.sum())
+    if n_wrong_all:
+        unreachable_all = int((truth_neighbours[wrong_all] == 0).sum())
+        reachable_all = n_wrong_all - unreachable_all
+        ceiling = (int(correct.sum()) + reachable_all) / n
+        print(f"\nError budget: {n_wrong_all:,} wrong — {reachable_all:,} "
+              f"({reachable_all / n_wrong_all * 100:.0f}%) had the true cluster among "
+              f"the k neighbours and lost the vote, {unreachable_all:,} "
+              f"({unreachable_all / n_wrong_all * 100:.0f}%) did not.")
+        print(f"            A perfect vote rule at this k would reach "
+              f"{ceiling * 100:.2f}% — that is the whole headroom left in the vote.")
     rows = []
-    for code in range(result["n_clusters"]):
+    top_code_of = {}
+    for code in range(n_clusters):
         mask = truth == code
         if mask.sum() == 0:
             continue
-        rows.append((str(result["categories"][code]), int(mask.sum()),
-                     float(correct[mask].mean())))
-    rows.sort(key=lambda r: r[2])
+        wrong = mask & ~correct
+        n_wrong = int(wrong.sum())
+        confused_with, confused_share, top_code = None, 0.0, None
+        if n_wrong > 0:
+            vote_counts = np.bincount(predicted[wrong], minlength=n_clusters)
+            top_code = int(np.argmax(vote_counts))
+            confused_with = str(categories[top_code])
+            confused_share = float(vote_counts[top_code] / n_wrong)
+            top_code_of[code] = top_code
+        wrong_margin = float(margins[wrong].mean()) if n_wrong > 0 else None
+        correct_margin = float(margins[mask & correct].mean()) if (mask & correct).any() else None
+        # Of this cluster's errors, how many had *no* same-cluster neighbour at
+        # all among the k. Those are beyond any vote rule.
+        unreachable = int((truth_neighbours[wrong] == 0).sum()) if n_wrong > 0 else 0
+        rows.append((code, str(categories[code]), int(mask.sum()), float(correct[mask].mean()),
+                     confused_with, confused_share, n_wrong, top_code, wrong_margin,
+                     correct_margin, unreachable))
+    rows.sort(key=lambda r: r[3])
+
+    # Is weak recovery just small-reference-count noise, or does it track a
+    # cluster's own size independent of that? A cluster with few reference
+    # tiles has fewer plausible same-cluster neighbours to vote for it even
+    # when the phenotype is perfectly separable, so size alone can explain
+    # part of a low number without anything being "wrong" to fix.
+    sizes = np.array([r[2] for r in rows], dtype=np.float64)
+    accs = np.array([r[3] for r in rows], dtype=np.float64)
+    if len(rows) > 2 and sizes.std() > 0 and accs.std() > 0:
+        size_acc_corr = float(np.corrcoef(sizes, accs)[0, 1])
+        print(f"\nCluster size vs. recovery: r = {size_acc_corr:+.2f} across {len(rows)} "
+              f"clusters (near 0 = size isn't the story; negative = smaller clusters "
+              f"recover worse).")
 
     print(f"\nWeakest {min(worst, len(rows))} clusters (recovery of their own tiles):")
-    print(f"  {'cluster':>8}  {'n':>7}  {'recovered':>9}")
-    for name, count, acc in rows[:worst]:
-        print(f"  {name:>8}  {count:>7,}  {acc * 100:>8.1f}%")
+    print(f"  {'cluster':>8}  {'n':>7}  {'recovered':>9}  top confusion")
+    for (code, name, count, acc, confused_with, confused_share, n_wrong, top_code,
+         wrong_margin, correct_margin, unreachable) in rows[:worst]:
+        if confused_with is None:
+            confusion = "(no errors)"
+        else:
+            mutual = top_code_of.get(top_code) == code
+            confusion = (f"→ {confused_with} ({confused_share * 100:.0f}% of {n_wrong} wrong)"
+                         f"{' [mutual]' if mutual else ''}")
+        print(f"  {name:>8}  {count:>7,}  {acc * 100:>8.1f}%  {confusion}")
+        if n_wrong == 0:
+            continue
+        # Reachable errors — the true cluster WAS among the k neighbours and
+        # still lost the vote — are the ones a vote rule can win back. The rest
+        # need a different space or a merge, not a better vote.
+        reachable = n_wrong - unreachable
+        print(f"           {reachable}/{n_wrong} errors had the true cluster among the "
+              f"k neighbours ({'vote is losable — weighting/class weights can help' if reachable else 'true cluster never appears — no vote rule can fix these'})")
+        if wrong_margin is None:
+            continue
+        if correct_margin is None:
+            print(f"           wrong-tile margin {wrong_margin:.2f} (no correct tiles to "
+                  f"compare against — this cluster is fully absorbed)")
+            continue
+        # Wrong tiles voted with near the same confidence as correct ones means
+        # the model isn't hesitating on them — it's confidently picking the
+        # wrong cluster, which margin-gated adaptive k cannot fix (it only
+        # re-queries LOW-margin tiles). Wrong tiles with a visibly lower margin
+        # than correct ones are boundary cases adaptive k should be catching.
+        gap = correct_margin - wrong_margin
+        style = "confidently wrong (adaptive-k won't catch this)" if gap < 0.1 \
+            else "low-confidence / boundary (adaptive-k should help)"
+        print(f"           wrong-tile margin {wrong_margin:.2f} vs. "
+              f"correct-tile margin {correct_margin:.2f} — {style}")
+
+    # Where the errors actually live. The weakest-cluster list ranks by *rate*,
+    # which over-weights small clusters: a 60%-recovery cluster of 40 tiles is
+    # 16 errors, while a 97% cluster of 3,000 is 90. Fixing the second moves the
+    # overall number and the first does not, so rank the pairs by error count
+    # too — that is the list to work down if the goal is overall accuracy.
+    pair_counts = {}
+    for t, p in zip(truth[~correct], predicted[~correct]):
+        pair_counts[(int(t), int(p))] = pair_counts.get((int(t), int(p)), 0) + 1
+    total_wrong = int((~correct).sum())
+    if pair_counts:
+        top_pairs = sorted(pair_counts.items(), key=lambda kv: -kv[1])[:worst]
+        print(f"\nBiggest confusion pairs by error count ({total_wrong:,} errors total):")
+        print(f"  {'true':>6} → {'predicted':<9}  {'errors':>7}  {'share':>6}  reverse")
+        for (t, p), count in top_pairs:
+            reverse = pair_counts.get((p, t), 0)
+            print(f"  {str(categories[t]):>6} → {str(categories[p]):<9}  {count:>7,}  "
+                  f"{count / total_wrong * 100:>5.1f}%  "
+                  f"{reverse:,} the other way"
+                  f"{' (symmetric — likely one phenotype split in two)' if reverse >= count * 0.5 else ''}")
 
     # Does vote_margin mean anything? If low-margin tiles are not wrong more
     # often, the confidence column in every assignment CSV is decoration, and
     # the low-confidence index on tile_registry is pointing at nothing.
-    margins = result["margins"]
     print("\nIs vote_margin informative?")
     edges = [0.0, 0.1, 0.25, 0.5, 0.75, 1.01]
     for low, high in zip(edges, edges[1:]):
@@ -190,6 +343,27 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what assignment uses.")
+    parser.add_argument("--metric", default="l2", choices=["l2", "cosine"],
+                        help="l2 (default): Euclidean distance. cosine: normalises "
+                             "reference and query vectors to unit length first, so "
+                             "only direction (not magnitude) decides neighbours. Run "
+                             "once with each to see whether it actually helps before "
+                             "using it for a real assignment.")
+    parser.add_argument("--distance-weighted", action="store_true",
+                        help="Weight each neighbour's vote by 1/distance instead of "
+                             "one vote each. Run once with and once without to see "
+                             "whether it actually helps before using it for a real "
+                             "assignment.")
+    parser.add_argument("--distance-power", type=float, default=1.0,
+                        help="Exponent on the distance-weighted vote: "
+                             "1/(distance+eps)**power. 2.0 makes the nearest few "
+                             "neighbours matter much more. Only used with "
+                             "--distance-weighted.")
+    parser.add_argument("--class-weighted", action="store_true",
+                        help="Scale each neighbour's vote by 1/(its cluster's "
+                             "reference count), so a large cluster's neighbours don't "
+                             "win a boundary tile just by being more numerous nearby. "
+                             "Composes with --distance-weighted.")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0,
                         help="Sampling seed, so a number can be reproduced.")
@@ -203,7 +377,11 @@ def main() -> None:
     k = args.k or reference["n_neighbors"]
     sample = args.sample if args.sample > 0 else len(reference["vectors"])
 
-    result = leave_one_out(reference, sample, k, args.batch_size, args.seed)
+    result = leave_one_out(reference, sample, k, args.batch_size, args.seed,
+                           distance_weighted=args.distance_weighted,
+                           distance_power=args.distance_power,
+                           class_weighted=args.class_weighted,
+                           metric=args.metric)
     report(result, args.worst)
 
     print(

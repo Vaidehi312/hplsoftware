@@ -74,7 +74,12 @@ def _run(*args: str) -> str:
 def _assign(ref: Path, h5: Path, out: Path, **flags) -> Path:
     args = ["--reference", str(ref), "--h5", str(h5), "--out", str(out)]
     for key, value in flags.items():
-        args += [f"--{key.replace('_', '-')}", str(value)]
+        flag = f"--{key.replace('_', '-')}"
+        # store_true flags take no value; passing True has to mean "present".
+        if value is True:
+            args.append(flag)
+        elif value is not False:
+            args += [flag, str(value)]
     _run(*args)
     return out
 
@@ -336,6 +341,273 @@ def test_reference_keys_match_the_builder(tmp_path):
     )
     assert check_reference(out2)["has_mean"] is True
 
+
+# --- adaptive k ----------------------------------------------------------
+#
+# The gate re-votes only the tiles whose base-k vote was nearly tied, at a
+# wider prefix of the SAME search. Two things could go wrong quietly: the flag
+# could be accepted and ignored (a normal-looking CSV that never re-voted), or
+# vote_margin could keep describing the discarded base vote while hpc_id came
+# from the wide one — which would make Stage 5's --min-margin drop exactly the
+# tiles this rescues. So these check the refusals fire and the columns agree.
+
+
+def _run_expecting_failure(*args: str) -> str:
+    result = subprocess.run(
+        [sys.executable, str(ASSIGN), *args],
+        capture_output=True, text=True, cwd=str(BACKEND),
+    )
+    assert result.returncode != 0, f"expected a refusal, got:\n{result.stdout}"
+    return result.stdout + result.stderr
+
+
+def test_adaptive_k_no_wider_than_k_is_refused(tmp_path):
+    """A re-vote at a k no wider than the base sees the same neighbours and
+    cannot change a single label. Accepting it would produce an output that
+    looks adaptive and is not."""
+    ref, h5 = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(ref)
+    _write_queries(h5)
+    message = _run_expecting_failure(
+        "--reference", str(ref), "--h5", str(h5), "--out", str(tmp_path / "o.csv"),
+        "--k", "10", "--adaptive-margin", "0.1", "--adaptive-k", "10",
+    )
+    assert "not wider" in message
+
+    # Narrower is refused for the same reason, not silently clamped.
+    message = _run_expecting_failure(
+        "--reference", str(ref), "--h5", str(h5), "--out", str(tmp_path / "o.csv"),
+        "--k", "10", "--adaptive-margin", "0.1", "--adaptive-k", "5",
+    )
+    assert "not wider" in message
+
+
+def test_adaptive_k_without_a_margin_is_refused(tmp_path):
+    """--adaptive-k alone has nothing to gate on. Ignoring it would mean a
+    typo'd sweep silently ran the plain configuration."""
+    ref, h5 = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(ref)
+    _write_queries(h5)
+    message = _run_expecting_failure(
+        "--reference", str(ref), "--h5", str(h5), "--out", str(tmp_path / "o.csv"),
+        "--k", "10", "--adaptive-k", "25",
+    )
+    assert "without a positive" in message
+
+
+def test_adaptive_k_beyond_the_reference_is_refused(tmp_path):
+    ref, h5 = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(ref)
+    _write_queries(h5)
+    message = _run_expecting_failure(
+        "--reference", str(ref), "--h5", str(h5), "--out", str(tmp_path / "o.csv"),
+        "--k", "10", "--adaptive-margin", "0.1",
+        "--adaptive-k", str(REF_ROWS + 1),
+    )
+    assert "exceeds" in message
+
+
+def test_adaptive_off_is_bit_identical_to_before(tmp_path):
+    """The widened search only happens when the gate is on. With it off the
+    output must match byte for byte, or every existing assignment in the KB is
+    now unreproducible."""
+    import pandas as pd
+    ref, h5 = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(ref)
+    _write_queries(h5)
+
+    plain = _assign(ref, h5, tmp_path / "plain.csv", k=10, distance_weighted=True, distance_power=3)
+    explicit_off = _assign(ref, h5, tmp_path / "off.csv", k=10, distance_weighted=True, distance_power=3,
+                           adaptive_margin=0)
+    assert plain.read_text() == explicit_off.read_text()
+
+    frame = pd.read_csv(plain)
+    assert len(frame) == QUERY_ROWS
+
+
+def test_adaptive_rewrites_only_low_margin_tiles(tmp_path):
+    """Above the threshold nothing may move; below it, the label and the margin
+    must both come from the wide vote."""
+    import pandas as pd
+    ref, h5 = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(ref)
+    _write_queries(h5)
+
+    threshold = 0.30
+    base = pd.read_csv(_assign(ref, h5, tmp_path / "base.csv",
+                               k=10, distance_weighted=True, distance_power=3))
+    adaptive = pd.read_csv(_assign(ref, h5, tmp_path / "adapt.csv",
+                                   k=10, distance_weighted=True, distance_power=3,
+                                   adaptive_margin=threshold, adaptive_k=25))
+    wide = pd.read_csv(_assign(ref, h5, tmp_path / "wide.csv",
+                               k=25, distance_weighted=True, distance_power=3))
+
+    assert list(base.columns) == list(adaptive.columns), \
+        "adaptive k must not change the CSV schema — the loader reflects on it"
+
+    low = base["vote_margin"] < threshold
+    assert low.any(), "threshold too low to exercise the re-vote"
+    assert not low.all(), "threshold too high to test the untouched rows"
+
+    # Untouched rows: identical label and identical margin.
+    kept = ~low
+    assert (adaptive.loc[kept, "leiden_2.5"].to_numpy()
+            == base.loc[kept, "leiden_2.5"].to_numpy()).all()
+    assert np.allclose(adaptive.loc[kept, "vote_margin"],
+                       base.loc[kept, "vote_margin"])
+
+    # Re-voted rows: label and margin both equal a plain k=25 run's, because
+    # the wide prefix of one search is the same neighbourhood as searching 25.
+    assert (adaptive.loc[low, "leiden_2.5"].to_numpy()
+            == wide.loc[low, "leiden_2.5"].to_numpy()).all()
+    assert np.allclose(adaptive.loc[low, "vote_margin"],
+                       wide.loc[low, "vote_margin"]), \
+        "vote_margin still describes the discarded base vote"
+    assert np.allclose(adaptive.loc[low, "neighbor_distance"],
+                       wide.loc[low, "neighbor_distance"])
+
+    # And it must actually have changed something, or the test proves nothing.
+    changed = (adaptive.loc[low, "leiden_2.5"].to_numpy()
+               != base.loc[low, "leiden_2.5"].to_numpy())
+    assert changed.any(), "the re-vote changed no label at all"
+
+
+def test_adaptive_survives_chunking_and_reports_the_count(tmp_path):
+    """The gate is applied per batch, so it must not become chunk-dependent —
+    the same failure mode the centering tests exist for."""
+    import pandas as pd
+    ref, h5 = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(ref)
+    _write_queries(h5)
+
+    frames = []
+    for chunk in (100, 100_000):
+        out = tmp_path / f"c{chunk}.csv"
+        stdout = _run("--reference", str(ref), "--h5", str(h5), "--out", str(out),
+                      "--k", "10", "--distance-power", "3",
+                      "--adaptive-margin", "0.3", "--adaptive-k", "25",
+                      "--distance-weighted", "--chunk-size", str(chunk))
+        assert "Re-voted  :" in stdout, "the re-voted count is not reported"
+        frames.append(pd.read_csv(out))
+
+    assert frames[0].equals(frames[1])
+
+# --- the submitter forwards the vote -------------------------------------
+#
+# Every vote knob was absent from the Slurm command before now, so a knob
+# measured offline had no way to reach a real assignment and the mismatch was
+# invisible: the job ran, wrote a complete CSV, and used the defaults. These
+# check the flags arrive and that an inert combination is refused at submit
+# time rather than dropped inside the container.
+
+
+def test_vote_flags_forwards_the_measured_configuration(tmp_path):
+    from submit_cluster_assignment import vote_flags
+    flags = " ".join(vote_flags(
+        k=10, distance_weighted=True, distance_power=3.0, class_weighted=False,
+        local_scaling=0, adaptive_margin=0.1, adaptive_k=25,
+    ))
+    assert flags == ("--distance-weighted --distance-power 3 "
+                     "--adaptive-margin 0.1 --adaptive-k 25")
+
+
+def test_vote_flags_defaults_add_nothing(tmp_path):
+    """The default has to stay exactly what Stage 4 already ran, or every
+    assignment already in the KB becomes unreproducible."""
+    from submit_cluster_assignment import vote_flags
+    assert vote_flags(k=None, distance_weighted=False, distance_power=1.0,
+                      class_weighted=False, local_scaling=0,
+                      adaptive_margin=0.0, adaptive_k=0) == []
+
+
+def _refused(expected: str, **kwargs) -> None:
+    """vote_flags must exit with a message naming the problem.
+
+    try/except rather than pytest.raises: every suite here also has to run
+    standalone on the cluster, where pytest is not installed.
+    """
+    from submit_cluster_assignment import vote_flags
+    try:
+        flags = vote_flags(**kwargs)
+    except SystemExit as e:
+        assert expected in str(e), str(e)
+    else:
+        raise AssertionError(
+            f"expected a refusal mentioning {expected!r}, got flags {flags}")
+
+
+def test_vote_flags_refuses_a_power_without_weighting(tmp_path):
+    """distance_power is read only when distance_weighted is on, so this pair
+    would otherwise queue a four-hour job that ignored the exponent."""
+    _refused("ignored without",
+             k=10, distance_weighted=False, distance_power=3.0,
+             class_weighted=False, local_scaling=0,
+             adaptive_margin=0.0, adaptive_k=0)
+
+
+def test_vote_flags_refuses_adaptive_without_an_explicit_k(tmp_path):
+    """k defaults to the reference's own n_neighbors, read inside the job. If
+    adaptive_k were checked against that, whether the re-vote does anything
+    could not be known until the job was already running."""
+    _refused("explicit --k",
+             k=None, distance_weighted=True, distance_power=3.0,
+             class_weighted=False, local_scaling=0,
+             adaptive_margin=0.1, adaptive_k=25)
+
+
+def test_vote_flags_refuses_an_adaptive_k_that_is_not_wider(tmp_path):
+    _refused("not wider",
+             k=25, distance_weighted=True, distance_power=3.0,
+             class_weighted=False, local_scaling=0,
+             adaptive_margin=0.1, adaptive_k=25)
+    _refused("without a positive",
+             k=10, distance_weighted=True, distance_power=3.0,
+             class_weighted=False, local_scaling=0,
+             adaptive_margin=0.0, adaptive_k=25)
+
+
+def test_the_slurm_command_actually_carries_the_vote_flags(tmp_path):
+    """vote_flags could be correct and still never reach the command line."""
+    from submit_cluster_assignment import _build_assignment_command, vote_flags
+    vote = vote_flags(k=10, distance_weighted=True, distance_power=3.0,
+                      class_weighted=False, local_scaling=0,
+                      adaptive_margin=0.1, adaptive_k=25)
+    command = _build_assignment_command(
+        singularity_bin="singularity",
+        singularity_image=tmp_path / "image.sif",
+        extras_dir=tmp_path / "extras",
+        assign_script=BACKEND / "assign_hpc_clusters.py",
+        reference=tmp_path / "ref.npz",
+        projections_h5=tmp_path / "q.h5",
+        out_csv=tmp_path / "out.csv",
+        rep_key="z_latent",
+        k=10,
+        batch_size=16_384,
+        validate_against=None,
+        vote=vote,
+    )
+    for flag in ("--distance-weighted", "--distance-power 3",
+                 "--adaptive-margin 0.1", "--adaptive-k 25", "--k 10"):
+        assert flag in command, f"{flag} never reached the Slurm command"
+
+    # And the default stays clean: no vote flags at all.
+    plain = _build_assignment_command(
+        singularity_bin="singularity",
+        singularity_image=tmp_path / "image.sif",
+        extras_dir=tmp_path / "extras",
+        assign_script=BACKEND / "assign_hpc_clusters.py",
+        reference=tmp_path / "ref.npz",
+        projections_h5=tmp_path / "q.h5",
+        out_csv=tmp_path / "out.csv",
+        rep_key="z_latent",
+        k=None,
+        batch_size=16_384,
+        validate_against=None,
+        vote=[],
+    )
+    for flag in ("--distance-weighted", "--adaptive-margin", "--class-weighted",
+                 "--local-scaling"):
+        assert flag not in plain
 
 # --- standalone runner ---------------------------------------------------
 

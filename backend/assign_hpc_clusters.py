@@ -566,8 +566,40 @@ def assign(args) -> dict:
     if k > len(reference):
         raise SystemExit(f"k={k} exceeds the {len(reference)} reference tiles.")
 
+    # Adaptive k: tiles whose base-k vote is nearly tied get re-voted at a
+    # wider neighbourhood. Refuse a setting that cannot do anything rather than
+    # accepting it and producing a normal-looking CSV that quietly ignored it.
+    adaptive_margin = getattr(args, "adaptive_margin", 0.0) or 0.0
+    adaptive_k = getattr(args, "adaptive_k", 0) or 0
+    if adaptive_margin > 0:
+        if adaptive_k <= k:
+            raise SystemExit(
+                f"--adaptive-k {adaptive_k} is not wider than k={k}, so the "
+                f"re-vote would see the same neighbours and change nothing. "
+                f"Raise it above k, or drop --adaptive-margin."
+            )
+        if adaptive_k > len(reference):
+            raise SystemExit(
+                f"--adaptive-k {adaptive_k} exceeds the {len(reference)} "
+                f"reference tiles."
+            )
+    elif adaptive_k and adaptive_k != k:
+        raise SystemExit(
+            f"--adaptive-k {adaptive_k} does nothing without a positive "
+            f"--adaptive-margin to gate it. Set the margin, or drop the k."
+        )
+
+    # One search at the wider width, voted on a prefix. The flat-L2 scan over
+    # the reference is the cost and does not depend on k -- only the top-k
+    # selection does -- so searching wider once is far cheaper than searching
+    # twice, and gives the base and the re-vote the same neighbours.
+    k_search = max(k, adaptive_k) if adaptive_margin > 0 else k
+
     print(f"Reference : {len(reference):,} tiles, {reference.shape[1]} comps, "
           f"{len(categories)} clusters, k={k} ({groupby})")
+    if adaptive_margin > 0:
+        print(f"Adaptive  : re-vote at k={adaptive_k} below margin "
+              f"{adaptive_margin:g} (searching k={k_search})")
 
     total_rows = query_row_count(args.h5, args.rep_key)
     if args.limit:
@@ -624,6 +656,7 @@ def assign(args) -> dict:
 
     started = time.perf_counter()
     written = 0
+    n_revoted = 0
     try:
         for start, stop, block in iter_embedding_chunks(
             args.h5, args.rep_key, args.chunk_size, lo, hi
@@ -633,12 +666,30 @@ def assign(args) -> dict:
             offset = start - lo
             for bstart in range(0, len(queries), args.batch_size):
                 bstop = min(bstart + args.batch_size, len(queries))
-                idx, dist = searcher.search(queries[bstart:bstop], k)
-                w, m, d = vote(idx, dist, codes, len(categories),
+                idx, dist = searcher.search(queries[bstart:bstop], k_search)
+                w, m, d = vote(idx[:, :k], dist[:, :k], codes, len(categories),
                                distance_weighted=args.distance_weighted,
                                distance_power=args.distance_power,
                                class_weights=class_weights,
                                local_scale=local_scale)
+                if adaptive_margin > 0:
+                    low = m < adaptive_margin
+                    if low.any():
+                        w2, m2, d2 = vote(
+                            idx[low, :adaptive_k], dist[low, :adaptive_k],
+                            codes, len(categories),
+                            distance_weighted=args.distance_weighted,
+                            distance_power=args.distance_power,
+                            class_weights=class_weights,
+                            local_scale=local_scale)
+                        # The recorded margin has to describe the vote that
+                        # produced the recorded label, or vote_margin measures
+                        # a vote that was thrown away -- and Stage 5's
+                        # --min-margin would then drop exactly the tiles this
+                        # was added to rescue.
+                        w, m, d = w.copy(), m.copy(), d.copy()
+                        w[low], m[low], d[low] = w2, m2, d2
+                        n_revoted += int(low.sum())
                 margins[offset + bstart:offset + bstop] = m
                 distances[offset + bstart:offset + bstop] = d
                 np.add.at(cluster_counts, w, 1)
@@ -674,6 +725,9 @@ def assign(args) -> dict:
     elapsed = time.perf_counter() - started
     print(f"Assigned  : {written:,} tiles in {elapsed:.1f}s "
           f"({written/max(elapsed, 1e-9):,.0f} tiles/s)")
+    if adaptive_margin > 0:
+        print(f"Re-voted  : {n_revoted:,} tiles ({n_revoted / max(written, 1) * 100:.1f}%) "
+              f"at k={adaptive_k}")
     print(f"Written   : {out_path}")
 
     return {
@@ -685,6 +739,7 @@ def assign(args) -> dict:
         "cluster_counts": cluster_counts,
         "categories": categories,
         "sharded": sharded,
+        "revoted": n_revoted,
     }
 
 
@@ -770,6 +825,21 @@ def main() -> None:
                              "win a boundary tile just by being more numerous nearby. "
                              "Composes with --distance-weighted. Validate first, same "
                              "as that flag.")
+    parser.add_argument("--adaptive-margin", type=float, default=0.0,
+                        metavar="MARGIN",
+                        help="Re-vote any tile whose base-k vote_margin falls "
+                             "below this at the wider --adaptive-k. 0 (default) "
+                             "disables it. Measured on the production reference "
+                             "at 200,000 tiles: --k 10 --distance-power 3 with "
+                             "--adaptive-margin 0.1 --adaptive-k 25 took "
+                             "96.78%% to 97.23%% (1,925 fixed, 1,030 broken, "
+                             "16.5 sigma by McNemar). Costs nothing extra in "
+                             "search: the wider neighbours come from the same "
+                             "scan, and only ~9%% of tiles are re-voted.")
+    parser.add_argument("--adaptive-k", type=int, default=0, metavar="K",
+                        help="The wider neighbourhood the low-margin tiles are "
+                             "re-voted at. Must exceed --k; refused otherwise, "
+                             "since the re-vote would see the same neighbours.")
     parser.add_argument("--local-scaling", type=int, default=0, metavar="R",
                         help="Divide each neighbour's distance by that neighbour's "
                              "own distance to its R-th nearest reference point, so "

@@ -218,6 +218,64 @@ def _import_check_python(reference_in_job: str) -> str:
     )
 
 
+def vote_flags(
+    *,
+    k: int | None,
+    distance_weighted: bool,
+    distance_power: float,
+    class_weighted: bool,
+    local_scaling: int,
+    adaptive_margin: float,
+    adaptive_k: int,
+) -> list[str]:
+    """The vote configuration, as flags, refusing combinations that do nothing.
+
+    These used not to be forwarded at all, so every Stage 4 job ran the plain
+    unweighted vote whatever was measured offline. Forwarding them one at a
+    time is worse than not forwarding them: a partial configuration produces a
+    complete, well-formed CSV of different cluster IDs with nothing to say it
+    was not the configuration asked for. So they travel together and the
+    inert combinations are refused here, before the queue, rather than being
+    dropped silently inside the container four hours later.
+    """
+    flags: list[str] = []
+    if distance_power != 1.0 and not distance_weighted:
+        raise SystemExit(
+            f"--distance-power {distance_power:g} is ignored without "
+            f"--distance-weighted: every neighbour would weigh exactly 1. "
+            f"Pass both, or neither."
+        )
+    if distance_weighted:
+        flags.append("--distance-weighted")
+        flags.append(f"--distance-power {distance_power:g}")
+    if class_weighted:
+        flags.append("--class-weighted")
+    if local_scaling:
+        flags.append(f"--local-scaling {local_scaling}")
+
+    if adaptive_margin > 0:
+        if k is None:
+            raise SystemExit(
+                "--adaptive-margin needs an explicit --k. Without one the base "
+                "neighbourhood is whatever the reference's n_neighbors turns "
+                "out to be, so whether --adaptive-k is actually wider than it "
+                "cannot be checked until the job is already running."
+            )
+        if adaptive_k <= k:
+            raise SystemExit(
+                f"--adaptive-k {adaptive_k} is not wider than --k {k}; the "
+                f"re-vote would see the same neighbours and change nothing."
+            )
+        flags.append(f"--adaptive-margin {adaptive_margin:g}")
+        flags.append(f"--adaptive-k {adaptive_k}")
+    elif adaptive_k:
+        raise SystemExit(
+            f"--adaptive-k {adaptive_k} does nothing without a positive "
+            f"--adaptive-margin to gate it."
+        )
+    return flags
+
+
 def _build_assignment_command(
     *,
     singularity_bin: str,
@@ -233,6 +291,7 @@ def _build_assignment_command(
     validate_against: Path | None,
     query_mean: Path | None = None,
     shard_bounds: list[tuple[int, int]] | None = None,
+    vote: list[str] | None = None,
 ) -> str:
     """Shell command the Slurm --wrap runs.
 
@@ -258,6 +317,8 @@ def _build_assignment_command(
     ]
     if k is not None:
         args.append(f"--k {k}")
+    # The vote configuration, already validated as a whole by vote_flags().
+    args.extend(vote or [])
     if validate_against is not None:
         args.append(f"--validate-against {shlex.quote(real(validate_against))}")
 
@@ -345,6 +406,15 @@ def submit_cluster_assignment_job(
     validate_against: Path | None = None,
     shards: int = 1,
     centering: str = "query",
+    # The vote. Defaults are what Stage 4 has always run, so nothing changes
+    # for an existing caller; the measured configuration is opt-in until the
+    # end-to-end acceptance test has been run at it.
+    distance_weighted: bool = False,
+    distance_power: float = 1.0,
+    class_weighted: bool = False,
+    local_scaling: int = 0,
+    adaptive_margin: float = 0.0,
+    adaptive_k: int = 0,
     partition: str = MERGE_PARTITION,
     cpus: int = 16,
     memory: str = "64G",
@@ -365,6 +435,18 @@ def submit_cluster_assignment_job(
     """
     reference = _reference_path(reference)
     reference_info = check_reference(reference)
+
+    # First, before any filesystem or Slurm work: an inert or contradictory
+    # vote configuration is a refusal, not something to discover in a log.
+    vote = vote_flags(
+        k=k,
+        distance_weighted=distance_weighted,
+        distance_power=distance_power,
+        class_weighted=class_weighted,
+        local_scaling=local_scaling,
+        adaptive_margin=adaptive_margin,
+        adaptive_k=adaptive_k,
+    )
 
     # Skipped when chained: the file will not exist yet, because the job that
     # writes it has not run. The dependency is what guarantees it later.
@@ -455,6 +537,7 @@ def submit_cluster_assignment_job(
             mean_path = None
 
     command = _build_assignment_command(
+        vote=vote,
         singularity_bin=singularity_bin,
         singularity_image=singularity_image,
         extras_dir=extras_dir,
@@ -500,6 +583,11 @@ def submit_cluster_assignment_job(
         "mean_job_id": mean_job_id,
         "merge_job_id": None,
         "sbatch_command": shlex.join(sbatch_command),
+        # Two CSVs from the same reference but different vote settings are not
+        # interchangeable, and nothing in the CSV itself distinguishes them.
+        # Recording the flags here at least puts them in the run record next to
+        # the job ID that produced the file.
+        "vote_flags": " ".join(vote),
         **reference_info,
     }
 
@@ -576,6 +664,28 @@ def build_parser() -> argparse.ArgumentParser:
                              f"path build_hpc_reference.py writes.")
     parser.add_argument("--depends-on-job-id", type=str, default=None)
     parser.add_argument("--rep-key", type=str, default="z_latent")
+    parser.add_argument("--distance-weighted", action="store_true",
+                        help="Weight each neighbour by 1/(distance+eps)**power "
+                             "instead of one vote each. Not forwarded to the "
+                             "Slurm job at all before now, so every Stage 4 run "
+                             "so far used the plain unweighted vote.")
+    parser.add_argument("--distance-power", type=float, default=1.0,
+                        help="Exponent on the distance weight. Needs "
+                             "--distance-weighted; refused without it, since it "
+                             "would otherwise be silently ignored.")
+    parser.add_argument("--class-weighted", action="store_true",
+                        help="Also scale each neighbour's vote by 1/(its "
+                             "cluster's reference count).")
+    parser.add_argument("--local-scaling", type=int, default=0, metavar="R",
+                        help="Judge distances relative to each neighbour's own "
+                             "local density (its R-th nearest reference point).")
+    parser.add_argument("--adaptive-margin", type=float, default=0.0,
+                        metavar="MARGIN",
+                        help="Re-vote tiles whose base-k margin falls below this "
+                             "at the wider --adaptive-k. Needs an explicit --k.")
+    parser.add_argument("--adaptive-k", type=int, default=0, metavar="K",
+                        help="The wider neighbourhood low-margin tiles are "
+                             "re-voted at. Must exceed --k.")
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
@@ -613,6 +723,12 @@ def main() -> None:
             validate_against=args.validate_against,
             shards=args.shards,
             centering=args.centering,
+            distance_weighted=args.distance_weighted,
+            distance_power=args.distance_power,
+            class_weighted=args.class_weighted,
+            local_scaling=args.local_scaling,
+            adaptive_margin=args.adaptive_margin,
+            adaptive_k=args.adaptive_k,
             partition=args.partition,
             cpus=args.cpus,
             memory=args.memory,

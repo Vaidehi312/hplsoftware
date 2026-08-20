@@ -228,6 +228,135 @@ def _add_profile_tables(engine, rows=()):
             )
 
 
+def _add_profile_tables_with_fk(engine, rows=()):
+    """The aggregate tables *with* the foreign key Postgres actually has.
+
+    schema.sql:486-487 gives hpl_profile_proportion
+    FOREIGN KEY (samples, slides) REFERENCES hpl_profile_summary ON DELETE CASCADE.
+    _add_profile_tables above omits it, which is why the ordering bug in
+    replace_profiles survived every existing test: without the constraint, both
+    the child-before-parent insert and the cascade-away-what-was-just-written
+    case are invisible.
+
+    SQLite enforces foreign keys only when asked, per connection.
+    """
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_connection, _record):  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, cancer_type TEXT,
+                total_tiles INTEGER, dominant_hpc TEXT,
+                UNIQUE (samples, slides))"""))
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_proportion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, hpc_id TEXT, proportion REAL,
+                FOREIGN KEY (samples, slides)
+                    REFERENCES hpl_profile_summary (samples, slides)
+                    ON DELETE CASCADE)"""))
+        for samples, slides, hpc, prop in rows:
+            conn.execute(
+                text("INSERT INTO hpl_profile_summary (samples, slides, total_tiles, "
+                     "dominant_hpc) VALUES (:sa, :sl, 1, :h)"),
+                {"sa": samples, "sl": slides, "h": hpc},
+            )
+            conn.execute(
+                text("INSERT INTO hpl_profile_proportion (samples, slides, hpc_id, "
+                     "proportion) VALUES (:sa, :sl, :h, :p)"),
+                {"sa": samples, "sl": slides, "h": hpc, "p": prop},
+            )
+
+
+def test_first_load_of_a_new_cohort_does_not_violate_the_foreign_key(tmp_path):
+    """The case that fires on every slide of a cohort's first load.
+
+    hpl_profile_proportion references hpl_profile_summary, so inserting a
+    proportion row for a slide that has no summary row yet is rejected — and
+    because the loader writes everything in one transaction, that rollback would
+    take the tile_registry update with it. Loading Radiogenomics for the first
+    time is exactly this case for all ten slides.
+    """
+    csv = _make_csv(tmp_path, n=30, clusters=("0", "1", "2"))
+    frame, column = loader.read_assignments(csv)
+    proportions, summary = loader.compute_profiles(frame, column, None)
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fk.sqlite'}")
+    _add_profile_tables_with_fk(engine)  # empty: nothing to be a parent yet
+
+    with engine.begin() as conn:
+        loader.replace_profiles(conn, proportions, summary)
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM hpl_profile_summary")).scalar() == 1
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM hpl_profile_proportion")).scalar() == len(proportions)
+
+
+def test_reload_does_not_cascade_away_the_rows_it_just_wrote(tmp_path):
+    """The second FK failure, and the quieter one.
+
+    Deleting a slide's summary row cascades to its proportions. Insert the
+    proportions before that delete and they are silently removed again, leaving
+    a summary row with no proportions — a slide whose HPC panel is simply empty,
+    with no error anywhere.
+    """
+    csv = _make_csv(tmp_path, n=30, clusters=("0", "1", "2"))
+    frame, column = loader.read_assignments(csv)
+    proportions, summary = loader.compute_profiles(frame, column, None)
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fk2.sqlite'}")
+    # Pre-existing aggregates for the same sample/slide, as a reload would meet.
+    _add_profile_tables_with_fk(
+        engine, rows=[(summary["samples"].iloc[0], summary["slides"].iloc[0], "9", 1.0)]
+    )
+
+    with engine.begin() as conn:
+        loader.replace_profiles(conn, proportions, summary)
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM hpl_profile_summary")).scalar() == 1
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM hpl_profile_proportion")).scalar() == len(proportions)
+        # The stale cluster 9 row is gone, not left beside the new ones.
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM hpl_profile_proportion WHERE hpc_id = '9'")
+        ).scalar() == 0
+
+
+def test_reload_matches_rows_stored_in_a_different_case(tmp_path):
+    """migrate_indexes.sql normalised the live columns to UPPER(TRIM(...)).
+    Matching on TRIM alone deletes nothing, and the insert still runs — so the
+    slide silently ends up with two full sets of aggregates.
+    """
+    csv = _make_csv(tmp_path, n=30, clusters=("0", "1", "2"))
+    frame, column = loader.read_assignments(csv)
+    proportions, summary = loader.compute_profiles(frame, column, None)
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'case.sqlite'}")
+    _add_profile_tables_with_fk(
+        engine,
+        rows=[(summary["samples"].iloc[0].upper(),
+               summary["slides"].iloc[0].upper(), "9", 1.0)],
+    )
+
+    with engine.begin() as conn:
+        loader.replace_profiles(conn, proportions, summary)
+
+    with engine.connect() as conn:
+        # One summary row, not two. The upper-cased one must have been replaced.
+        assert conn.execute(text("SELECT COUNT(*) FROM hpl_profile_summary")).scalar() == 1
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM hpl_profile_proportion")).scalar() == len(proportions)
+
+
 def test_proportions_sum_to_one_per_slide(tmp_path):
     csv = _make_csv(tmp_path, n=30, clusters=("0", "1", "2"))
     frame, column = loader.read_assignments(csv)

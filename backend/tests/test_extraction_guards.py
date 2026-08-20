@@ -57,9 +57,16 @@ def write_input(path, rows=ROWS):
                 ds[:] = np.array([b"slide_01"] * rows, dtype="S12")
 
 
-def write_output(path, rows=ROWS, latents=True, meta=True, meta_rows=None):
+def write_output(path, rows=ROWS, latents=True, meta=True, meta_rows=None,
+                 tile_suffix=".jpeg"):
     """A projections .h5 as the encoder leaves it. latents=False, meta=False
-    is the shape of the real leftover: mode='w' ran, nothing else did."""
+    is the shape of the real leftover: mode='w' ran, nothing else did.
+
+    `tiles` carries realistic names because the encoder copies them straight
+    through from the packaged .h5, and validate_extraction_output checks them —
+    tile_suffix="" reproduces an output derived from a .h5 packaged before the
+    tile-name fix.
+    """
     with h5py.File(path, "w") as f:
         if latents:
             f.create_dataset("img_h_latent", (rows, H_DIM), dtype=np.float32)
@@ -69,7 +76,9 @@ def write_output(path, rows=ROWS, latents=True, meta=True, meta_rows=None):
             for name in CARRIED:
                 ds = f.create_dataset(name, (mr,), dtype="S12")
                 if mr:
-                    ds[:] = np.array([b"slide_01"] * mr, dtype="S12")
+                    value = (f"18_15{tile_suffix}".encode() if name == "tiles"
+                             else b"slide_01")
+                    ds[:] = np.array([value] * mr, dtype="S12")
 
 
 # --- validate_extraction_output ------------------------------------------
@@ -121,13 +130,75 @@ def test_truncated_file_rejected(tmp_path):
 
 
 def test_output_from_a_different_input_rejected(tmp_path):
-    """Same basename, different source .h5 — the one corruption reading rows
-    cannot catch, since every row present is perfectly readable."""
+    """More embeddings than the input has tiles: it cannot have come from that
+    input at all. The one corruption reading rows cannot catch, since every row
+    present is perfectly readable."""
     p = tmp_path / "complete.h5"
     write_output(p)
-    ok, reason = validate_extraction_output(p, expected_rows=ROWS + 1)
-    assert not ok and "different input file" in reason
+    ok, reason = validate_extraction_output(p, expected_rows=ROWS - 1)
+    assert not ok and "different .h5" in reason
     assert validate_extraction_output(p, expected_rows=ROWS)[0]
+
+
+def test_legacy_tile_names_do_not_make_projections_unusable(tmp_path):
+    """A projections file whose tile names predate the ".jpeg" fix is still a
+    valid set of embeddings, and must validate.
+
+    The encoder copies `tiles` through, so such a file inherits the short names
+    from its input .h5 — but the embeddings were computed from the right tile
+    images and cluster assignment never reads the name column. Rejecting it here
+    blocked Stage 3 and Stage 4 for a defect neither is affected by; the suffix
+    only matters once the name becomes a Knowledge Bank join key, which
+    migrate_tile_names.py fixes without recomputing anything.
+    """
+    legacy = tmp_path / "legacy.h5"
+    write_output(legacy, tile_suffix="")
+    assert validate_extraction_output(legacy, expected_rows=ROWS) == (True, "")
+
+    current = tmp_path / "current.h5"
+    write_output(current)
+    assert validate_extraction_output(current, expected_rows=ROWS) == (True, "")
+
+    # The genuine failures still fail — this relaxation must not have widened
+    # into "accept anything".
+    truncated = tmp_path / "short.h5"
+    write_output(truncated, rows=ROWS - 2, tile_suffix="")
+    assert not validate_extraction_output(truncated, expected_rows=ROWS)[0]
+
+
+def test_partial_run_rejected_and_named_as_partial(tmp_path):
+    """The failure that looks exactly like success: the encoder got through
+    part of the input and wrote a file with the right schema, the right dtypes
+    and no gaps. Nothing inside the file distinguishes it from a complete one —
+    only the input's tile count does.
+
+    Real case: 14,044 slides submitted, ~3,500 encoded, every internal check
+    passed and the UI showed 'features ready'.
+    """
+    p = tmp_path / "partial.h5"
+    write_output(p, rows=ROWS)
+
+    # Every check that does not know the input's size passes it.
+    assert validate_extraction_output(p) == (True, "")
+
+    ok, reason = validate_extraction_output(p, expected_rows=ROWS * 4)
+    assert not ok
+    # Must say it is short and by how much, not that it is the wrong file:
+    # the fix for a partial run is to resume or resubmit.
+    assert "missing" in reason, reason
+    assert "different .h5" not in reason, reason
+    assert f"{ROWS * 4:,}" in reason and f"{ROWS:,}" in reason, reason
+
+
+def test_partial_and_wrong_input_give_different_reasons(tmp_path):
+    """Short and over-long are different faults with different fixes, so they
+    must not collapse into one message."""
+    p = tmp_path / "out.h5"
+    write_output(p, rows=ROWS)
+    short = validate_extraction_output(p, expected_rows=ROWS + 5)[1]
+    over = validate_extraction_output(p, expected_rows=ROWS - 5)[1]
+    assert short != over
+    assert "missing" in short and "missing" not in over
 
 
 def test_missing_file_rejected(tmp_path):

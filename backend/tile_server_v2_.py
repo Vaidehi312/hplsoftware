@@ -61,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from tile_cache import TileCache
 from tile_mask import run_tissue_detection
 from auto_tile_from_mask import tile_slide_from_mask
-from slide_naming import slide_id_from_raw_path
+from slide_naming import slide_id_from_raw_path, tiles_missing_suffix
 from submit_mask_tile_slurm import submit_array as submit_dataset_array
 from submit_mask_tile_slurm import (
     submit_packaging_job,
@@ -81,6 +81,7 @@ from submit_feature_extraction import (
     submit_feature_extraction_job,
     expected_extraction_output_path,
     validate_extraction_output as _validate_extraction_output,
+    _input_h5_rows as _packaged_h5_rows,
     HPL_REPO_DIR,
 )
 
@@ -1198,9 +1199,52 @@ def _validate_h5(path: Path) -> tuple[bool, str]:
             f["img"][0]
             f["img"][rows - 1]
             f["slides"][rows - 1]
+
     except (OSError, KeyError, ValueError) as e:
         return False, f"unreadable HDF5: {e}"
     return True, ""
+
+
+def _h5_has_legacy_tile_names(path: Path) -> bool:
+    """Whether this .h5 stores tile names without the ".jpeg" suffix.
+
+    Deliberately *not* part of _validate_h5. The file is perfectly usable — the
+    images are right, and feature extraction and cluster assignment both read it
+    without caring what the name column says. The suffix only matters where the
+    name becomes a join key, which is the Knowledge Bank load, and
+    migrate_tile_names.py fixes it there in one command.
+
+    Treating it as invalid blocked packaging, extraction and assignment for a
+    defect none of them are affected by. So it is reported as an advisory the UI
+    can show, and the refusal lives at the one boundary where a wrong key
+    produces a wrong result.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            if "tiles" not in f:
+                return False
+            rows = f["tiles"].shape[0]
+            return bool(rows) and tiles_missing_suffix(f["tiles"][: min(rows, 100)])
+    except (OSError, KeyError, ValueError):
+        return False
+
+
+def _extraction_expected_rows(row: dict) -> int | None:
+    """Tiles in the .h5 this run's extraction was given, or None if that can't
+    be established.
+
+    None means "cannot check", and the row-count comparison is skipped rather
+    than failed — a run whose packaged input has since been moved or deleted
+    should not have a previously-good extraction start reading as incomplete.
+    The narrower checks in validate_extraction_output still apply.
+    """
+    packaged = row.get("h5_output_path")
+    if not packaged:
+        return None
+    packaged_path = Path(packaged)
+    if not packaged_path.is_file():
+        return None
+    return _packaged_h5_rows(packaged_path)
 
 
 def _job_output_ready(
@@ -3583,7 +3627,15 @@ def start_feature_extraction_job(submission_id: str, req: FeatureExtractionReque
             # output file before encoding anything, so a killed attempt leaves
             # one behind that would otherwise read as a completed extraction
             # and permanently block this run at "already completed".
-            if _job_output_ready(prior_output, prior_state, validator=_validate_extraction_output):
+            # Bound to the input's tile count for the same reason the status
+            # payload is: an output covering a fraction of the slides passes
+            # every internal check, and refusing the retry with "already
+            # completed" is precisely how a partial run becomes permanent.
+            prior_expected = _extraction_expected_rows(row)
+            if _job_output_ready(
+                prior_output, prior_state,
+                validator=lambda p: _validate_extraction_output(p, expected_rows=prior_expected),
+            ):
                 raise HTTPException(400, "Feature extraction has already completed for this run.")
             if prior_state in IN_FLIGHT_SLURM_STATES:
                 raise HTTPException(
@@ -3714,7 +3766,13 @@ def start_test_feature_extraction_job(submission_id: str, req: FeatureExtraction
         if existing_job_id:
             existing_output = expected_extraction_output_path(HPL_REPO_DIR, req.model, dataset_name, h5_path)
             existing_state = _get_slurm_job_state(existing_job_id)
-            if _job_output_ready(existing_output, existing_state, validator=_validate_extraction_output):
+            # The test path knows its input directly rather than through the
+            # run row, so bind the count from the .h5 the caller handed us.
+            existing_expected = _packaged_h5_rows(h5_path)
+            if _job_output_ready(
+                existing_output, existing_state,
+                validator=lambda p: _validate_extraction_output(p, expected_rows=existing_expected),
+            ):
                 raise HTTPException(
                     400, "A test feature-extraction run with these exact parameters has already completed."
                 )
@@ -3817,7 +3875,15 @@ def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentReque
             raise HTTPException(400, "Feature extraction hasn't been started for this run yet.")
 
         projections = Path(row["extraction_output_path"])
-        ok, reason = _validate_extraction_output(projections)
+        # Bound to the packaged input's tile count. Unbound, this accepts an
+        # extraction that covered a fraction of the slides — and Stage 4 would
+        # then write a complete, well-formed assignments CSV for that fraction,
+        # which Stage 5 loads into the KB as if it were the whole dataset. The
+        # per-slide aggregates come out of that silently wrong, with nothing
+        # downstream able to tell.
+        ok, reason = _validate_extraction_output(
+            projections, expected_rows=_extraction_expected_rows(row)
+        )
         if not ok:
             raise HTTPException(
                 400,
@@ -3936,12 +4002,29 @@ def _kb_load_source_csv(row: dict, override_path: str | None = None) -> Path:
     ok, reason = _validate_assignment_output(csv_path)
     if not ok:
         source = "This CSV" if override_path else "This run's assignment output"
-        raise HTTPException(
-            400,
-            f"{source} isn't usable ({reason}). Stage 5 loads exactly what's there, "
-            f"so it refuses to read a partial or missing CSV rather than loading "
-            f"whatever rows happen to be there.",
+        # Name the path. "no output file" without it is unactionable — the
+        # commonest cause is a typed path that does not exist, and the message
+        # was giving no way to tell that apart from a corrupt file.
+        detail = (
+            f"{source} isn't usable ({reason}):\n  {csv_path}\n\n"
+            f"Stage 5 loads exactly what's there, so it refuses to read a partial "
+            f"or missing CSV rather than loading whatever rows happen to be there."
         )
+        if reason == "no output file":
+            detail += (
+                f"\n\nNothing exists at that path. Check it with "
+                f"`ls -l {csv_path}`. If you meant the output of "
+                f"migrate_tile_names.py, that file is only written when it is run "
+                f"with --commit — a dry run reports what it would do and writes "
+                f"nothing."
+            )
+        elif reason.startswith("missing column"):
+            detail += (
+                "\n\nIf the columns look like data values, this CSV has no header "
+                "row. migrate_tile_names.py restores one, and doing so also "
+                "recovers the first tile, which a headerless read silently drops."
+            )
+        raise HTTPException(400, detail)
     return csv_path
 
 
@@ -4452,6 +4535,10 @@ def dataset_job_status(submission_id: str):
         # isn't usable, rather than showing a silent "not ready" forever.
         if not base["h5_ready"] and h5_path and h5_path.is_file():
             base["h5_invalid_reason"] = _validate_h5(h5_path)[1] or None
+        # Advisory, not a blocker: the run proceeds normally, but the KB load
+        # at the end will need migrate_tile_names.py first.
+        if base["h5_ready"] and h5_path:
+            base["h5_legacy_tile_names"] = _h5_has_legacy_tile_names(h5_path)
         # Slurm-independent evidence that packaging is alive: the .partial is
         # being written to right now. This is the only thing that answers "did
         # my job actually start?" when sacct/squeue can't be reached — without
@@ -4494,15 +4581,27 @@ def dataset_job_status(submission_id: str):
     if row["extraction_job_id"]:
         ext_path = Path(row["extraction_output_path"]) if row["extraction_output_path"] else None
         ext_state = _get_slurm_job_state(row["extraction_job_id"])
+        # Bind the input's tile count into the validator. Without it this only
+        # checks the file is internally consistent, and a run that encoded a
+        # fraction of the slides — an array job where most tasks died, a
+        # sharded run merged from the shards that happened to finish — writes a
+        # perfectly self-consistent file and reads as "features ready". That
+        # is the whole failure mode this pipeline is written against: right
+        # shape, right dtype, no missing values, a third of the data.
+        expected = _extraction_expected_rows(row)
         base["extraction_ready"] = _job_output_ready(
-            ext_path, ext_state, validator=_validate_extraction_output
+            ext_path, ext_state,
+            validator=lambda p: _validate_extraction_output(p, expected_rows=expected),
         )
         base["extraction_slurm_state"] = ext_state
+        base["extraction_expected_rows"] = expected
         if not base["extraction_ready"] and ext_path and ext_path.is_file():
             # Mirrors h5_invalid_reason / test_h5_invalid_reason above: an
             # output that exists but doesn't validate is the single most
             # confusing state to show without a reason attached.
-            base["extraction_invalid_reason"] = _validate_extraction_output(ext_path)[1] or None
+            base["extraction_invalid_reason"] = _validate_extraction_output(
+                ext_path, expected_rows=expected
+            )[1] or None
 
     if row.get("assignment_job_id"):
         asg_path = Path(row["assignment_output_path"]) if row.get("assignment_output_path") else None

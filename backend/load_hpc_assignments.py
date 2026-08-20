@@ -41,6 +41,10 @@ import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy import inspect as sqlalchemy_inspect
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from slide_naming import make_slide_tile_series, tiles_missing_suffix  # noqa: E402
+
 # Same defaults and env names as tile_server_v2_.py, so a shell configured for
 # the server needs no extra setup here. Duplicated rather than imported: that
 # module opens HDF5 handles and builds a FastAPI app at import time, which is a
@@ -99,14 +103,28 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     if frame.empty:
         raise SystemExit(f"{csv_path} holds no assignments.")
 
-    # tile_coordinates.slide_tile is "<slides>_<tiles>", e.g.
-    # TCGA-55-7574-01Z-00-DX1_18_15.jpeg. The server joins case-insensitively,
-    # so match its UPPER() rather than hoping the two agree on case.
-    frame["slide_tile"] = (
-        frame["slides"].astype(str).str.strip()
-        + "_"
-        + frame["tiles"].astype(str).str.strip()
-    ).str.upper()
+    # Refuse a CSV produced from a .h5 packaged before make_hpl_hdf5.py started
+    # storing the ".jpeg" suffix. Such a file is wrong in three places at once —
+    # it cannot join tile_registry, it cannot join tile_coordinates, and
+    # assign_hpc_clusters.py --validate-against merges zero rows against Kai's
+    # reference CSV — so the useful thing is to name the cause here rather than
+    # let it surface as an unexplained 0% match rate.
+    if tiles_missing_suffix(frame["tiles"]):
+        raise SystemExit(
+            f"{csv_path} has tile names without a file extension "
+            f"(e.g. {frame['tiles'].iloc[0]!r}). Kai's reference CSVs and the "
+            f"Knowledge Bank both use '18_15.jpeg', so this CSV would match "
+            f"nothing.\n\n"
+            f"Nothing needs recomputing — the cluster IDs and margins here are "
+            f"correct, only the label is short. Convert it with:\n\n"
+            f"    python migrate_tile_names.py --csv {csv_path} --commit\n\n"
+            f"then load the '_tilenames.csv' it writes beside this one."
+        )
+
+    # tile_coordinates.slide_tile is "<slides>_<tiles>" upper-cased, e.g.
+    # TCGA-55-7574-01Z-00-DX1_18_15.JPEG. Built by the shared helper so this and
+    # the dataset-registration step cannot drift apart on the key they join on.
+    frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
     return frame, cluster_columns[0]
 
 
@@ -300,30 +318,59 @@ def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> 
     rather than upsert because a slide's cluster set changes between references —
     a cluster that no longer appears must lose its row, and an upsert would leave
     it behind at its old proportion.
+
+    Order matters, and not in the obvious way. In Postgres
+    hpl_profile_proportion carries
+    FOREIGN KEY (samples, slides) REFERENCES hpl_profile_summary ON DELETE CASCADE,
+    so this cannot be a per-table delete-then-insert loop:
+
+      * inserting a proportion row for a slide with no summary row yet — every
+        slide on a cohort's first load — violates the FK and rolls back the whole
+        transaction, taking the tile_registry update with it;
+      * inserting proportions first for a slide that *does* exist, then deleting
+        its summary row, cascades away the proportions just written, leaving a
+        summary row with no proportions.
+
+    So: both deletes first (child, then parent), then both inserts (parent, then
+    child). The SQLite tests cannot see this — their fixtures create the two
+    tables without the foreign key — so it is asserted against a real FK in
+    test_kb_load.py rather than left to the schema.
     """
-    slides = sorted(set(summary["slides"].astype(str)))
-    written = {}
-    for table, frame in (("hpl_profile_proportion", proportions),
-                         ("hpl_profile_summary", summary)):
+    # UPPER as well as TRIM: migrate_indexes.sql normalised the live columns to
+    # UPPER(TRIM(...)), so matching on TRIM alone finds nothing for any slide
+    # whose CSV casing differs. That failure is silent in the worst way — the
+    # DELETE removes zero rows, the INSERT still runs, and the slide ends up with
+    # two sets of aggregates that both look plausible.
+    slides = sorted({s.strip().upper() for s in summary["slides"].astype(str)})
+    bind = {"slides": slides}
+
+    def _delete(table: str) -> None:
+        conn.execute(
+            text(f"DELETE FROM {table} WHERE UPPER(TRIM(slides)) IN :slides").bindparams(
+                bindparam("slides", expanding=True)
+            ),
+            bind,
+        )
+
+    def _insert(table: str, frame: pd.DataFrame) -> int:
         columns = _existing_columns(conn, table)
         usable = [c for c in frame.columns if c in columns]
         skipped = [c for c in frame.columns if c not in columns]
         if skipped:
             print(f"  {table}: no column(s) {skipped}; not writing them", file=sys.stderr)
-
-        conn.execute(
-            text(f"DELETE FROM {table} WHERE TRIM(slides) IN :slides").bindparams(
-                bindparam("slides", expanding=True)
-            ),
-            {"slides": slides},
-        )
         placeholders = ", ".join(f":{c}" for c in usable)
         conn.execute(
             text(f"INSERT INTO {table} ({', '.join(usable)}) VALUES ({placeholders})"),
             frame[usable].to_dict("records"),
         )
-        written[table] = len(frame)
-    return written
+        return len(frame)
+
+    _delete("hpl_profile_proportion")
+    _delete("hpl_profile_summary")
+    return {
+        "hpl_profile_summary": _insert("hpl_profile_summary", summary),
+        "hpl_profile_proportion": _insert("hpl_profile_proportion", proportions),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:

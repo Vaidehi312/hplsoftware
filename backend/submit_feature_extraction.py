@@ -67,6 +67,7 @@ from pathlib import Path
 
 import h5py
 
+from slide_naming import tiles_missing_suffix
 from submit_mask_tile_slurm import _run_sbatch_with_retry
 
 # The entry point the job runs. Used to tell "HPL_REPO_DIR points at the repo"
@@ -432,14 +433,39 @@ def validate_extraction_output(
             if mismatched:
                 return False, f"dataset lengths disagree with {rows}: {mismatched}"
 
+            # Note on tile names: the encoder copies `tiles` through unchanged,
+            # so a projections file made before the tile-name fix carries names
+            # without the ".jpeg" suffix. That is deliberately NOT a failure
+            # here. These embeddings are correct — they were computed from the
+            # right tile images — and cluster assignment reads them without
+            # caring what the name column says. The suffix only matters once the
+            # name becomes a Knowledge Bank join key, and migrate_tile_names.py
+            # fixes it there without recomputing anything.
+
             # A row count that doesn't match the input is the one failure this
-            # can catch that reading rows cannot: the encoder sizes its output
-            # from the input it was given, so a mismatch means this file came
-            # from a *different* .h5 that happens to share a basename.
+            # can catch that reading rows cannot. Every other check here is
+            # internal consistency, which a partial run passes: the encoder
+            # writes whatever it got through, and a file holding a third of the
+            # slides has the right schema, the right dtypes and no gaps.
+            #
+            # Short and over-long are different faults and get different
+            # messages, because the fix differs — a short output is a run to
+            # resume or resubmit, an over-long one is the wrong file entirely.
             if expected_rows is not None and rows != expected_rows:
+                if rows < expected_rows:
+                    missing = expected_rows - rows
+                    return False, (
+                        f"has {rows:,} embeddings but the input .h5 has "
+                        f"{expected_rows:,} tiles — {missing:,} missing "
+                        f"({missing / expected_rows * 100:.1f}%). The encoder did not "
+                        f"get through the whole input: an array task that died, a "
+                        f"timeout, or a sharded run merged from only the shards that "
+                        f"finished"
+                    )
                 return False, (
-                    f"has {rows} embeddings but the input .h5 has {expected_rows} tiles — "
-                    f"this output is from a different input file"
+                    f"has {rows:,} embeddings but the input .h5 has only "
+                    f"{expected_rows:,} tiles — this output cannot have come from "
+                    f"that input, so it is a leftover from a different .h5"
                 )
 
             # Same reasoning as _validate_h5: HDF5 validates the superblock on

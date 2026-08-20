@@ -1283,7 +1283,12 @@ def _pipeline_steps(status: dict) -> list[dict]:
     test_note = _test_packaging_note(status)
     h5_state = status.get("h5_slurm_state")
     if status.get("h5_ready"):
-        packaging = ("done", ".h5 ready")
+        # Legacy tile names are noted, not treated as a failure: the .h5 is
+        # usable and every stage between here and the KB load reads it happily.
+        # Only the Knowledge Bank join needs the suffix, and migrating the
+        # assignments CSV at that point fixes it without recomputing anything.
+        packaging = ("done", ".h5 ready (tile names need migrating before KB load)"
+                             if status.get("h5_legacy_tile_names") else ".h5 ready")
     elif status.get("h5_job_id"):
         if h5_state in _SLURM_IN_FLIGHT:
             packaging = ("running", f"running ({h5_state})")
@@ -1313,8 +1318,10 @@ def _pipeline_steps(status: dict) -> list[dict]:
 
     # --- 3. Feature extraction --------------------------------------------
     ext_state = status.get("extraction_slurm_state")
+    expected_rows = status.get("extraction_expected_rows")
     if status.get("extraction_ready"):
-        extraction = ("done", "features ready")
+        extraction = ("done", f"features ready ({expected_rows:,} tiles)"
+                              if expected_rows else "features ready")
     elif status.get("extraction_job_id"):
         if ext_state in _SLURM_IN_FLIGHT:
             extraction = ("running", f"running ({ext_state})")
@@ -1322,7 +1329,23 @@ def _pipeline_steps(status: dict) -> list[dict]:
             # Slurm can call a job COMPLETED while its output is unusable —
             # saying "did not finish (COMPLETED)" for that is the confusing
             # read this branch exists to avoid.
-            extraction = ("attention", "finished but the output is incomplete")
+            #
+            # A short output is the case worth naming in the one-line summary
+            # rather than leaving to the expandable detail: it is the failure
+            # that otherwise looks exactly like success, and the count is the
+            # whole point. "Incomplete" alone sent someone on to the next stage
+            # believing 14,044 slides had been encoded when 3,500 had.
+            reason = status.get("extraction_invalid_reason") or ""
+            shortfall = re.search(r"has ([\d,]+) embeddings but the input \.h5 has "
+                                  r"([\d,]+) tiles", reason)
+            if shortfall:
+                got = int(shortfall.group(1).replace(",", ""))
+                want = int(shortfall.group(2).replace(",", ""))
+                extraction = ("attention",
+                              f"incomplete — {got:,} of {want:,} tiles encoded "
+                              f"({got / want * 100:.0f}%)")
+            else:
+                extraction = ("attention", "finished but the output is incomplete")
         else:
             extraction = ("attention", f"did not finish ({ext_state or 'no Slurm record'})")
     elif status.get("h5_ready"):

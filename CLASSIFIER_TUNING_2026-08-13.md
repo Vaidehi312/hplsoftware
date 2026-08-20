@@ -450,8 +450,81 @@ covers 25 of 71 HPCs and prints its coverage.
 
 | item | state |
 |---|---|
-| **`assign_hpc_clusters.py` has no adaptive-k flag** | blocks using the settled config in production — next build |
-| Acceptance test at `pow 3` | not run. `--validate-against` is the gate; <99% is a defect, not drift |
-| `class_weighted` | flag now in `tune_classifier.py`, free to sweep, still never measured |
+| ~~`assign_hpc_clusters.py` has no adaptive-k flag~~ | **done, `0855f20`** — and see §18: the submitter forwarded no vote knob at all |
+| Acceptance test at `pow 3` | not run. `--validate-against` is the gate; <99% is a defect, not drift. **Read §19 before reading its number** |
+| `class_weighted` | flag is in `tune_classifier.py`; the cluster's copy of that file predates it, which is why the sweep would not parse |
 | `--local-scaling` | untested. 19.5 h for all 2.5M rows; budgeted and skipped by default |
-| Confirm winner on `--seed 1` | not run; best-of-many on one sample is upward-biased |
+| Confirm winner on `--seed 1` | not run; best-of-many on one sample is upward-biased. Use a **separate** `--neighbours-cache` file: the cache is keyed on the query set and a different seed overwrites it |
+| Stage 4's UI/endpoint path | `tile_server_v2_.py:3908,3958` call the submitter without vote arguments, so the UI still queues the default vote. CLI only, for now |
+
+## §18 The vote settings never reached a real assignment
+
+Two separate gaps, and the second is the larger one.
+
+**Adaptive k existed only in the experiment scripts** — `adaptive_k_experiment.py`
+and `tune_classifier.py`. `assign()` had `--k`, `--distance-weighted`,
+`--distance-power`, `--class-weighted` and `--local-scaling`, but no gate. So the
+best result of the session was unreachable from the production path.
+
+**And `submit_cluster_assignment.py` forwarded none of the vote knobs.** The
+Slurm command carried `--reference`, `--h5`, `--out`, `--rep-key`, `--batch-size`,
+`--progress`, and conditionally `--k`, `--validate-against`, `--query-mean`,
+`--row-start/--row-stop`. That is all
+(`_build_assignment_command`). `--distance-weighted` is a `store_true` defaulting
+to `False`, so **every Stage 4 job submitted through Slurm has run the plain
+unweighted vote**, whatever was measured offline — and nothing in the output says
+so. Wiring adaptive k without noticing this would have produced a flag that still
+could not be used.
+
+Fixed in `0855f20`:
+
+- `assign()` takes `--adaptive-margin` and `--adaptive-k`. It searches once at
+  `max(k, adaptive_k)` and votes on a prefix, rather than searching twice: the
+  flat-L2 scan over the reference is the whole cost and does not depend on `k` —
+  only the top-`k` selection does — so widening is nearly free, and the base vote
+  and the re-vote see the same neighbours by construction. ~9% of tiles re-vote.
+- Re-voted rows take the wide vote's **margin and mean distance**, not just its
+  label. A `vote_margin` describing a discarded vote would make Stage 5's
+  `--min-margin` drop precisely the tiles adaptive k exists to rescue.
+- The submitter forwards the configuration as **one unit** through `vote_flags()`,
+  not knob by knob. A partial vote configuration is this codebase's standard
+  failure mode: a complete, well-formed CSV of different cluster IDs with nothing
+  to say it was not what was asked for.
+- `vote_flags()` refuses, before the queue: a distance power with no weighting; an
+  `adaptive_k` no wider than `k`; an `adaptive_k` with no margin to gate it; and
+  `--adaptive-margin` with no explicit `--k`, because `k` otherwise falls back to
+  the reference's own `n_neighbors` *inside the container*, so whether the re-vote
+  does anything could not be checked until the job was already running.
+- The flags go into the returned run record. That is currently the only place two
+  CSVs from one reference but different votes can be told apart — the CSV carries
+  `hpc_reference` but nothing about the vote.
+
+Defaults are unchanged. The measured configuration is opt-in, for the reason in §19.
+
+## §19 Leave-one-out accuracy and the acceptance test can move in opposite directions
+
+They measure different things, and the settled configuration is expected to help
+one and hurt the other.
+
+- **`validate_reference.py`** asks: does the k-NN vote recover the reference's own
+  Leiden labels? That is what the sweep optimised, 96.78% → 97.23%.
+- **`--validate-against`** asks: do we reproduce Kai's TCGA cluster transfer? Those
+  labels came from `sc.tl.ingest`, which is an **unweighted** k-nearest-neighbour
+  majority vote at the reference's own `n_neighbors`.
+
+So `--distance-weighted --distance-power 3` makes the classifier *less* like
+`ingest` by construction, and adaptive k more so again. A drop in
+`--validate-against` agreement is therefore not automatically a defect the way
+`CLAUDE.md`'s "<99% is a defect" rule reads for the default configuration — it is
+the expected consequence of deliberately no longer imitating `ingest`.
+
+That leaves a real decision, which is why the defaults were not changed:
+
+- The 99% gate is what protects against projection and centering bugs, which
+  leave-one-out does not cover at all. Losing it means losing that cover.
+- So run the acceptance test **twice**: once at the default to confirm the ≥99%
+  gate still holds (that validates projection and centering), and once at the
+  settled configuration to see the size of the deliberate divergence. If the
+  default still passes and the settled config lands a little below, the pipeline is
+  sound and the difference is the intended change. If the *default* drops below 99%,
+  that is a real defect and has nothing to do with any of this.

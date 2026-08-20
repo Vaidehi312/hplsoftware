@@ -366,3 +366,92 @@ them into a commit for this work without checking what they contain first.
 Tests: **145 passing** (`python3 -m pytest backend/tests -q`) — up from 126, the three new
 test files adding 19. Still no `.gitignore`; `hpl_kb_dump.pgsql` (3.8 MB DB dump) and
 several large CSVs sit untracked in the repo root, one `git add -A` from permanent history.
+
+---
+
+# 2026-08-18 — everything above was measured on the wrong reference
+
+## §14 The two references
+
+Sections 9–13 were all measured against `ref_raw128.npz`: **LATTICeA**, leiden
+**5.0**, fold0, 250k-tile subsample, **109 clusters**. Production assigns against
+`hpc_reference_leiden_2p5_fold2.npz`: **TCGA LUAD**, leiden **2.5**, fold2, 2.5M
+tiles, 127 comps, **71 clusters**. Verified locally: the repo-root CSV
+`TCGA_LUAD_5x_he_train_filtered_leiden_2p5__fold2.csv` has exactly 71 distinct
+clusters, 0–70, over 360,667 rows, matching `hpc_dictionary`.
+
+Worse than "untested on production": leiden_5.0 is the **QC pass** whose only job
+is isolating junk for deletion (`HPL-LATTICeA/README.md`, §Background and artefact
+removal). 27 of its 108 reviewed clusters are flagged `remove=1` — background ×13,
+edge ×7, ink, out-of-focus, air bubble, artefact — and `remove_indexes_h5.py`
+physically deletes those tiles before production's leiden_2.5 runs on the
+`_filtered` data. So it is deliberately over-split, with duplicate descriptions
+(`52`/`61` both "solid retraction artefact", `46`/`79` both "edge", `31`/`38` both
+"infiltrative tumour with collageous stroma"). Errors between such pairs are not
+errors.
+
+Now guarded in code: all five experiment/validation tools default `--reference` to
+`HPC_REFERENCE_PATH` and print a provenance banner, shouting to stderr on anything
+that is not 71-cluster leiden_2.5. `--reference` had been `required=True`, which is
+why the correct default already in `build_hpc_reference.py` was never used.
+
+## §15 Production numbers, and what changed
+
+Leave-one-out, production reference. `tune_classifier.py` searches once at k_max
+and re-votes, so k / distance_power / class-weighting / adaptive-k all sweep off
+one search; `--neighbours-cache` makes re-sweeps instant. Reports **McNemar** on
+discordant pairs, not marginal CIs — every config scores the same tiles, and a
+marginal CI at n=20,000 is ±0.24pp, which would call a real +0.4pp gain noise.
+
+Baseline (`k=10 --distance-power 2`): **96.78%** at n=200,000 (96.79% at 20,000).
+
+| config | Δ | net | σ |
+|---|---|---|---|
+| `pow 3` alone | +0.02 | +5 | 0.5 |
+| `pow 2` + adapt 0.1 | +0.34 | +676 | 12.0 |
+| **`pow 3` + adapt k=25 below 0.1** | **+0.45** | **+895** | **16.5** |
+| `k=15 pow 3`, no adapt | +0.28 | +558 | 9.0 |
+
+**Settled: `--k 10 --distance-weighted --distance-power 3` + adaptive k=25 for
+`vote_margin < 0.1`. 96.78% → 97.23%.**
+
+Two corrections to §10 and §12. **`distance_power=3` beats 2 on production**,
+where the exploratory reference had it as a plateau and this doc recommended 2.
+And **threshold 0.1 still beats 0.25** (+895 vs +820) despite production's
+0.10–0.25 band being worse (79.8% vs 86.4% correct) — precision, not coverage.
+
+Sample size changed the conclusion, not just the error bar: at n=20,000 the top
+two configs were 18 tiles apart and the simpler one looked equivalent; at 200,000
+they separate by ~337 tiles.
+
+## §16 Why it is not 100%, and where the remaining error is
+
+Every structural finding from §13 **transferred**: 100% of errors had the true
+cluster among the k neighbours (642/642), 93% had it as runner-up, size explains
+nothing (r = −0.16), the biggest confusion pair is 7 of 642, and there are **zero
+errors above margin 0.75** — which is 68% of tiles.
+
+So retrieval is perfect and the vote is near its limit. 100% is also the wrong
+target: a Leiden cluster is a cut through a continuous density, and a tile on that
+cut has no unambiguous label.
+
+`cluster_diagnostics.py` classified **all 71 production clusters as `boundary`** —
+no duplicates, no engulfed clusters. Per-cluster work is the wrong frame here: 642
+errors over 71 clusters is ~9 each, and the error sits at boundaries everywhere.
+
+**The reframe worth more than another 0.4pp:** `supercluster_dictionary.py`
+collapses HPCs into four immune/architecture classes and `hpc_annotations.py` takes
+its majority *at that level*, so an HPC error inside one supercluster changes no
+downstream number. The weakest cluster's main confusion (69 → 67) is exactly that,
+as is 34 → 47. `validate_reference.py --superclusters` measures it; the mapping
+covers 25 of 71 HPCs and prints its coverage.
+
+## §17 Outstanding
+
+| item | state |
+|---|---|
+| **`assign_hpc_clusters.py` has no adaptive-k flag** | blocks using the settled config in production — next build |
+| Acceptance test at `pow 3` | not run. `--validate-against` is the gate; <99% is a defect, not drift |
+| `class_weighted` | flag now in `tune_classifier.py`, free to sweep, still never measured |
+| `--local-scaling` | untested. 19.5 h for all 2.5M rows; budgeted and skipped by default |
+| Confirm winner on `--seed 1` | not run; best-of-many on one sample is upward-biased |

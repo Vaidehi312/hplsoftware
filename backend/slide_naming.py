@@ -26,3 +26,75 @@ def slide_id_from_raw_path(raw_path) -> str:
         if match:
             return match.group("slide_id")
     return Path(raw_path).stem
+
+
+# --- the tile_coordinates / tile_registry join key -------------------------
+#
+# slide_tile is "<slides>_<tiles>" upper-cased, and it is the primary key of
+# both tile_coordinates and tile_registry. The two sides of the pipeline
+# disagree about the tile name, which is why this is centralised:
+#
+#   auto_tile_from_mask.py  writes tiles as "24_10.jpeg"  (Stage 1 metadata CSV)
+#   make_hpl_hdf5.py        writes tiles as "24_10"       (packaged .h5, and so
+#                                                          the Stage 4 CSV too)
+#   existing TCGA registry rows are        "..._18_15.JPEG"
+#
+# So a key built from Stage 4's CSV could never match a row registered from
+# Stage 1's CSV, and neither could match the TCGA rows already loaded. Both
+# sides go through here instead.
+#
+# This does NOT repair a tile name that is missing its extension. The fix for
+# that belongs in make_hpl_hdf5.py, which is where the suffix was being dropped;
+# quietly appending one here would let a .h5 packaged before that fix produce a
+# key that matches, while its (slides, tiles) columns still disagree with Kai's
+# reference CSV and so still fail the acceptance test. Use tiles_missing_suffix()
+# to refuse such a file instead.
+_TILE_SUFFIX = ".JPEG"
+
+# Only the tile part is ever inspected for an extension. A slide name may itself
+# contain dots — a real one is "BB232560 A3-1 - 2023-10-11 16.41.02" — so
+# testing the concatenated key would read that timestamp's ".02" as a file
+# extension.
+_HAS_EXTENSION_RE = re.compile(r"\.[A-Za-z0-9]{1,5}$")
+
+
+def make_slide_tile(slide, tile) -> str:
+    """The join key for one tile: "<slides>_<tiles>", upper-cased."""
+    return f"{str(slide).strip().upper()}_{str(tile).strip().upper()}"
+
+
+def make_slide_tile_series(slides, tiles):
+    """make_slide_tile over two pandas Series, returning a Series.
+
+    Kept beside the scalar version and pinned to it by test, so the vectorised
+    path used for millions of rows cannot drift from the definition.
+    """
+    return (
+        slides.astype(str).str.strip().str.upper()
+        + "_"
+        + tiles.astype(str).str.strip().str.upper()
+    )
+
+
+def _as_text(value) -> str:
+    """Tile names arrive as str from a CSV and as bytes from HDF5. Decoding
+    matters more than it looks: str(b"18_15.jpeg") is "b'18_15.jpeg'", whose
+    last character is a quote, so an extension test against it says the suffix
+    is missing on a file that has it."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", "replace").strip()
+    return str(value).strip()
+
+
+def tiles_missing_suffix(tiles) -> bool:
+    """True if these tile names have no file extension.
+
+    The signature of a .h5 packaged before make_hpl_hdf5.py started storing
+    "18_15.jpeg" rather than "18_15". Every consumer of such a file is wrong in
+    the same way — the KB join matches nothing and --validate-against merges
+    zero rows — so it is worth naming rather than working around.
+    """
+    sample = [t for t in (_as_text(v) for v in list(tiles)[:100]) if t]
+    if not sample:
+        return False
+    return not any(_HAS_EXTENSION_RE.search(t) for t in sample)

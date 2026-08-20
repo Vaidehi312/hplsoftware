@@ -36,6 +36,31 @@ from tile_metadata import CORRUPT, read_tile_metadata, tile_metadata_path
 # write.
 _CHUNK_CACHE_BYTES = 64 * 1024 * 1024
 
+# Applied to the "img" dataset only — the byte-string metadata datasets are
+# too small for a filter to matter. Recorded in run_identity below (not just
+# passed to create_dataset) so a checkpoint written under a different setting
+# is treated as incompatible instead of silently resumed into.
+_IMG_COMPRESSION = "gzip"
+_IMG_COMPRESSION_OPTS = 6
+
+# Identifies what the "tiles" dataset contains, for run_identity. "col_row" was
+# the original, storing "18_15"; "col_row.jpeg" stores "18_15.jpeg", which is
+# what Kai's reference CSVs and the Knowledge Bank both use. The two produce
+# byte-identical checkpoint labels, so nothing else distinguishes a checkpoint
+# written by one from a resume under the other.
+_TILE_NAME_FORMAT = "col_row.jpeg"
+
+
+def _tile_name(tile_row) -> str:
+    """The tile's name as stored in the .h5 and on disk.
+
+    One definition, because it is consumed three times — to size the
+    fixed-length `tiles` column, to build the file path, and to write the
+    value — and the three must agree. Sizing from a shorter form than the one
+    written truncates it back to the shorter form on write, silently.
+    """
+    return f"{tile_row.col}_{tile_row.row}.jpeg"
+
 
 
 
@@ -247,9 +272,14 @@ def package_to_h5(
     n_processes: int | None = None,
     threads_per_process: int = 4,
     batch_size: int = 2000,
+    resume: bool | None = None,
 ) -> dict:
     """Thin wrapper over package_slides_to_h5 for manifest-file callers
-    (the CLI, the dataset-wide Slurm pipeline)."""
+    (the CLI, the dataset-wide Slurm pipeline).
+
+    resume is passed straight through: None keeps the historical behaviour of
+    continuing whatever checkpoint is on disk, True demands one, False discards
+    it. See package_slides_to_h5."""
     return package_slides_to_h5(
         raw_paths=read_manifest(manifest_path),
         tile_dir=tile_dir,
@@ -262,6 +292,7 @@ def package_to_h5(
         n_processes=n_processes,
         threads_per_process=threads_per_process,
         batch_size=batch_size,
+        resume=resume,
     )
 
 
@@ -278,6 +309,7 @@ def package_slides_to_h5(
     threads_per_process: int = 4,
     batch_size: int = 2000,
     slide_ids: list[str] | None = None,
+    resume: bool | None = None,
 ) -> dict:
     """Core packaging logic, taking raw slide paths directly rather than a
     manifest file — lets a single-slide caller package one slide without
@@ -367,8 +399,13 @@ def package_slides_to_h5(
     # exceed those (e.g. "BB232001 20C2 - 2023-08-29 2020.38.24" is 37 bytes).
     max_sample_len = max(len(sample_from_slide_id(sid).encode("utf-8")) for sid in per_slide_rows)
     max_slide_len = max(len(sid.encode("utf-8")) for sid in per_slide_rows)
+    # Sized from the name actually stored, suffix included. These are
+    # fixed-length byte strings, so a width computed from the bare "24_10"
+    # would silently truncate "24_10.jpeg" back to "24_10" on write — the
+    # stored value would be exactly the bug this suffix was added to fix, with
+    # nothing anywhere reporting a problem.
     max_tile_len = max(
-        len(f"{tile_row.col}_{tile_row.row}".encode("utf-8"))
+        len(_tile_name(tile_row).encode("utf-8"))
         for df in per_slide_rows.values()
         for tile_row in df.itertuples()
     )
@@ -432,9 +469,51 @@ def package_slides_to_h5(
         "marker": marker,
         "split": split,
         "tile_size": tile_size,
+        "img_compression": _IMG_COMPRESSION,
+        "img_compression_opts": _IMG_COMPRESSION_OPTS,
+        # What the `tiles` dataset holds. A checkpoint records tile *labels*
+        # ("<slide>/<col>_<row>.jpeg"), which did not change when the stored
+        # tile name gained its ".jpeg" suffix — so without this key a resume
+        # across that change would skip every already-written row and leave the
+        # file holding bare "18_15" for those and "18_15.jpeg" for the rest.
+        # That .h5 would pass every structural check while being unjoinable for
+        # part of its contents. Bump this whenever the meaning of a stored
+        # column changes without its label changing.
+        "tile_name_format": _TILE_NAME_FORMAT,
     }
 
     resuming = ckpt["completed"].is_file() or ckpt["skipped"].is_file()
+
+    # resume=False is an explicit instruction to discard an earlier attempt's
+    # progress, not a hint. It exists because resuming used to be decided
+    # entirely here: a checkpoint on disk meant the next submission silently
+    # continued it, and the caller had no way to say "no, rebuild this from
+    # scratch" — which is the right answer whenever the tiles themselves have
+    # been re-made, or when an attempt is suspected of having written bad data
+    # that a resume would preserve forever.
+    #
+    # The .partial goes too. Leaving it would make the fresh run reopen a file
+    # whose contents belong to a discarded attempt (mode "w" truncates it, but
+    # only after _h5_resumable has already probed it), and its size on disk is
+    # the largest thing being thrown away.
+    if resuming and resume is False:
+        print(
+            f"[{output_h5_path}] Discarding the earlier attempt's checkpoint at the "
+            f"caller's explicit request — packaging every tile from scratch."
+        )
+        _clear_checkpoint(ckpt)
+        partial_h5_path.unlink(missing_ok=True)
+        resuming = False
+    elif not resuming and resume is True:
+        # Asked to resume with nothing to resume from. Refuse rather than
+        # quietly doing a full run: the caller told the user how much work
+        # would be skipped, and a silent full re-run makes that a lie.
+        raise RuntimeError(
+            f"resume=True was requested for {output_h5_path}, but no checkpoint from a "
+            f"previous attempt exists at {ckpt['completed']}. Re-run without resume to "
+            f"package from scratch."
+        )
+
     if resuming:
         try:
             prior_identity = json.loads(ckpt["config"].read_text())
@@ -478,17 +557,25 @@ def package_slides_to_h5(
     # this flat (rather than nested per-slide) is what lets the batches
     # below cut across slide boundaries and stay evenly sized regardless of
     # how many tiles any one slide has.
-    tile_jobs: list[tuple[str, str, str, str, str]] = []  # (path, label, sample, slide_id, col_row)
+    tile_jobs: list[tuple[str, str, str, str, str]] = []  # (path, label, sample, slide_id, tile_name)
     for slide_id, df in per_slide_rows.items():
         sample = sample_from_slide_id(slide_id)
         slide_dir = tile_dir / tile_dataset_name / slide_id
         for tile_row in df.itertuples():
-            col_row = f"{tile_row.col}_{tile_row.row}"
-            tile_path = slide_dir / f"{col_row}.jpeg"
-            tile_label = f"{slide_id}/{col_row}.jpeg"
+            # The stored tile name keeps its extension. Kai's reference CSVs use
+            # "18_15.jpeg", the KB's tile_coordinates/tile_registry store the
+            # same, and assign_hpc_clusters.py's --validate-against merges on
+            # (slides, tiles) against exactly that form. Writing the bare
+            # "18_15" here made the packaged .h5 — and so every downstream
+            # assignments CSV — disagree with all three: the KB load matched
+            # 0.0% of 38,892 Radiogenomics tiles, and the acceptance test would
+            # have merged zero rows.
+            tile_name = _tile_name(tile_row)
+            tile_path = slide_dir / tile_name
+            tile_label = f"{slide_id}/{tile_name}"
             if tile_label in already_done:
                 continue
-            tile_jobs.append((str(tile_path), tile_label, sample, slide_id, col_row))
+            tile_jobs.append((str(tile_path), tile_label, sample, slide_id, tile_name))
 
     resolved_n_processes = n_processes or min(os.cpu_count() or 4, 8)
 
@@ -533,9 +620,18 @@ def package_slides_to_h5(
             # One tile per chunk makes a single image write exactly one chunk
             # write, and is also the right shape for reads, since training
             # reads individual tiles.
+            #
+            # gzip level 6 trades some write CPU for a meaningful cut in the
+            # on-disk size (raw 224x224x3 uint8 tiles compress ~2x with
+            # gzip — real photographic detail, not the ~7x a lossy JPEG gets,
+            # but free of any read-side change: h5py decompresses a chunk
+            # transparently on access, so training's plain
+            # img[i:i+n]-style slicing (see HPL's data_manipulation/dataset.py)
+            # doesn't need to know this dataset is compressed at all).
             img_ds = hdf5.create_dataset(
                 "img", img_shape, maxshape=img_shape, dtype="uint8",
                 chunks=(1, tile_size, tile_size, 3),
+                compression=_IMG_COMPRESSION, compression_opts=_IMG_COMPRESSION_OPTS,
             )
             sample_ds = hdf5.create_dataset(
                 "samples", (total_tiles,), maxshape=(total_tiles,), dtype=sample_dtype
@@ -597,7 +693,7 @@ def package_slides_to_h5(
                     samples: list[bytes] = []
                     slides: list[bytes] = []
                     tiles: list[bytes] = []
-                    for (_, tile_label, sample, slide_id, col_row), img_array in zip(chunk, results):
+                    for (_, tile_label, sample, slide_id, tile_name), img_array in zip(chunk, results):
                         if img_array is None:
                             skipped_tiles.append(tile_label)
                             skipped_f.write(tile_label + "\n")
@@ -606,7 +702,7 @@ def package_slides_to_h5(
                         labels.append(tile_label)
                         samples.append(sample.encode("utf-8"))
                         slides.append(slide_id.encode("utf-8"))
-                        tiles.append(col_row.encode("utf-8"))
+                        tiles.append(tile_name.encode("utf-8"))
 
                     if imgs:
                         end = write_index + len(imgs)
@@ -769,6 +865,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tiles decoded and held in memory at once before writing to the .h5 — bounds "
              "memory usage on datasets with millions of tiles.",
     )
+    # Mutually exclusive so "--resume --fresh" is rejected by argparse rather
+    # than silently resolved to one of them.
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume", dest="resume", action="store_true", default=None,
+        help="Require continuing a previous attempt's checkpoint, and fail if there "
+             "isn't one. Without either flag, a checkpoint is continued if present.",
+    )
+    resume_group.add_argument(
+        "--fresh", dest="resume", action="store_false",
+        help="Discard any previous attempt's checkpoint and .partial, and package every "
+             "tile again from scratch.",
+    )
     return parser
 
 
@@ -786,6 +895,7 @@ def main() -> None:
         marker=args.marker,
         split=args.split,
         tile_size=args.tile_size,
+        resume=args.resume,
     )
     print(f"Output:                {info['output_h5_path']}")
     print(f"Total tiles packaged:  {info['total_tiles']}")

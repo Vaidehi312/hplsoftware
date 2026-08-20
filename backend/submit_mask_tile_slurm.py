@@ -10,6 +10,7 @@ Worker mode is invoked automatically by Slurm.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import re
@@ -20,6 +21,8 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+
+import pandas as pd
 
 from slide_naming import slide_id_from_raw_path
 from make_hpl_hdf5 import hpl_h5_output_path
@@ -71,6 +74,9 @@ def select_slides(
     (with or without extension) or derived slide_id, so a non-coder can
     paste in whatever they recognize from a file browser without knowing
     the slide_id convention.
+
+    Raises ValueError if sample_size exceeds the pool, rather than narrowing
+    the request to fit — see the comment at that check.
     """
     if sample_size is not None and slide_names:
         raise ValueError("Specify either sample_size or slide_names, not both.")
@@ -94,7 +100,23 @@ def select_slides(
     if sample_size is not None:
         if sample_size <= 0:
             raise ValueError("sample_size must be positive.")
-        if sample_size >= len(slides):
+        if sample_size > len(slides):
+            # Refused, not quietly narrowed to fit. Returning every available
+            # slide whenever the request overshot the pool was indistinguishable
+            # from success: asking a 30-slide manifest for 3500 produced a
+            # 30-slide .h5 with no error and nothing in the logs to explain the
+            # gap. It also hid *why* — the pool here is usually a run's
+            # manifest, fixed at submission time, so no value of sample_size
+            # could ever have widened it. The caller has to choose a different
+            # pool, and can only know that if this says so.
+            raise ValueError(
+                f"Asked for {sample_size} slides but only {len(slides)} are "
+                f"available to choose from. Ask for at most {len(slides)}, or "
+                f"widen the pool — package with scope='tiled' to take every "
+                f"slide with tiles on disk, or start a new run over the full "
+                f"directory."
+            )
+        if sample_size == len(slides):
             return slides
         return random.Random(random_seed).sample(slides, sample_size)
 
@@ -107,6 +129,82 @@ def write_manifest(slides: list[Path], manifest_path: Path) -> None:
         "".join(f"{slide}\n" for slide in slides),
         encoding="utf-8",
     )
+
+
+def tiling_output_complete(
+    metadata_path: Path,
+    summary_path: Path,
+    slide_tile_dir: Path,
+    verify_row_count: bool = True,
+) -> bool:
+    """Whether a slide's tiling output is genuinely finished and self-consistent.
+
+    This is the "should I skip this slide?" test, and it replaces a check that
+    only asked whether the two files existed and were non-empty. That was too
+    weak in the one case that matters: a tiling job killed mid-write (TIMEOUT,
+    OOM, node failure) can leave a complete-looking summary next to a metadata
+    CSV that stopped short, and the old check skipped such a slide forever
+    while packaging then went looking for tiles the CSV promised and the disk
+    never had.
+
+    Cross-checking summary["saved_tiles"] against the CSV's row count is what
+    closes that: the summary is written once at the end, the CSV grows as tiles
+    are saved, so a disagreement is exactly the signature of an interrupted run.
+
+    saved_tiles == 0 returns True deliberately. A slide with no tissue above
+    the min-tissue threshold ran to completion and produced nothing, and
+    re-tiling it on every resubmission would burn a full slide read to arrive
+    at the same empty answer. Callers that care about the distinction should
+    read saved_tiles themselves rather than treating "incomplete" as a proxy.
+
+    verify_row_count=False skips reading the CSV, keeping the JSON checks. The
+    row count costs a full parse of a file with one line per tile — negligible
+    for the one slide a worker is deciding about, but O(dataset) when something
+    sweeps thousands of slides at once (see _tiled_coverage in
+    tile_server_v2_.py). Note the asymmetry that creates: a sweep may call a
+    slide complete that a worker would then re-tile. That direction is the safe
+    one — the worker gets the final say and redoes the work — but it does mean
+    the two answers are not guaranteed identical.
+
+    Any unreadable/corrupt file answers False: the cost of re-tiling a slide is
+    bounded, while trusting a damaged summary corrupts the packaged .h5.
+    """
+    if not metadata_path.is_file() or not summary_path.is_file():
+        return False
+
+    try:
+        # A directory replaced by a file (or a broken symlink) would otherwise
+        # only surface further down as a confusing parse error.
+        if not slide_tile_dir.is_dir():
+            return False
+
+        if metadata_path.stat().st_size == 0 or summary_path.stat().st_size == 0:
+            return False
+
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        saved_tiles = int(summary.get("saved_tiles", -1))
+
+        if saved_tiles < 0:
+            return False
+
+        # Zero tiles can be a legitimate completed result.
+        if saved_tiles == 0:
+            return True
+
+        if not verify_row_count:
+            return True
+
+        metadata = pd.read_csv(metadata_path)
+
+        if len(metadata) != saved_tiles:
+            return False
+
+        return True
+
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, pd.errors.ParserError):
+        # TypeError included for a summary whose saved_tiles is null or a list —
+        # int() raises TypeError there, not ValueError.
+        return False
 
 
 def read_manifest_slide(manifest_path: Path, task_id: int) -> Path:
@@ -184,12 +282,7 @@ def run_worker(args: argparse.Namespace) -> None:
     if not mask_path.exists() or mask_path.stat().st_size == 0:
         raise RuntimeError(f"Expected mask was not created: {mask_path}")
 
-    tile_complete = (
-        metadata_path.exists()
-        and metadata_path.stat().st_size > 0
-        and summary_path.exists()
-        and summary_path.stat().st_size > 0
-    )
+    tile_complete = tiling_output_complete(metadata_path, summary_path, slide_tile_dir)
 
     if tile_complete:
         print("[SKIP] Slide already tiled.", flush=True)
@@ -579,6 +672,12 @@ def submit_packaging_job(
     slide_names: list[str] | None = None,
     random_seed: int | None = None,
     allow_incomplete: bool = False,
+    # None leaves make_hpl_hdf5.py to continue a checkpoint if it finds one
+    # (its historical behaviour). True requires one and fails without it; False
+    # discards it and repackages from scratch. Passed through as an explicit
+    # flag so the decision is the caller's — and visible in the recorded sbatch
+    # command — rather than an implicit consequence of what's on disk.
+    resume: bool | None = None,
 ) -> dict:
     """Submit a Slurm job that packages a tiling run's output into the .h5
     format Kai's HPL pipeline expects, deferred via Slurm's own --dependency
@@ -626,9 +725,22 @@ def submit_packaging_job(
     process-pool version, so 24h wasn't leaving enough margin either.
     Still override this if 48h isn't enough, or if your cluster's
     partition caps below that.
+
+    depends_on_job_ids may be empty, which submits with no --dependency at
+    all. That is not a way to skip the afterok safety check — it is for the
+    case where tiling has *already* finished, so there is nothing left to
+    wait on. It matters because sbatch resolves dependencies against
+    slurmctld, which forgets a job MinJobAge seconds after it completes
+    (default 300), while sacct keeps it for weeks. So a caller can confirm
+    via sacct that every tiling task COMPLETED and still have sbatch reject
+    the submission with "Job dependency problem", because slurmctld no
+    longer recognises those IDs. With --kill-on-invalid-dep=yes that lands
+    as a submit-time failure rather than a job that queues forever, which is
+    the right behaviour for a dependency that might yet be satisfied and the
+    wrong one for a dependency that is already moot. Deciding whether the
+    tiling jobs are terminal is the caller's job, not this function's — it
+    needs sacct state the caller has usually already fetched.
     """
-    if not depends_on_job_ids:
-        raise ValueError("depends_on_job_ids must have at least one job ID.")
 
     script_path = Path(__file__).resolve()
     backend_dir = script_path.parent
@@ -679,6 +791,7 @@ def submit_packaging_job(
         # to run on instead of oversubscribing (or undersubscribing) cpus.
         "--processes", str(cpus),
         "--threads-per-process", str(threads_per_process),
+        *([] if resume is None else ["--resume"] if resume else ["--fresh"]),
     ]
 
     sbatch_command = [
@@ -688,8 +801,10 @@ def submit_packaging_job(
         f"--cpus-per-task={cpus}",
         f"--mem={memory}",
         f"--time={time_limit}",
-        f"--dependency={'afterany' if allow_incomplete else 'afterok'}:{':'.join(depends_on_job_ids)}",
-        "--kill-on-invalid-dep=yes",
+        *([
+            f"--dependency={'afterany' if allow_incomplete else 'afterok'}:{':'.join(depends_on_job_ids)}",
+            "--kill-on-invalid-dep=yes",
+        ] if depends_on_job_ids else []),
         f"--output={log_dir}/hpl_h5_%j.out",
         f"--error={log_dir}/hpl_h5_%j.err",
         f"--chdir={backend_dir}",
@@ -701,7 +816,15 @@ def submit_packaging_job(
         "h5_output_path": str(hpl_h5_output_path(output_root, dataset_name, marker, split, tile_size)),
         "sbatch_command": shlex.join(sbatch_command),
         "h5_job_id": None,
-        "dependency_type": "afterany" if allow_incomplete else "afterok",
+        # None, not the afterok/afterany the flags *would* have used, when no
+        # dependency was actually set — this is what a caller inspects to see
+        # whether the job is gated on anything, and reporting a gate that
+        # isn't on the sbatch line would misreport an immediately-eligible
+        # job as still waiting on tiling.
+        "dependency_type": (
+            ("afterany" if allow_incomplete else "afterok") if depends_on_job_ids else None
+        ),
+        "depends_on_job_ids": list(depends_on_job_ids),
         "allow_incomplete": allow_incomplete,
     }
 

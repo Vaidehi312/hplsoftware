@@ -29,7 +29,8 @@ from pathlib import Path
 
 import numpy as np
 
-from validate_reference import load_reference, leave_one_out
+from validate_reference import describe_reference, leave_one_out, load_reference
+from build_hpc_reference import HPC_REFERENCE_PATH
 
 
 def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
@@ -107,7 +108,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--reference", type=Path, default=HPC_REFERENCE_PATH,
+                        help=f"Reference .npz. Defaults to the production one "
+                             f"({HPC_REFERENCE_PATH}). Anything else is reported "
+                             f"as not-production before any number is printed.")
     parser.add_argument("--sample", type=int, default=20_000,
                         help="Reference tiles in the baseline (--k-base) pass.")
     parser.add_argument("--seed", type=int, default=0)
@@ -124,6 +128,7 @@ def main() -> None:
     args = parser.parse_args()
 
     reference = load_reference(args.reference)
+    describe_reference(args.reference, reference)
     result = compare(reference, args.sample, args.seed, args.k_base, args.k_expand,
                      args.distance_power, args.margin_threshold, args.batch_size)
     report(result, args.k_base, args.k_expand, args.margin_threshold)

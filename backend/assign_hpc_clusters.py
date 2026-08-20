@@ -328,11 +328,81 @@ class Searcher:
 # --------------------------------------------------------------------------- #
 
 _WEIGHT_EPS = 1e-6  # avoids a divide-by-zero for a duplicate-vector neighbour at distance 0
+# Floor on a local density scale. A reference point sitting on duplicates has a
+# scale of zero, and dividing by it would send every distance to infinity.
+_SCALE_EPS = 1e-6
+
+def compute_local_scale_for(vectors: np.ndarray, rows: np.ndarray, r: int = 7,
+                            batch: int = 8192) -> np.ndarray:
+    """Local density scale for a chosen subset of reference rows.
+
+    The index is still the whole reference — a density scale computed against a
+    subsample would be a different quantity — but only `rows` are queried. That
+    matters a great deal: at the production reference's measured 28 ms/query,
+    scaling every one of 2.5M rows is 19.5 hours, while the ~1M distinct rows a
+    20,000-tile sweep actually touches is a fraction of that, and a smaller
+    sample is minutes.
+    """
+    if r < 1:
+        raise ValueError(f"r must be at least 1, got {r}")
+    rows = np.asarray(rows, dtype=np.int64)
+    searcher = Searcher(vectors)
+    scale = np.empty(len(rows), dtype=np.float32)
+    for start in range(0, len(rows), batch):
+        stop = min(start + batch, len(rows))
+        block_rows = rows[start:stop]
+        idx, dist = searcher.search(
+            np.ascontiguousarray(vectors[block_rows]), r + 1
+        )
+        self_mask = idx == block_rows[:, None]
+        no_self = ~self_mask.any(axis=1)
+        if no_self.any():
+            self_mask[no_self, -1] = True
+        kept = np.sqrt(np.maximum(dist[~self_mask].reshape(len(block_rows), r), 0.0))
+        scale[start:stop] = kept[:, -1]
+    return scale
+
+
+def compute_local_scale(vectors: np.ndarray, r: int = 7,
+                        batch: int = 8192) -> np.ndarray:
+    """Each reference point's local density scale: its distance to its r-th
+    nearest *other* reference point.
+
+    This is the same quantity UMAP calls sigma, arrived at cheaply. UMAP solves
+    a binary search per point so the neighbourhood's entropy equals log2(k);
+    the r-th neighbour distance is the standard cheap stand-in, and it captures
+    the property that matters here — that a point in a dense region has a small
+    scale and one in a sparse region a large one.
+
+    r is the *other* points, so the search asks for r+1 and drops the
+    self-match. A reference with duplicate vectors can legitimately produce a
+    scale of zero; vote() floors it rather than dividing by it.
+    """
+    if r < 1:
+        raise ValueError(f"r must be at least 1, got {r}")
+    searcher = Searcher(vectors)
+    scale = np.empty(len(vectors), dtype=np.float32)
+    for start in range(0, len(vectors), batch):
+        stop = min(start + batch, len(vectors))
+        rows = np.arange(start, stop)
+        idx, dist = searcher.search(np.ascontiguousarray(vectors[start:stop]), r + 1)
+        # Mask the self-match by index rather than assuming column 0: with
+        # duplicate vectors the tie order is not guaranteed.
+        self_mask = idx == rows[:, None]
+        no_self = ~self_mask.any(axis=1)
+        if no_self.any():
+            self_mask[no_self, -1] = True
+        kept = np.sqrt(np.maximum(dist[~self_mask].reshape(len(rows), r), 0.0))
+        scale[start:stop] = kept[:, -1]
+    return scale
+
 
 def vote(neighbour_indices: np.ndarray, neighbour_distances: np.ndarray,
          codes: np.ndarray, n_clusters: int,
          distance_weighted: bool = False, distance_power: float = 1.0,
-         class_weights: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+         class_weights: np.ndarray | None = None,
+         local_scale: np.ndarray | None = None,
+         return_counts: bool = False) -> tuple[np.ndarray, ...]:
     """Majority (or weighted) label, margin, and mean neighbour distance.
 
     distance_weighted gives neighbour i a vote of 1/(distance_i + eps)**power
@@ -351,6 +421,12 @@ def vote(neighbour_indices: np.ndarray, neighbour_distances: np.ndarray,
     All three are opt-in and independent. With none, every valid neighbour's
     weight is exactly 1, so counts and margin come out bit-for-bit what this
     returned before any of them existed.
+
+    return_counts appends the full per-cluster vote-weight matrix to the return
+    tuple. Diagnostics need it to ask where the *true* cluster placed on a tile
+    that came out wrong — runner-up is a different problem from also-ran, and
+    only the losing scores distinguish them. Off by default so the assignment
+    path never materialises a rows x n_clusters array it does not read.
     """
     rows, k = neighbour_indices.shape
     valid = neighbour_indices >= 0
@@ -358,8 +434,29 @@ def vote(neighbour_indices: np.ndarray, neighbour_distances: np.ndarray,
     labels = codes[safe]
     distances = np.sqrt(np.maximum(neighbour_distances, 0.0))
 
+    # local_scale divides each neighbour's distance by that neighbour's own
+    # local density scale, so "close" is judged relative to how tightly packed
+    # the reference is where that neighbour sits, not on an absolute ruler.
+    #
+    # This is the asymmetry the reference's own construction creates. Leiden
+    # partitioned a UMAP fuzzy-simplicial-set graph whose edge weights are
+    # exp(-(d - rho_i)/sigma_i), with sigma_i solved per reference point so
+    # every neighbourhood carries equal entropy. 1/(d+eps)^p has no per-point
+    # scale at all, so where A and B differ in local density the denser one
+    # wins on sheer numerosity of nearby points rather than on being the
+    # better answer.
+    #
+    # Weighting only. mean_distance below stays on raw distances, because it is
+    # written to the assignments CSV as neighbor_distance and consumed as a real
+    # distance — rescaling it would silently change what that column means.
+    weight_distances = distances
+    if local_scale is not None:
+        weight_distances = distances / np.maximum(local_scale[safe], _SCALE_EPS)
+
     if distance_weighted:
-        weights = np.where(valid, 1.0 / (distances + _WEIGHT_EPS) ** distance_power, 0.0)
+        weights = np.where(
+            valid, 1.0 / (weight_distances + _WEIGHT_EPS) ** distance_power, 0.0
+        )
     else:
         weights = valid.astype(np.float64)
 
@@ -397,6 +494,9 @@ def vote(neighbour_indices: np.ndarray, neighbour_distances: np.ndarray,
         np.sum(np.where(valid, distances, 0.0), axis=1) / denominator,
         np.nan,
     )
+    if return_counts:
+        return (winner, margin.astype(np.float32), mean_distance.astype(np.float32),
+                counts)
     return winner, margin.astype(np.float32), mean_distance.astype(np.float32)
 
 
@@ -491,6 +591,13 @@ def assign(args) -> dict:
     searcher = Searcher(reference, metric=args.metric)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
 
+    # A property of the reference, so computed once here rather than per chunk.
+    local_scale = None
+    if args.local_scaling:
+        local_scale = compute_local_scale(reference, r=args.local_scaling)
+        print(f"Local scale : r={args.local_scaling}, "
+              f"median {np.median(local_scale):.3f}")
+
     class_weights = None
     if args.class_weighted:
         # 1/count so a cluster with more reference points gets less weight per
@@ -530,7 +637,8 @@ def assign(args) -> dict:
                 w, m, d = vote(idx, dist, codes, len(categories),
                                distance_weighted=args.distance_weighted,
                                distance_power=args.distance_power,
-                               class_weights=class_weights)
+                               class_weights=class_weights,
+                               local_scale=local_scale)
                 margins[offset + bstart:offset + bstop] = m
                 distances[offset + bstart:offset + bstop] = d
                 np.add.at(cluster_counts, w, 1)
@@ -662,6 +770,13 @@ def main() -> None:
                              "win a boundary tile just by being more numerous nearby. "
                              "Composes with --distance-weighted. Validate first, same "
                              "as that flag.")
+    parser.add_argument("--local-scaling", type=int, default=0, metavar="R",
+                        help="Divide each neighbour's distance by that neighbour's "
+                             "own distance to its R-th nearest reference point, so "
+                             "closeness is judged relative to local density rather "
+                             "than on an absolute ruler. 0 (the default) is off. "
+                             "Validate with validate_reference.py --local-scaling "
+                             "before using it for a real assignment.")
     parser.add_argument("--centering", default="query",
                         choices=["query", "reference", "none"],
                         help="How queries are centred before projection. 'query' "

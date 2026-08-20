@@ -180,6 +180,92 @@ def test_unreachable_errors_are_counted_as_unreachable(tmp_path):
     assert (result["truth_neighbours"][result["correct"]] > 0).all()
 
 
+def test_truth_neighbours_ignores_faiss_padding(tmp_path):
+    """When k+1 exceeds the reference size faiss pads the result with -1, and
+    codes[-1] is the last reference row's cluster. Counting without masking
+    credits every padded slot to that one cluster, so tiles report more
+    same-label neighbours than the whole reference contains — and the error
+    budget then under-counts unreachable errors and over-states the ceiling.
+
+    The existing count test only runs with k < n, so it cannot see this.
+    """
+    from validate_reference import leave_one_out, load_reference
+
+    ref = tmp_path / "tiny.npz"
+    n, ncomp, nclust = 20, 4, 4
+    rng = np.random.default_rng(3)
+    codes = np.repeat(np.arange(nclust), n // nclust).astype(np.int64)
+    np.savez(
+        ref, reference=rng.standard_normal((n, ncomp)).astype(np.float32),
+        components=np.zeros((ncomp, ncomp), np.float32), codes=codes,
+        categories=np.array([str(i) for i in range(nclust)]),
+        n_neighbors=np.int64(30), meta=json.dumps({"groupby": "leiden_2.5"}),
+    )
+    # k=30 with n=20 forces 11 padded slots per row.
+    result = leave_one_out(load_reference(ref), n, 30, 4096, 0)
+
+    per_cluster = np.bincount(codes, minlength=nclust)
+    for row, truth in enumerate(result["truth"]):
+        # Excluding the tile itself, its cluster has at most count-1 others.
+        assert result["truth_neighbours"][row] <= per_cluster[truth] - 1, (
+            f"tile {row} of cluster {truth} reports "
+            f"{result['truth_neighbours'][row]} same-label neighbours, but only "
+            f"{per_cluster[truth] - 1} exist — padding is being counted"
+        )
+
+
+def test_truth_rank_separates_runner_up_from_also_ran(tmp_path):
+    """Runner-up errors are recoverable by a tiebreak; also-rans are not. The
+    diagnostic is only worth acting on if it can tell them apart.
+
+    Two references where the answer is known by construction: clusters in
+    overlapping *pairs* must put the true cluster at rank 2 on most errors,
+    while random labels must scatter it across many ranks.
+    """
+    from validate_reference import leave_one_out, load_reference
+
+    paired = tmp_path / "paired.npz"
+    rng = np.random.default_rng(17)
+    ncomp, k = 6, 25
+    # 8 clusters arranged as 4 tightly-overlapping pairs, far apart between
+    # pairs: a tile's only plausible rival is its partner.
+    per, nclust = 900, 8
+    codes = np.repeat(np.arange(nclust), per).astype(np.int64)
+    centres = np.zeros((nclust, ncomp), np.float32)
+    for pair in range(nclust // 2):
+        centres[2 * pair, pair] = 60.0 * (pair + 1)
+        centres[2 * pair + 1, pair] = 60.0 * (pair + 1) + 1.1
+    vectors = centres[codes] + rng.standard_normal((len(codes), ncomp)).astype(np.float32)
+    np.savez(
+        paired, reference=vectors.astype(np.float32),
+        components=np.zeros((ncomp, ncomp), np.float32), codes=codes,
+        categories=np.array([str(i) for i in range(nclust)]),
+        n_neighbors=np.int64(k), meta=json.dumps({"groupby": "leiden_2.5"}),
+    )
+    result = leave_one_out(load_reference(paired), 3000, 10, 4096, 0)
+    wrong = ~result["correct"]
+    assert wrong.sum() > 30, wrong.sum()
+    paired_share = (result["truth_rank"][wrong] == 2).mean()
+
+    # Random labels: the true cluster is just one of many, so it lands at
+    # rank 2 only about as often as any other cluster does.
+    noise = tmp_path / "noise.npz"
+    _write_reference(noise, separable=False, n=6000, nclust=8)
+    noisy = leave_one_out(load_reference(noise), 2000, 10, 4096, 0)
+    noisy_wrong = ~noisy["correct"]
+    noise_share = (noisy["truth_rank"][noisy_wrong] == 2).mean()
+
+    # The claim is that this number discriminates: high when the true cluster
+    # is the one plausible rival, low when it is one of many.
+    assert paired_share > 0.7, paired_share
+    assert noise_share < 0.4, noise_share
+    assert paired_share > noise_share + 0.3, (paired_share, noise_share)
+
+    # A correct tile always ranks 1, by definition of winning the vote.
+    assert (noisy["truth_rank"][noisy["correct"]] == 1).all()
+    assert (result["truth_rank"][result["correct"]] == 1).all()
+
+
 def test_error_budget_ceiling_is_between_accuracy_and_one(tmp_path):
     """The ceiling is accuracy + the addressable share. It must sit strictly
     above the measured accuracy when there are recoverable errors, and must not

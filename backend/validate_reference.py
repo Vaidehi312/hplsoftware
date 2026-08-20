@@ -46,7 +46,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from assign_hpc_clusters import Searcher, vote  # noqa: E402
+from assign_hpc_clusters import Searcher, compute_local_scale, vote  # noqa: E402
+from build_hpc_reference import HPC_REFERENCE_PATH  # noqa: E402
+from superclusters import load_mapping, report as report_superclusters, summarise  # noqa: E402
 
 # Enough for a tight confidence interval on an accuracy near 0.9 (±0.4% at
 # 20k), while staying seconds rather than minutes. The full 2.5M reference
@@ -74,9 +76,44 @@ def load_reference(path: Path) -> dict:
     }
 
 
+# What the production reference looks like. A mismatch is not an error — an
+# exploratory reference is a legitimate thing to measure — but it has to be
+# stated, because the numbers are not comparable across references and that is
+# very easy to forget once they are written down.
+_PRODUCTION_GROUPBY = "leiden_2.5"
+_PRODUCTION_CLUSTERS = 71
+
+
+def describe_reference(path: Path, reference: dict) -> None:
+    """Say which reference this is, loudly, before any number is printed.
+
+    Every accuracy figure is relative to one reference. Two were in play here —
+    the production leiden_2.5 (TCGA LUAD, 71 clusters) and an exploratory
+    leiden_5.0 (LATTICeA, 109 clusters, a deliberately over-split QC pass) — and
+    a run against the second reads exactly like a run against the first once the
+    command line has scrolled away.
+    """
+    groupby = reference["groupby"]
+    n_clusters = len(reference["categories"])
+    print(f"Reference file: {path}")
+    if groupby == _PRODUCTION_GROUPBY and n_clusters == _PRODUCTION_CLUSTERS:
+        print(f"                production reference "
+              f"({groupby}, {n_clusters} clusters)")
+        return
+    print(
+        f"                *** NOT the production reference ***\n"
+        f"                this is {groupby} with {n_clusters} clusters; production "
+        f"is {_PRODUCTION_GROUPBY} with {_PRODUCTION_CLUSTERS}.\n"
+        f"                Numbers from here are not comparable with production "
+        f"ones and must not be quoted as if they were.",
+        file=sys.stderr,
+    )
+
+
 def leave_one_out(reference: dict, sample: int, k: int,
                   batch: int, seed: int, distance_weighted: bool = False,
                   distance_power: float = 1.0, class_weighted: bool = False,
+                  local_scaling: int = 0,
                   metric: str = "l2", query_index: np.ndarray | None = None) -> dict:
     """Leave-one-out over `sample` random reference rows (or exactly
     `query_index`, when given).
@@ -112,9 +149,22 @@ def leave_one_out(reference: dict, sample: int, k: int,
     vote_desc = "+".join(filter(None, [
         f"distance^{distance_power:g}" if distance_weighted else None,
         "class" if class_weighted else None,
+        f"local-scale(r={local_scaling})" if local_scaling else None,
     ])) or "unweighted"
     print(f"Queries   : {len(query_index):,} sampled, k={k} (self excluded), "
           f"{vote_desc} vote")
+
+    # One extra self-search over the whole reference, seconds at this size. Done
+    # once here rather than per batch: it is a property of the reference, not of
+    # the query, so recomputing it per chunk would be both wasteful and a way for
+    # two chunks to disagree.
+    local_scale = None
+    if local_scaling:
+        local_scale = compute_local_scale(vectors, r=local_scaling)
+        print(f"Local scale: r={local_scaling}, "
+              f"median {np.median(local_scale):.3f}, "
+              f"{np.percentile(local_scale, 5):.3f}-{np.percentile(local_scale, 95):.3f} "
+              f"(5-95%)")
 
     class_weights = None
     if class_weighted:
@@ -132,6 +182,14 @@ def leave_one_out(reference: dict, sample: int, k: int,
     # means the right answer was present and lost the vote, which is exactly
     # what those knobs can change.
     truth_neighbours = np.empty(len(query_index), dtype=np.int32)
+    # Where the true cluster placed in the vote. 1 = it won. 2 = it was the
+    # runner-up, which is the case a tiebreak between the top two could still
+    # win back. Anything higher means a tiebreak cannot reach it, and the tile
+    # needs more neighbours or a different space instead.
+    truth_rank = np.empty(len(query_index), dtype=np.int32)
+    # The cluster that came second. A tiebreak rule only ever chooses between
+    # this and the winner, so it is the other half of what such a rule needs.
+    runner_up = np.empty(len(query_index), dtype=np.int64)
     started = time.perf_counter()
 
     for start in range(0, len(query_index), batch):
@@ -154,15 +212,32 @@ def leave_one_out(reference: dict, sample: int, k: int,
         trimmed_idx = idx[keep].reshape(len(rows), k)
         trimmed_dist = dist[keep].reshape(len(rows), k)
 
-        winners, margin, _ = vote(trimmed_idx, trimmed_dist, codes, n_clusters,
-                                  distance_weighted=distance_weighted,
-                                  distance_power=distance_power,
-                                  class_weights=class_weights)
+        winners, margin, _, counts = vote(trimmed_idx, trimmed_dist, codes, n_clusters,
+                                          distance_weighted=distance_weighted,
+                                          distance_power=distance_power,
+                                          class_weights=class_weights,
+                                          local_scale=local_scale,
+                                          return_counts=True)
         predicted[start:stop] = winners
         margins[start:stop] = margin
+        row_truth = codes[rows]
+        # faiss pads a short result with -1, and codes[-1] is the *last
+        # reference row's* cluster — so counting without masking would credit
+        # every padded slot to that one cluster and report tiles as having far
+        # more same-label neighbours than exist. vote() guards this with
+        # `valid`; this count has to guard it too.
+        neighbour_valid = trimmed_idx >= 0
         truth_neighbours[start:stop] = (
-            codes[trimmed_idx] == codes[rows][:, None]
+            (codes[np.where(neighbour_valid, trimmed_idx, 0)] == row_truth[:, None])
+            & neighbour_valid
         ).sum(axis=1)
+        # Rank by "how many clusters scored strictly higher", so ties with the
+        # true cluster count in its favour rather than against it — otherwise a
+        # tile the vote genuinely tied would read as already lost.
+        truth_score = np.take_along_axis(counts, row_truth[:, None], 1).ravel()
+        truth_rank[start:stop] = (counts > truth_score[:, None]).sum(axis=1) + 1
+        runner_up[start:stop] = np.argsort(counts, axis=1)[:, -2] if n_clusters > 1 \
+            else winners
 
     elapsed = time.perf_counter() - started
     truth = codes[query_index]
@@ -177,6 +252,8 @@ def leave_one_out(reference: dict, sample: int, k: int,
         "predicted": predicted,
         "margins": margins,
         "truth_neighbours": truth_neighbours,
+        "truth_rank": truth_rank,
+        "runner_up": runner_up,
         "categories": reference["categories"],
         "n_clusters": n_clusters,
         "rate": len(query_index) / max(elapsed, 1e-9),
@@ -206,6 +283,7 @@ def report(result: dict, worst: int) -> None:
     truth, predicted, correct = result["truth"], result["predicted"], result["correct"]
     margins = result["margins"]
     truth_neighbours = result["truth_neighbours"]
+    truth_rank = result["truth_rank"]
     categories, n_clusters = result["categories"], result["n_clusters"]
 
     # The ceiling. Errors where the true cluster never appeared among the k
@@ -223,8 +301,25 @@ def report(result: dict, worst: int) -> None:
               f"({reachable_all / n_wrong_all * 100:.0f}%) had the true cluster among "
               f"the k neighbours and lost the vote, {unreachable_all:,} "
               f"({unreachable_all / n_wrong_all * 100:.0f}%) did not.")
-        print(f"            A perfect vote rule at this k would reach "
-              f"{ceiling * 100:.2f}% — that is the whole headroom left in the vote.")
+        # An oracle bound, not a target: a rule that always picked the true
+        # cluster when present would be reading the answer. What it says is
+        # where the loss is — above this line the neighbours do not carry the
+        # label, below it the vote is throwing it away.
+        print(f"            An oracle picking the true cluster whenever it was present "
+              f"would reach {ceiling * 100:.2f}%. Not achievable — it bounds how much "
+              f"is lost in scoring rather than in the search.")
+
+        # Of the errors where the true cluster was present, where did it place?
+        # Runner-up is recoverable by a rule that only has to break the top two
+        # apart. Rank 5 is not — no tiebreak reaches it, and those tiles need
+        # more neighbours or a different space.
+        ranks = truth_rank[wrong_all]
+        runner_up = int((ranks == 2).sum())
+        top3 = int((ranks <= 3).sum())
+        print(f"            Of the wrong tiles, {runner_up:,} "
+              f"({runner_up / n_wrong_all * 100:.0f}%) had the true cluster as "
+              f"runner-up and {top3:,} ({top3 / n_wrong_all * 100:.0f}%) in the top 3 "
+              f"(median rank {int(np.median(ranks))}) — the share a tiebreak could reach.")
     rows = []
     top_code_of = {}
     for code in range(n_clusters):
@@ -336,7 +431,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--reference", type=Path, default=HPC_REFERENCE_PATH,
+                        help=f"Reference .npz. Defaults to the production one "
+                             f"({HPC_REFERENCE_PATH}). Anything else is reported "
+                             f"as not-production before any number is printed.")
     parser.add_argument("--sample", type=int, default=_DEFAULT_SAMPLE,
                         help="Reference tiles to test. 0 or more than the reference "
                              "size tests all of them.")
@@ -364,9 +462,23 @@ def main() -> None:
                              "reference count), so a large cluster's neighbours don't "
                              "win a boundary tile just by being more numerous nearby. "
                              "Composes with --distance-weighted.")
+    parser.add_argument("--local-scaling", type=int, default=0, metavar="R",
+                        help="Divide each neighbour's distance by that neighbour's "
+                             "own distance to its R-th nearest reference point, so "
+                             "closeness is judged relative to local density. 0 (the "
+                             "default) is off. 7 is a reasonable first try. The "
+                             "reference's Leiden clusters were cut from a graph whose "
+                             "weights carry exactly this per-point scale, which the "
+                             "plain 1/d^p vote does not.")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0,
                         help="Sampling seed, so a number can be reproduced.")
+    parser.add_argument("--superclusters", action="store_true",
+                        help="Also report accuracy after collapsing HPCs into the "
+                             "four immune/architecture superclusters the survival "
+                             "analysis uses. An HPC error inside one supercluster "
+                             "changes nothing downstream, so this says how much of "
+                             "the remaining error is worth chasing.")
     parser.add_argument("--worst", type=int, default=10,
                         help="How many weakest clusters to list.")
     parser.add_argument("--min-accuracy", type=float, default=None,
@@ -374,6 +486,7 @@ def main() -> None:
     args = parser.parse_args()
 
     reference = load_reference(args.reference)
+    describe_reference(args.reference, reference)
     k = args.k or reference["n_neighbors"]
     sample = args.sample if args.sample > 0 else len(reference["vectors"])
 
@@ -381,8 +494,20 @@ def main() -> None:
                            distance_weighted=args.distance_weighted,
                            distance_power=args.distance_power,
                            class_weighted=args.class_weighted,
+                           local_scaling=args.local_scaling,
                            metric=args.metric)
     report(result, args.worst)
+
+    if args.superclusters:
+        mapping = load_mapping()
+        if mapping:
+            report_superclusters(summarise(
+                result["truth"], result["predicted"], result["categories"], mapping
+            ))
+        else:
+            print("\nNo supercluster mapping available — HPL-LATTICeA/libraries/"
+                  "supercluster_dictionary.py is not present in this checkout.",
+                  file=sys.stderr)
 
     print(
         "\nThis measures the search, the vote and whether the clusters are "

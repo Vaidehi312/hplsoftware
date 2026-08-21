@@ -528,3 +528,133 @@ That leaves a real decision, which is why the defaults were not changed:
   default still passes and the settled config lands a little below, the pipeline is
   sound and the difference is the intended change. If the *default* drops below 99%,
   that is a real defect and has nothing to do with any of this.
+
+## §20 The runner-up idea, measured to a conclusion
+
+Asked: 93% of errors have the true cluster as runner-up, so why not assign the
+runner-up for those? Measured on the production reference at 200,000 tiles, the
+answer went through three stages and ended somewhere useful.
+
+### The blanket version cannot work, and the bar is exact
+
+That 93% is conditioned on already knowing the tile is wrong, which at assignment
+time is the one thing unknown. Swapping a band of tiles to their runner-up fixes
+the wrong ones whose truth is the runner-up and breaks every tile already right:
+
+    net > 0  <=>  p > 1/(1 + r)     p = fraction of the band wrong
+                                    r = P(runner-up | wrong) = 0.93 measured
+
+So the band must be **more than 51.9% wrong**. No band is:
+
+| margin < | tiles | wrong | fixed | broke | net |
+|---|---|---|---|---|---|
+| 0.01 | 729 | 50.6% | 342 | 360 | −18 |
+| 0.05 | 3,857 | 45.7% | 1,609 | 2,093 | −484 |
+| 0.10 | 7,459 | 41.6% | 2,831 | 4,359 | −1,528 |
+| 0.25 | 18,433 | 28.6% | 4,861 | 13,152 | −8,291 |
+| 0.75 | 61,701 | 10.3% | 5,893 | 55,331 | −49,438 |
+
+`fixed` saturates while `broke` explodes: from margin < 0.25 to < 0.75 adds 1,032
+fixable errors and 42,179 breakable correct tiles. 76% of all errors already sit
+below margin 0.25.
+
+### Deciding *which* tiles to swap does work — and only one rule does
+
+`tiebreak_experiment.py` had existed unrun. Of its four rules, exactly one has
+signal:
+
+| rule | net at flip 0 |
+|---|---|
+| `restricted` | **+796** |
+| `mean-dist` | −1,137 |
+| `nearest` | −1,150 |
+| `centroid` | −1,640 |
+
+`restricted` is the only rule that uses **more evidence** — it re-votes at k=50
+while counting only the two candidates. `nearest` and `mean-dist` re-read the same
+k=10; `centroid` uses a global summary. **The gain comes from more neighbours, not
+from a cleverer read of the ones already there.**
+
+### The band is a parameter, and the old grid missed its optimum
+
+| band | best rule | net | adaptive k | hybrid | oracle |
+|---|---|---|---|---|---|
+| 0.05 | `restricted` @0.02 | +562 | +569 | +597 | 97.27% |
+| 0.10 | `restricted` @0.05 | +828 | +840 | +904 | 97.56% |
+| **0.15** | `restricted` @0.05 | **+911** | **+910** | **+992** | 97.72% |
+| 0.25 | `restricted` @0.10 | +826 | +765 | +916 | 97.88% |
+| 0.50 | `restricted` @0.10 | +684 | +564 | +799 | 97.92% |
+
+**0.15 is the optimum for every policy, and the sweep never tested it** — its
+grid was `0 / 0.10 / 0.25`. Plain adaptive k at 0.15 gives **97.27%** against
+97.23% at 0.10 and 97.19% at 0.25. `tune_classifier.py`'s default `--adaptive`
+grid is now `0 / 0.05 / 0.10 / 0.15 / 0.20 / 0.25`; thresholds are re-votes of a
+subset, so a coarse grid buys nothing and can hide the answer.
+
+The oracle column keeps rising with the band only because a wider band contains
+more reachable tiles. It is not achievable — see below.
+
+### They are complementary, and the hybrid is the best measured policy
+
+At band 0.15, `restricted` (+911) and adaptive k (+910) score the same but agree
+on only 82.9% of the band:
+
+| | tiles |
+|---|---|
+| right after adaptive only | 897 |
+| right after the rule only | 898 |
+| right after both | 6,990 |
+| right after neither | 2,264 |
+
+Not one mechanism. `restricted` adds neighbours *while narrowing to two
+candidates*; adaptive k adds neighbours *keeping all 71 open*. The narrowing does
+independent work. The hybrid — adaptive's answer, overruled by the rule where
+adaptive's own re-vote is still a near-tie — reaches **+992, 97.31%**.
+
+### The selector is real, already exploited, and closed
+
+Where they disagree it is a coin flip overall: 50.9% adaptive on the 341 tiles the
+A/B rule structurally cannot reach, 49.8% on the 1,544 head-to-head. Stratified:
+
+| adaptive margin | adaptive wins | | rule advantage | adaptive wins |
+|---|---|---|---|---|
+| 0.000–0.018 | 39.2% | | 0.000–0.028 | 52.4% |
+| 0.018–0.039 | 50.1% | | 0.028–0.058 | 51.8% |
+| 0.039–0.072 | 54.7% | | 0.058–0.103 | 50.9% |
+| 0.072–0.272 | 54.8% | | 0.103–0.333 | 44.0% |
+| | 15.6 pts, 4.3σ | | | 8.4 pts, 2.3σ |
+
+Both monotone and beyond noise, so a selector exists. But:
+
+- **Signal 1 is already fully exploited.** The hybrid's best gate (0.02) sits
+  exactly on the first quartile boundary (0.018), which is the only lopsided
+  stratum. Q2 is 50.1% — a coin flip — so widening the gate adds nothing, and the
+  gate sweep confirms it (+992 at 0.02, declining after).
+- **Signal 2 is worth ~35 tiles.** Only its top quartile deviates: 386 tiles at a
+  12-point edge, less the overlap with Q1 already taken. **+0.017pp.**
+
+The +0.41pp oracle gap needs a selector that is *right* on 1,795 near-coin-flip
+decisions. The best stratum observed is 55/45. A selector at 58% — optimistic,
+using both signals — recovers +144 tiles, **+0.07pp**, against the oracle's +898.
+Most of that gap is irreducible.
+
+**So this line of work is finished.** Not because nothing was found, but because
+what was found has been measured to its limit.
+
+### What to actually do
+
+| | accuracy | cost |
+|---|---|---|
+| shipped today (`--adaptive-margin 0.1`) | 97.23% | — |
+| **`--adaptive-margin 0.15`** | **97.27%** | **one flag, code already shipped** |
+| hybrid (band 0.15, gate 0.02) | 97.31% | implement `restricted` in production |
+
+The one-flag change is the recommendation. The hybrid's extra +0.04pp needs a
+second mechanism inside `assign_hpc_clusters.py`, and every figure above is
+best-of-sweep on **seed 0** — confirm on `--seed 1`, with its own cache file,
+before adopting either.
+
+Two independent tools agreeing is worth noting: `tune_classifier`'s sweep and
+`tiebreak_experiment`'s adaptive arm both give **97.23%** for `k=10 / pow 3 /
+adapt 0.1 / k=25`, computed through separately written code paths from the
+baseline vote down.

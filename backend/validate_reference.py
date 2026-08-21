@@ -114,7 +114,8 @@ def leave_one_out(reference: dict, sample: int, k: int,
                   batch: int, seed: int, distance_weighted: bool = False,
                   distance_power: float = 1.0, class_weighted: bool = False,
                   local_scaling: int = 0,
-                  metric: str = "l2", query_index: np.ndarray | None = None) -> dict:
+                  metric: str = "l2", query_index: np.ndarray | None = None,
+                  neighbours: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
     """Leave-one-out over `sample` random reference rows (or exactly
     `query_index`, when given).
 
@@ -123,6 +124,15 @@ def leave_one_out(reference: dict, sample: int, k: int,
     fresh random sample. `sample` and `seed` are ignored in that case: the
     caller already knows exactly which rows it wants, and re-deriving them from
     a seed would risk silently drifting from the set the caller actually meant.
+
+    neighbours skips the search entirely, taking `(idx, dist)` a caller already
+    has — `tune_classifier.gather_neighbours` caches exactly this, and the search
+    is the whole cost of a run against the production reference. It must already
+    have the self-match removed and be ordered by distance, with at least k
+    columns and one row per query_index entry; anything else is refused rather
+    than trusted, because neighbours for the wrong rows produce a complete,
+    plausible set of accuracies for tiles nobody asked about. Distances are
+    squared, as faiss returns them and as vote() expects.
     """
     vectors, codes = reference["vectors"], reference["codes"]
     n_clusters = len(reference["categories"])
@@ -142,8 +152,29 @@ def leave_one_out(reference: dict, sample: int, k: int,
         else:
             query_index = np.sort(rng.choice(total, size=sample, replace=False))
 
-    searcher = Searcher(vectors, metric=metric)
-    print(f"Backend   : {searcher.backend}")
+    given_idx = given_dist = None
+    if neighbours is not None:
+        given_idx, given_dist = neighbours
+        if given_idx.shape != given_dist.shape:
+            raise ValueError(
+                f"neighbours: idx {given_idx.shape} and dist {given_dist.shape} "
+                f"disagree.")
+        if given_idx.shape[0] != len(query_index):
+            raise ValueError(
+                f"neighbours has {given_idx.shape[0]} rows for "
+                f"{len(query_index)} queries — these are not the same tiles.")
+        if given_idx.shape[1] < k:
+            raise ValueError(
+                f"neighbours has only {given_idx.shape[1]} columns, so it cannot "
+                f"answer k={k}. Re-search at k_max >= {k}.")
+
+    searcher = None
+    if given_idx is None:
+        searcher = Searcher(vectors, metric=metric)
+        print(f"Backend   : {searcher.backend}")
+    else:
+        print(f"Backend   : pre-computed neighbours "
+              f"({given_idx.shape[0]:,} x {given_idx.shape[1]}), no search")
     print(f"Reference : {total:,} tiles, {vectors.shape[1]} comps, "
           f"{n_clusters} clusters ({reference['groupby']})")
     vote_desc = "+".join(filter(None, [
@@ -195,22 +226,27 @@ def leave_one_out(reference: dict, sample: int, k: int,
     for start in range(0, len(query_index), batch):
         stop = min(start + batch, len(query_index))
         rows = query_index[start:stop]
-        # k+1 so that dropping each tile's self-match still leaves k voters,
-        # keeping the margin denominator comparable to a real assignment.
-        idx, dist = searcher.search(np.ascontiguousarray(vectors[rows]), k + 1)
+        if given_idx is not None:
+            # Already self-excluded and ordered, so a prefix is the k nearest.
+            trimmed_idx = given_idx[start:stop, :k]
+            trimmed_dist = given_dist[start:stop, :k]
+        else:
+            # k+1 so that dropping each tile's self-match still leaves k voters,
+            # keeping the margin denominator comparable to a real assignment.
+            idx, dist = searcher.search(np.ascontiguousarray(vectors[rows]), k + 1)
 
-        # Mask the self-match rather than assuming it is column 0: with
-        # duplicate vectors or ties it need not be.
-        self_mask = idx == rows[:, None]
-        # A row with no self-match (possible if k+1 exceeds the reference size)
-        # would otherwise keep an extra neighbour; drop its last column so
-        # every row votes on k.
-        no_self = ~self_mask.any(axis=1)
-        if no_self.any():
-            self_mask[no_self, -1] = True
-        keep = ~self_mask
-        trimmed_idx = idx[keep].reshape(len(rows), k)
-        trimmed_dist = dist[keep].reshape(len(rows), k)
+            # Mask the self-match rather than assuming it is column 0: with
+            # duplicate vectors or ties it need not be.
+            self_mask = idx == rows[:, None]
+            # A row with no self-match (possible if k+1 exceeds the reference
+            # size) would otherwise keep an extra neighbour; drop its last
+            # column so every row votes on k.
+            no_self = ~self_mask.any(axis=1)
+            if no_self.any():
+                self_mask[no_self, -1] = True
+            keep = ~self_mask
+            trimmed_idx = idx[keep].reshape(len(rows), k)
+            trimmed_dist = dist[keep].reshape(len(rows), k)
 
         winners, margin, _, counts = vote(trimmed_idx, trimmed_dist, codes, n_clusters,
                                           distance_weighted=distance_weighted,

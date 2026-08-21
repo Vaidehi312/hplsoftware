@@ -47,10 +47,17 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from assign_hpc_clusters import Searcher, _WEIGHT_EPS  # noqa: E402
+from tune_classifier import gather_neighbours  # noqa: E402
 from validate_reference import describe_reference, leave_one_out, load_reference  # noqa: E402
 from build_hpc_reference import HPC_REFERENCE_PATH  # noqa: E402
 
 RULES = ("nearest", "mean-dist", "restricted", "centroid")
+
+# Measured on the production reference: of the tiles the vote gets wrong,
+# this fraction have the true cluster as the runner-up. Used only for the
+# break-even figure printed before the sweep -- the report recomputes it
+# from the sample in hand rather than trusting this.
+_RUNNER_UP_SHARE = 0.93
 
 # How far ahead the runner-up must be before the vote is overridden. 0.0 is
 # "override on any lead at all", which is what a plain tiebreak does — and the
@@ -144,11 +151,38 @@ def _pick(rule: str, *, flip_margin: float = 0.0, **kwargs) -> np.ndarray:
 def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
             distance_power: float, margin_threshold: float, batch: int,
             rules: tuple[str, ...] = RULES,
-            flip_margins: tuple[float, ...] = FLIP_MARGINS) -> dict:
+            flip_margins: tuple[float, ...] = FLIP_MARGINS,
+            cache: Path | None = None) -> dict:
     """Baseline at k_base, then every rule applied to the low-margin tiles, at
-    every flip margin."""
-    baseline = leave_one_out(reference, sample, k_base, batch, seed,
-                             distance_weighted=True, distance_power=distance_power)
+    every flip margin.
+
+    With `cache`, both searches come out of one cached neighbour matrix — the
+    same file tune_classifier.py writes. Against the production reference the
+    search is the entire cost (~18 min for 200,000 queries), and this experiment
+    otherwise pays it twice: once for the baseline vote and once to expand the
+    low-margin tiles to k_expand.
+    """
+    if cache is not None:
+        # Reproduce leave_one_out's own sampling so the cached rows line up with
+        # the query set it would have chosen. Derived here rather than passed in
+        # because a mismatch is silent: every accuracy would be real, just for
+        # different tiles.
+        total = len(reference["vectors"])
+        rng = np.random.default_rng(seed)
+        query_index = (np.arange(total) if sample >= total
+                       else np.sort(rng.choice(total, size=sample, replace=False)))
+        idx_all, dist_all_sq = gather_neighbours(
+            reference, query_index, max(k_base, k_expand), batch, cache)
+        baseline = leave_one_out(reference, sample, k_base, batch, seed,
+                                 distance_weighted=True,
+                                 distance_power=distance_power,
+                                 query_index=query_index,
+                                 neighbours=(idx_all, dist_all_sq))
+    else:
+        idx_all = dist_all_sq = None
+        baseline = leave_one_out(reference, sample, k_base, batch, seed,
+                                 distance_weighted=True,
+                                 distance_power=distance_power)
 
     low_mask = baseline["margins"] < margin_threshold
     if not low_mask.any():
@@ -160,19 +194,25 @@ def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
     runner = baseline["runner_up"][low_mask]
     truth = baseline["truth"][low_mask]
 
-    searcher = Searcher(vectors)
     queries = np.ascontiguousarray(vectors[rows])
-    # k_expand + 1 for the same reason leave_one_out uses k + 1: every tile is
-    # its own nearest neighbour and must be dropped.
-    idx, dist = searcher.search(queries, k_expand + 1)
+    if idx_all is not None:
+        # Already self-excluded, so the low-margin rows of the cached matrix are
+        # exactly what a k_expand search would have returned for them.
+        idx = idx_all[low_mask, :k_expand]
+        dist = np.sqrt(np.maximum(dist_all_sq[low_mask, :k_expand], 0.0))
+    else:
+        searcher = Searcher(vectors)
+        # k_expand + 1 for the same reason leave_one_out uses k + 1: every tile
+        # is its own nearest neighbour and must be dropped.
+        idx, dist = searcher.search(queries, k_expand + 1)
 
-    self_mask = idx == rows[:, None]
-    no_self = ~self_mask.any(axis=1)
-    if no_self.any():
-        self_mask[no_self, -1] = True
-    keep = ~self_mask
-    idx = idx[keep].reshape(len(rows), k_expand)
-    dist = np.sqrt(np.maximum(dist[keep].reshape(len(rows), k_expand), 0.0))
+        self_mask = idx == rows[:, None]
+        no_self = ~self_mask.any(axis=1)
+        if no_self.any():
+            self_mask[no_self, -1] = True
+        keep = ~self_mask
+        idx = idx[keep].reshape(len(rows), k_expand)
+        dist = np.sqrt(np.maximum(dist[keep].reshape(len(rows), k_expand), 0.0))
 
     valid = idx >= 0
     labels_all = np.where(valid, codes[np.where(valid, idx, 0)], -1)
@@ -228,6 +268,93 @@ def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
         "overall_before": baseline["accuracy"],
         "ceiling": (untouched_correct + int(reachable.sum())) / baseline["n"],
     }
+
+
+# What fraction of a band has to be wrong before swapping every tile in it to
+# its runner-up pays off. Swapping fixes the wrong tiles whose truth IS the
+# runner-up, and breaks every tile that was already right:
+#
+#     net per tile = p * r - (1 - p)      p = fraction wrong, r = P(truth is
+#                                         runner-up | wrong) ~ 0.93
+#     net > 0   <=>   p > 1 / (1 + r)
+#
+# At r = 0.93 that is p > 51.8%. The band has to be MAJORITY ERROR. This is the
+# whole reason "the truth is usually the runner-up" does not license taking the
+# runner-up: that 93% is conditioned on already knowing the tile is wrong, which
+# at assignment time is exactly what is unknown.
+def blind_swap_bands(baseline: dict, thresholds=(0.01, 0.02, 0.05, 0.10, 0.15,
+                                                 0.25, 0.50, 0.75)) -> list[dict]:
+    """Per margin band: how wrong it is, and what a blind swap would score.
+
+    Reported cumulatively (margin < t) because that is the shape of rule anyone
+    would actually ship — a single threshold below which the runner-up is taken.
+    """
+    margins, correct = baseline["margins"], baseline["correct"]
+    truth, runner = baseline["truth"], baseline["runner_up"]
+    rows = []
+    for t in thresholds:
+        band = margins < t
+        n = int(band.sum())
+        if not n:
+            rows.append({"threshold": t, "n": 0})
+            continue
+        wrong = ~correct[band]
+        # Swap every tile in the band to its runner-up.
+        fixed = int((wrong & (runner[band] == truth[band])).sum())
+        broke = int(correct[band].sum())
+        rows.append({
+            "threshold": t, "n": n,
+            "share": n / len(margins),
+            "error_rate": float(wrong.mean()),
+            "fixed": fixed, "broke": broke, "net": fixed - broke,
+        })
+    return rows
+
+
+def report_blind_swap(baseline: dict, rows: list[dict]) -> None:
+    """The 'just take the runner-up' idea, priced."""
+    reachable = 1.0 / (1.0 + _RUNNER_UP_SHARE) if _RUNNER_UP_SHARE else 1.0
+    wrong = ~baseline["correct"]
+    n_wrong = int(wrong.sum())
+    if n_wrong:
+        measured = float((baseline["runner_up"][wrong]
+                          == baseline["truth"][wrong]).mean())
+        breakeven = 1.0 / (1.0 + measured)
+    else:
+        measured, breakeven = 0.0, 1.0
+
+    print(f"\n=== Taking the runner-up outright, by margin band ===")
+    print(f"On this sample the true cluster is the runner-up for "
+          f"{measured * 100:.0f}% of the {n_wrong:,} errors. So swapping a whole "
+          f"band pays only where more than {breakeven * 100:.1f}% of that band is "
+          f"already wrong — it fixes {measured * 100:.0f}% of the errors and breaks "
+          f"every tile that was right.")
+    print(f"\n  {'margin <':>9}  {'tiles':>8}  {'of all':>7}  {'wrong':>7}  "
+          f"{'fixed':>6}  {'broke':>6}  {'net':>7}")
+    for row in rows:
+        if not row["n"]:
+            print(f"  {row['threshold']:>9.2f}  {0:>8}       —        —"
+                  f"       —       —        —")
+            continue
+        flag = "  <-- pays" if row["net"] > 0 else ""
+        print(f"  {row['threshold']:>9.2f}  {row['n']:>8,}  "
+              f"{row['share'] * 100:>6.1f}%  {row['error_rate'] * 100:>6.1f}%  "
+              f"{row['fixed']:>6,}  {row['broke']:>6,}  {row['net']:>+7,}{flag}")
+
+    best = max((r for r in rows if r["n"]), key=lambda r: r["net"], default=None)
+    if best is None or best["net"] <= 0:
+        print(f"\n  No band is majority-error, so a blind swap loses everywhere — "
+              f"best is {best['net']:+,} at margin < {best['threshold']:g}. "
+              f"The runner-up being usually right is not usable on its own; it "
+              f"takes a rule that decides WHICH tiles to swap. That is what the "
+              f"tiebreak rules below are, and the ceiling above is what they are "
+              f"chasing." if best else "")
+    else:
+        print(f"\n  Margin < {best['threshold']:g} is {best['error_rate'] * 100:.1f}% "
+              f"wrong, above the {breakeven * 100:.1f}% break-even, so a blind swap "
+              f"there is worth {best['net']:+,} net. Still compare it against the "
+              f"rules below, which should beat it by not swapping the tiles they "
+              f"can tell are already right.")
 
 
 def report(result: dict, margin_threshold: float, k_base: int, k_expand: int) -> None:
@@ -316,6 +443,14 @@ def main() -> None:
     parser.add_argument("--margin-threshold", type=float, default=0.25,
                         help="Only tiles below this vote_margin are re-decided.")
     parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--neighbours-cache", type=Path, default=None,
+                        help="Reuse (or write) a neighbour matrix here — the same "
+                             "file tune_classifier.py caches. The search is the "
+                             "whole cost against the production reference, and "
+                             "this experiment otherwise pays it twice. Must have "
+                             "been built at k_max >= --k-expand for the same "
+                             "--sample and --seed; a mismatch re-searches rather "
+                             "than serving the wrong tiles.")
     parser.add_argument("--flip-margins", type=float, nargs="+", default=list(FLIP_MARGINS),
                         help="How far ahead the runner-up must be before the vote is "
                              "overridden. All are evaluated in one run — the scores are "
@@ -326,7 +461,13 @@ def main() -> None:
     describe_reference(args.reference, reference)
     result = compare(reference, args.sample, args.seed, args.k_base, args.k_expand,
                      args.distance_power, args.margin_threshold, args.batch_size,
-                     flip_margins=tuple(args.flip_margins))
+                     flip_margins=tuple(args.flip_margins),
+                     cache=args.neighbours_cache)
+    # The cheap idea first: is any margin band wrong often enough that taking the
+    # runner-up outright would pay? Answered before the rules, because if it did
+    # pay there would be no need for a rule.
+    baseline = result["baseline"]
+    report_blind_swap(baseline, blind_swap_bands(baseline))
     report(result, args.margin_threshold, args.k_base, args.k_expand)
 
 

@@ -237,6 +237,162 @@ def test_centroids_match_a_direct_mean(tmp_path):
         assert np.allclose(got[code], expected, atol=1e-5), code
 
 
+# --- the cached search must be the same search ---------------------------
+#
+# The cache turns an 18-minute search into nothing, which is only sound if the
+# numbers are identical. If they were not, the cheap path would produce a whole
+# report of plausible figures for a slightly different question.
+
+
+def _without_timing(row: dict) -> dict:
+    return {k: v for k, v in row.items() if k != "elapsed"}
+
+
+def test_the_cached_path_gives_identical_results(tmp_path):
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref)
+    reference = load_reference(ref)
+    cache = tmp_path / "nbr.npz"
+
+    plain = compare(reference, 4000, 0, 10, 30, 2.0, 0.5, 4096)
+    cached = compare(reference, 4000, 0, 10, 30, 2.0, 0.5, 4096, cache=cache)
+    assert cache.is_file(), "the cache was never written"
+    reused = compare(reference, 4000, 0, 10, 30, 2.0, 0.5, 4096, cache=cache)
+
+    for other, label in ((cached, "first cached run"), (reused, "reused cache")):
+        assert other["baseline"]["accuracy"] == plain["baseline"]["accuracy"], label
+        assert np.array_equal(other["baseline"]["query_index"],
+                              plain["baseline"]["query_index"]), label
+        assert np.array_equal(other["baseline"]["predicted"],
+                              plain["baseline"]["predicted"]), label
+        assert other["n_low"] == plain["n_low"], label
+        assert other["reachable"] == plain["reachable"], label
+        for rule in RULES:
+            # Everything but the timing, which is wall-clock and is the one
+            # field the cache is supposed to change.
+            assert _without_timing(other["rules"][rule]) \
+                == _without_timing(plain["rules"][rule]), f"{label}: {rule}"
+
+
+def test_a_cache_too_narrow_for_k_expand_is_refused(tmp_path):
+    """A cache built at k_max=20 cannot answer --k-expand 30. Truncating the
+    'restricted' rule to fewer neighbours than asked for would change its answer
+    while reporting the k that was requested."""
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref)
+    reference = load_reference(ref)
+    cache = tmp_path / "nbr.npz"
+
+    # Seed the cache narrow, by asking for a small k_expand first.
+    compare(reference, 4000, 0, 10, 12, 2.0, 0.5, 4096, cache=cache)
+    stored_width = int(np.load(cache)["idx"].shape[1])
+    assert stored_width == 12
+
+    # Now ask for wider. It must re-search, not serve 12 columns as 30.
+    wide = compare(reference, 4000, 0, 10, 30, 2.0, 0.5, 4096, cache=cache)
+    plain = compare(reference, 4000, 0, 10, 30, 2.0, 0.5, 4096)
+    assert int(np.load(cache)["idx"].shape[1]) == 30, "the cache was not rebuilt"
+    for rule in RULES:
+        assert _without_timing(wide["rules"][rule]) \
+            == _without_timing(plain["rules"][rule]), rule
+
+
+def test_a_cache_from_tune_classifier_is_reused_not_re_searched(tmp_path):
+    """The whole point of the cache: one 18-minute search serves both tools.
+    Both derive the query set from (sample, seed) independently, so if either
+    changes how it samples, this stops being a reuse and becomes a silent
+    re-search — correct, but paying the cost twice with no sign of it."""
+    import io
+    import contextlib
+    import tune_classifier as tc
+
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref)
+    reference = load_reference(ref)
+    cache = tmp_path / "shared.npz"
+
+    # Written by the sweep, at k_max wide enough for the tiebreak's k_expand.
+    tc.sweep(reference, 4000, 0, 30, 4096, [10], [2.0], [0], [0.0], [15],
+             [False], cache)
+    stored = np.load(cache)["query_index"]
+
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+        result = compare(reference, 4000, 0, 10, 30, 2.0, 0.5, 4096, cache=cache)
+    output = captured.getvalue()
+
+    assert "reusing" in output, f"the sweep's cache was not reused:\n{output}"
+    assert "does not match" not in output, output
+    assert np.array_equal(result["baseline"]["query_index"], stored), \
+        "the two tools disagree about which tiles (sample, seed) selects"
+
+
+# --- the blind-swap accounting -------------------------------------------
+#
+# This is the "the truth is usually the runner-up, so just take the runner-up"
+# idea. The 93% it rests on is conditioned on knowing the tile is wrong, which
+# is what assignment does not know, so the accounting has to be explicit.
+
+
+def test_a_blind_swap_breaks_every_correct_tile_in_the_band(tmp_path):
+    """broke must equal the number of correct tiles in the band, exactly.
+    Anything less means the swap is being credited for tiles it did not touch."""
+    from tiebreak_experiment import blind_swap_bands
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref)
+    result = compare(load_reference(ref), 4000, 0, 10, 30, 2.0, 0.5, 4096)
+    baseline = result["baseline"]
+    margins, correct = baseline["margins"], baseline["correct"]
+
+    rows = [r for r in blind_swap_bands(baseline) if r["n"]]
+    assert rows, "no bands had any tiles"
+    for row in rows:
+        band = margins < row["threshold"]
+        assert row["n"] == int(band.sum())
+        assert row["broke"] == int(correct[band].sum())
+        assert row["error_rate"] == float((~correct[band]).mean())
+        # fixed can only ever be errors whose truth was the runner-up.
+        assert row["fixed"] <= int((~correct[band]).sum())
+        assert row["net"] == row["fixed"] - row["broke"]
+
+
+def test_a_blind_swap_only_pays_in_a_majority_error_band(tmp_path):
+    """The break-even. With r = P(truth is runner-up | wrong), net > 0 requires
+    the band to be more than 1/(1+r) wrong. This asserts the arithmetic holds on
+    real bands rather than restating the algebra."""
+    from tiebreak_experiment import blind_swap_bands
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref)
+    result = compare(load_reference(ref), 4000, 0, 10, 30, 2.0, 0.5, 4096)
+    baseline = result["baseline"]
+
+    wrong = ~baseline["correct"]
+    assert wrong.any(), "the fixture has no errors, so this proves nothing"
+    r = float((baseline["runner_up"][wrong] == baseline["truth"][wrong]).mean())
+    breakeven = 1.0 / (1.0 + r)
+
+    paid = [row for row in blind_swap_bands(baseline) if row["n"] and row["net"] > 0]
+    for row in paid:
+        assert row["error_rate"] > breakeven, (
+            f"band margin<{row['threshold']} nets {row['net']:+} at only "
+            f"{row['error_rate']:.1%} error, below the {breakeven:.1%} break-even")
+
+
+def test_bands_are_cumulative_and_monotone(tmp_path):
+    """Reported as margin < t, so tile counts must only grow with t. A per-band
+    (rather than cumulative) reading of the same table would be a different and
+    much more optimistic claim."""
+    from tiebreak_experiment import blind_swap_bands
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref)
+    baseline = compare(load_reference(ref), 4000, 0, 10, 30, 2.0,
+                       0.5, 4096)["baseline"]
+    rows = [r for r in blind_swap_bands(baseline) if r["n"]]
+    counts = [r["n"] for r in rows]
+    assert counts == sorted(counts)
+    assert all(r["broke"] >= 0 and r["fixed"] >= 0 for r in rows)
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

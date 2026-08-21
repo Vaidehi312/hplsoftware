@@ -350,19 +350,40 @@ class TileServerClient:
             {"checkpoint": checkpoint, "model": model, "marker": marker},
         )
 
+    def vote_presets(self) -> dict:
+        """The named vote configurations Stage 4 offers, from the server.
+
+        Not a local constant: a preset is seven numbers and an accuracy figure,
+        and a copy of those in the UI is a copy that drifts. Showing "97.27%"
+        next to something that is no longer that configuration would be exactly
+        the kind of confident wrongness the pipeline guards against elsewhere.
+        """
+        return self._get_json("/vote-presets")
+
     def start_cluster_assignment(
         self,
         submission_id: str,
         reference: str | None = None,
         k: int | None = None,
         overwrite: bool = False,
+        vote_preset: str | None = None,
+        vote_overrides: dict | None = None,
     ) -> dict:
         """User-triggered: assign HPL cluster IDs to this run's embeddings by
         k-NN vote against the reference. Only valid once extraction's
-        projections .h5 validates."""
+        projections .h5 validates.
+
+        vote_preset names which measured configuration to use; the server
+        defaults to the tuned one. vote_overrides adjusts individual settings on
+        top of it — omitted keys keep the preset's value, so a partial override
+        cannot quietly reduce the vote to something never measured.
+        """
+        body = {"reference": reference, "k": k, "overwrite": overwrite}
+        if vote_preset:
+            body["vote_preset"] = vote_preset
+        body.update(vote_overrides or {})
         return self._post_json(
-            f"/dataset-jobs/{submission_id}/assign-clusters",
-            {"reference": reference, "k": k, "overwrite": overwrite},
+            f"/dataset-jobs/{submission_id}/assign-clusters", body,
         )
 
     def start_test_cluster_assignment(
@@ -371,13 +392,18 @@ class TileServerClient:
         projections_h5: str,
         reference: str | None = None,
         k: int | None = None,
+        vote_preset: str | None = None,
+        vote_overrides: dict | None = None,
     ) -> dict:
         """Assign clusters for an arbitrary projections .h5 without recording
         it against the run — so a test attempt can never make the run look
         further along than it is."""
+        body = {"projections_h5": projections_h5, "reference": reference, "k": k}
+        if vote_preset:
+            body["vote_preset"] = vote_preset
+        body.update(vote_overrides or {})
         return self._post_json(
-            f"/dataset-jobs/{submission_id}/assign-clusters-test",
-            {"projections_h5": projections_h5, "reference": reference, "k": k},
+            f"/dataset-jobs/{submission_id}/assign-clusters-test", body,
         )
 
     def preview_kb_load(self, submission_id: str, min_margin: float = 0.0,

@@ -218,6 +218,108 @@ def _import_check_python(reference_in_job: str) -> str:
     )
 
 
+# Named vote configurations. Defined once, here, because the server, the API
+# client and the UI all have to mean the same thing by "the tuned one" -- six
+# loose numbers copied into four places is how a run ends up with five of them
+# right, which produces a complete well-formed CSV of slightly different cluster
+# IDs and nothing to say so.
+#
+# Accuracies are leave-one-out on the production reference
+# (hpc_reference_leiden_2p5_fold2.npz) at 200,000 tiles, seed 0. They are not
+# agreement with Kai's TCGA transfer, which is a different measurement that can
+# move the other way -- see CLASSIFIER_TUNING_2026-08-13.md section 19.
+VOTE_PRESETS: dict[str, dict] = {
+    "tuned": {
+        "label": "Tuned (97.27%)",
+        "accuracy": 0.9727,
+        "summary": "k=10, distance^3, re-vote at k=25 below margin 0.15",
+        "why": (
+            "The settled configuration. Distance weighting at power 3, plus a "
+            "second vote at k=25 for the ~5% of tiles whose first vote was "
+            "nearly tied. Costs no extra search: the wider neighbours come out "
+            "of the same scan."
+        ),
+        "flags": {
+            "k": 10,
+            "distance_weighted": True,
+            "distance_power": 3.0,
+            "class_weighted": False,
+            "local_scaling": 0,
+            "adaptive_margin": 0.15,
+            "adaptive_k": 25,
+        },
+    },
+    "legacy": {
+        "label": "Legacy unweighted (96.78%)",
+        "accuracy": 0.9678,
+        "summary": "plain majority vote at the reference's own n_neighbors",
+        "why": (
+            "What every Stage 4 job submitted before 2026-08-21 actually ran, "
+            "because the submitter forwarded no vote setting at all. Here so an "
+            "existing assignment can be reproduced exactly."
+        ),
+        "flags": {
+            "k": None,
+            "distance_weighted": False,
+            "distance_power": 1.0,
+            "class_weighted": False,
+            "local_scaling": 0,
+            "adaptive_margin": 0.0,
+            "adaptive_k": 0,
+        },
+    },
+}
+
+DEFAULT_VOTE_PRESET = "tuned"
+
+
+def resolve_vote(preset: str | None = None, **overrides) -> dict:
+    """The vote settings for a preset, with any explicit overrides applied.
+
+    Overrides exist for the same reason --reference is exposed in the UI:
+    comparing two configurations is a real thing to want. They are applied on
+    top of a named preset rather than onto bare defaults, so an override always
+    starts from something that was actually measured.
+
+    An override of None means "not specified" and leaves the preset's value
+    alone -- otherwise every optional field in an HTTP request body would erase
+    the preset it was sent alongside.
+    """
+    name = preset or DEFAULT_VOTE_PRESET
+    if name not in VOTE_PRESETS:
+        raise SystemExit(
+            f"Unknown vote preset {name!r}. Known: "
+            f"{', '.join(sorted(VOTE_PRESETS))}."
+        )
+    resolved = dict(VOTE_PRESETS[name]["flags"])
+    unknown = set(overrides) - set(resolved)
+    if unknown:
+        raise SystemExit(
+            f"Not vote settings: {sorted(unknown)}. "
+            f"Known: {sorted(resolved)}."
+        )
+    for key, value in overrides.items():
+        if value is not None:
+            resolved[key] = value
+    return resolved
+
+
+def describe_vote(resolved: dict, preset: str | None = None) -> str:
+    """One line naming the configuration, for a run record and a UI caption.
+
+    Says which preset it came from AND whether it still matches it, because a
+    preset name alone would be a lie once anything was overridden.
+    """
+    name = preset or DEFAULT_VOTE_PRESET
+    flags = " ".join(vote_flags(**resolved)) or "(plain unweighted vote)"
+    k = resolved.get("k")
+    detail = f"k={k}" if k is not None else "k=reference n_neighbors"
+    matches = (name in VOTE_PRESETS
+               and resolved == VOTE_PRESETS[name]["flags"])
+    suffix = "" if matches else " (modified)"
+    return f"{name}{suffix}: {detail} {flags}".strip()
+
+
 def vote_flags(
     *,
     k: int | None,
@@ -406,15 +508,22 @@ def submit_cluster_assignment_job(
     validate_against: Path | None = None,
     shards: int = 1,
     centering: str = "query",
-    # The vote. Defaults are what Stage 4 has always run, so nothing changes
-    # for an existing caller; the measured configuration is opt-in until the
-    # end-to-end acceptance test has been run at it.
-    distance_weighted: bool = False,
-    distance_power: float = 1.0,
-    class_weighted: bool = False,
-    local_scaling: int = 0,
-    adaptive_margin: float = 0.0,
-    adaptive_k: int = 0,
+    # The vote, as a named preset plus optional overrides. A preset rather than
+    # six loose numbers because a partially-applied vote configuration is this
+    # codebase's signature failure: it produces a complete, well-formed CSV of
+    # slightly different cluster IDs, and nothing downstream can tell.
+    #
+    # None means "legacy", not "tuned", so no existing caller changes behaviour
+    # by being upgraded. The UI and the server endpoints ask for "tuned"
+    # explicitly, which is what makes the change visible at the call site.
+    vote_preset: str | None = None,
+    k_override: int | None = None,
+    distance_weighted: bool | None = None,
+    distance_power: float | None = None,
+    class_weighted: bool | None = None,
+    local_scaling: int | None = None,
+    adaptive_margin: float | None = None,
+    adaptive_k: int | None = None,
     partition: str = MERGE_PARTITION,
     cpus: int = 16,
     memory: str = "64G",
@@ -438,8 +547,14 @@ def submit_cluster_assignment_job(
 
     # First, before any filesystem or Slurm work: an inert or contradictory
     # vote configuration is a refusal, not something to discover in a log.
-    vote = vote_flags(
-        k=k,
+    #
+    # `k` is both a plain argument of this function and part of a vote preset,
+    # so it needs one resolution order rather than two: an explicit k always
+    # wins, then k_override, then the preset's. Without this a caller passing
+    # k=15 alongside the tuned preset would silently get the preset's k=10.
+    resolved_vote = resolve_vote(
+        vote_preset or "legacy",
+        k=k if k is not None else k_override,
         distance_weighted=distance_weighted,
         distance_power=distance_power,
         class_weighted=class_weighted,
@@ -447,6 +562,9 @@ def submit_cluster_assignment_job(
         adaptive_margin=adaptive_margin,
         adaptive_k=adaptive_k,
     )
+    k = resolved_vote["k"]
+    vote = vote_flags(**resolved_vote)
+    vote_description = describe_vote(resolved_vote, vote_preset or "legacy")
 
     # Skipped when chained: the file will not exist yet, because the job that
     # writes it has not run. The dependency is what guarantees it later.
@@ -588,6 +706,8 @@ def submit_cluster_assignment_job(
         # Recording the flags here at least puts them in the run record next to
         # the job ID that produced the file.
         "vote_flags": " ".join(vote),
+        "vote_preset": vote_preset or "legacy",
+        "vote": vote_description,
         **reference_info,
     }
 
@@ -664,28 +784,41 @@ def build_parser() -> argparse.ArgumentParser:
                              f"path build_hpc_reference.py writes.")
     parser.add_argument("--depends-on-job-id", type=str, default=None)
     parser.add_argument("--rep-key", type=str, default="z_latent")
-    parser.add_argument("--distance-weighted", action="store_true",
+    parser.add_argument("--vote-preset", default="legacy",
+                        choices=sorted(VOTE_PRESETS),
+                        help="Named vote configuration. "
+                             + "; ".join(f"{name}: {spec['summary']}"
+                                         for name, spec in sorted(VOTE_PRESETS.items()))
+                             + ". Defaults to legacy so this CLI keeps doing "
+                               "what it did; the UI asks for tuned explicitly.")
+    # Overrides. None means "leave the preset alone", so an unset flag cannot
+    # silently erase the preset it was passed alongside.
+    parser.add_argument("--distance-weighted", dest="distance_weighted",
+                        action="store_true", default=None,
                         help="Weight each neighbour by 1/(distance+eps)**power "
-                             "instead of one vote each. Not forwarded to the "
-                             "Slurm job at all before now, so every Stage 4 run "
-                             "so far used the plain unweighted vote.")
-    parser.add_argument("--distance-power", type=float, default=1.0,
-                        help="Exponent on the distance weight. Needs "
-                             "--distance-weighted; refused without it, since it "
-                             "would otherwise be silently ignored.")
-    parser.add_argument("--class-weighted", action="store_true",
+                             "instead of one vote each. Overrides the preset.")
+    parser.add_argument("--no-distance-weighted", dest="distance_weighted",
+                        action="store_false",
+                        help="Force the plain unweighted vote even under a "
+                             "preset that weights.")
+    parser.add_argument("--distance-power", type=float, default=None,
+                        help="Exponent on the distance weight. Needs distance "
+                             "weighting on; refused without it, since it would "
+                             "otherwise be silently ignored.")
+    parser.add_argument("--class-weighted", dest="class_weighted",
+                        action="store_true", default=None,
                         help="Also scale each neighbour's vote by 1/(its "
-                             "cluster's reference count).")
-    parser.add_argument("--local-scaling", type=int, default=0, metavar="R",
+                             "cluster's reference count). Never measured to help.")
+    parser.add_argument("--local-scaling", type=int, default=None, metavar="R",
                         help="Judge distances relative to each neighbour's own "
                              "local density (its R-th nearest reference point).")
-    parser.add_argument("--adaptive-margin", type=float, default=0.0,
+    parser.add_argument("--adaptive-margin", type=float, default=None,
                         metavar="MARGIN",
                         help="Re-vote tiles whose base-k margin falls below this "
-                             "at the wider --adaptive-k. Needs an explicit --k.")
-    parser.add_argument("--adaptive-k", type=int, default=0, metavar="K",
+                             "at the wider --adaptive-k. Needs an explicit k.")
+    parser.add_argument("--adaptive-k", type=int, default=None, metavar="K",
                         help="The wider neighbourhood low-margin tiles are "
-                             "re-voted at. Must exceed --k.")
+                             "re-voted at. Must exceed k.")
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
@@ -723,6 +856,7 @@ def main() -> None:
             validate_against=args.validate_against,
             shards=args.shards,
             centering=args.centering,
+            vote_preset=args.vote_preset,
             distance_weighted=args.distance_weighted,
             distance_power=args.distance_power,
             class_weighted=args.class_weighted,

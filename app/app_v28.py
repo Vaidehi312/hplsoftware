@@ -2341,6 +2341,13 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
         st.code(status.get("assignment_output_path"), language=None)
         if status.get("assignment_reference"):
             st.caption(f"Reference: {status['assignment_reference']}")
+        # Which vote produced it. Surfaced here because the CSV cannot carry it
+        # — Stage 5 finds its cluster column by elimination, so an extra column
+        # there would break the load. Absent for runs assigned before this was
+        # recorded, and for deployments without
+        # migrate_dataset_runs_assignment_vote.sql applied.
+        if status.get("assignment_vote"):
+            st.caption(f"Vote: {status['assignment_vote']}")
         return
 
     if state == "blocked":
@@ -2373,6 +2380,100 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
     )
 
 
+def _render_vote_picker(submission_id: str, key_prefix: str) -> tuple[str, dict]:
+    """Which vote Stage 4 should use. Returns (preset name, overrides).
+
+    A preset list rather than seven number inputs. The vote decides every
+    cluster ID in the output, and a half-applied configuration — distance
+    weighting on but the exponent left at 1, an adaptive margin with no wider k
+    — produces a complete, well-formed CSV that is simply not the thing that was
+    measured. Presets make that unreachable by accident, and the server refuses
+    the combinations that are inert anyway.
+
+    Fetched from the server rather than listed here: the numbers and the
+    accuracy beside them live in submit_cluster_assignment.py, and a second copy
+    in the UI is a copy that drifts.
+    """
+    try:
+        served = client.vote_presets()
+    except Exception as e:
+        # The picker is not worth blocking the stage over. Without it the server
+        # applies its own default, which is the tuned configuration.
+        st.caption(f"Could not load vote presets ({e}); the server's default will be used.")
+        return "", {}
+
+    presets = served.get("presets") or {}
+    if not presets:
+        return "", {}
+
+    # Best accuracy first, so the recommended one is the one already selected.
+    names = sorted(presets, key=lambda n: -(presets[n].get("accuracy") or 0))
+    default = served.get("default")
+    index = names.index(default) if default in names else 0
+
+    chosen = st.radio(
+        "Vote",
+        names,
+        index=index,
+        horizontal=True,
+        format_func=lambda n: presets[n].get("label") or n,
+        key=f"{key_prefix}assign_vote_{submission_id}",
+        help="How the k-NN vote is weighted. This changes the cluster ID of "
+             "every tile, so two runs under different votes are not "
+             "comparable and must not be mixed in the Knowledge Bank.",
+    )
+    spec = presets[chosen]
+    st.caption(spec.get("summary", ""))
+    with st.expander("What this means", expanded=False):
+        st.write(spec.get("why", ""))
+        accuracy = spec.get("accuracy")
+        if accuracy:
+            st.caption(
+                f"{accuracy * 100:.2f}% leave-one-out on the production "
+                f"reference at 200,000 tiles (seed 0). That measures recovery of "
+                f"the reference's own Leiden labels — not agreement with the "
+                f"original TCGA transfer, which is a separate check that can "
+                f"move the other way."
+            )
+
+    overrides: dict = {}
+    with st.expander("Override individual settings", expanded=False):
+        st.caption(
+            "Starts from the preset above and changes only what you touch. For "
+            "comparing configurations — anything other than a preset as-is is "
+            "not a measured setting."
+        )
+        flags = spec.get("flags") or {}
+        for field, label in (
+            ("distance_power", "Distance exponent"),
+            ("adaptive_margin", "Re-vote below this margin (0 = off)"),
+            ("adaptive_k", "Re-vote at this k (0 = off)"),
+        ):
+            current = flags.get(field)
+            if current is None:
+                continue
+            entered = st.text_input(
+                f"{label} — preset uses {current:g}",
+                value="",
+                key=f"{key_prefix}assign_vote_{field}_{submission_id}",
+                placeholder=f"{current:g}",
+            )
+            if not entered.strip():
+                continue
+            try:
+                value = float(entered)
+            except ValueError:
+                st.error(f"{label}: '{entered}' is not a number — ignoring it.")
+                continue
+            overrides[field] = int(value) if field == "adaptive_k" else value
+        if overrides:
+            st.warning(
+                "Overridden: " + ", ".join(f"{k}={v:g}" for k, v in overrides.items())
+                + ". This is no longer the measured configuration."
+            )
+    return chosen, overrides
+
+
 def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: str,
                                  button_label: str = "Start cluster assignment",
                                  full_available: bool = True):
@@ -2396,6 +2497,11 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
         index=0 if full_available else 1,
         key=f"{key_prefix}assign_mode_{submission_id}",
     )
+
+    # The vote, chosen by name and shown outside the Options expander. It
+    # changes every cluster ID in the output, so it is not an option — it is the
+    # second thing about this run worth knowing, after which reference.
+    preset_name, overrides = _render_vote_picker(submission_id, key_prefix)
 
     with st.expander("Options", expanded=False):
         reference = st.text_input(
@@ -2435,15 +2541,23 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
             if not projections.strip():
                 st.error("Enter the projections .h5 to assign.")
                 return
-            client.start_test_cluster_assignment(
-                submission_id, projections.strip(), reference=ref
+            result = client.start_test_cluster_assignment(
+                submission_id, projections.strip(), reference=ref,
+                vote_preset=preset_name, vote_overrides=overrides,
             )
             st.success("Test cluster assignment queued (not recorded against this run).")
         else:
-            client.start_cluster_assignment(
-                submission_id, reference=ref, overwrite=True
+            result = client.start_cluster_assignment(
+                submission_id, reference=ref, overwrite=True,
+                vote_preset=preset_name, vote_overrides=overrides,
             )
             st.success("Cluster assignment job queued.")
+        # Echo back the vote the server actually resolved, not the one this form
+        # thinks it asked for. An override that was dropped, or a preset that
+        # resolved to something else, is worth seeing now rather than inferring
+        # from cluster IDs later.
+        if result.get("vote"):
+            st.caption(f"Vote: {result['vote']}")
         st.rerun()
     except requests.exceptions.HTTPError as e:
         detail = e.response.text if e.response is not None else str(e)

@@ -609,6 +609,243 @@ def test_the_slurm_command_actually_carries_the_vote_flags(tmp_path):
                  "--local-scaling"):
         assert flag not in plain
 
+# --- the named vote presets ----------------------------------------------
+#
+# The presets are what makes the tuned configuration one click instead of seven
+# numbers typed correctly. Their whole value is that the server, the API client
+# and the UI cannot disagree about what "tuned" means, so these pin the numbers
+# and the wiring rather than the plumbing.
+
+
+def test_the_tuned_preset_is_the_configuration_that_was_measured(tmp_path):
+    """97.27% was measured for exactly these settings. If a preset drifts from
+    them, the UI goes on displaying the accuracy of a configuration it is no
+    longer running — which is worse than displaying nothing."""
+    from submit_cluster_assignment import VOTE_PRESETS
+    assert VOTE_PRESETS["tuned"]["flags"] == {
+        "k": 10,
+        "distance_weighted": True,
+        "distance_power": 3.0,
+        "class_weighted": False,
+        "local_scaling": 0,
+        "adaptive_margin": 0.15,
+        "adaptive_k": 25,
+    }
+    # 0.15, not 0.1: the sweep's original grid was 0/0.10/0.25 and could not see
+    # its own optimum.
+    assert VOTE_PRESETS["tuned"]["flags"]["adaptive_margin"] == 0.15
+
+
+def test_the_legacy_preset_is_what_stage_4_used_to_run(tmp_path):
+    """It exists to reproduce an existing assignment exactly, so it has to be
+    the plain unweighted vote and produce no flags at all."""
+    from submit_cluster_assignment import VOTE_PRESETS, resolve_vote, vote_flags
+    assert vote_flags(**resolve_vote("legacy")) == []
+
+
+def test_every_preset_resolves_to_a_usable_configuration(tmp_path):
+    """A preset that vote_flags refuses would be a one-click refusal. Checked
+    for all of them so a new preset cannot be added inert."""
+    from submit_cluster_assignment import VOTE_PRESETS, resolve_vote, vote_flags
+    for name, spec in VOTE_PRESETS.items():
+        vote_flags(**resolve_vote(name))          # must not raise
+        for field in ("label", "accuracy", "summary", "why", "flags"):
+            assert spec.get(field), f"{name} has no {field}"
+        assert 0.5 < spec["accuracy"] < 1.0, name
+
+
+def test_an_unset_override_does_not_erase_the_preset(tmp_path):
+    """Every override arrives from an HTTP body where absent fields are None.
+    If None meant "set to None" rather than "not specified", sending a preset
+    with no overrides would strip it down to nothing."""
+    from submit_cluster_assignment import VOTE_PRESETS, resolve_vote
+    everything_none = dict.fromkeys(VOTE_PRESETS["tuned"]["flags"], None)
+    assert resolve_vote("tuned", **everything_none) == VOTE_PRESETS["tuned"]["flags"]
+
+
+def test_an_override_applies_on_top_of_the_preset(tmp_path):
+    from submit_cluster_assignment import resolve_vote
+    tuned = resolve_vote("tuned")
+    changed = resolve_vote("tuned", adaptive_margin=0.1)
+    assert changed["adaptive_margin"] == 0.1
+    assert {k: v for k, v in changed.items() if k != "adaptive_margin"} \
+        == {k: v for k, v in tuned.items() if k != "adaptive_margin"}
+
+
+def test_an_unknown_preset_and_an_unknown_setting_are_both_refused(tmp_path):
+    from submit_cluster_assignment import resolve_vote
+    try:
+        resolve_vote("whatever-sounds-good")
+    except SystemExit as e:
+        assert "Unknown vote preset" in str(e)
+    else:
+        raise AssertionError("an unknown preset must be refused")
+
+    try:
+        resolve_vote("tuned", distnace_power=3.0)   # typo, deliberately
+    except SystemExit as e:
+        assert "Not vote settings" in str(e), str(e)
+    else:
+        raise AssertionError("a misspelled setting must be refused, not ignored")
+
+
+def test_describe_vote_says_when_a_preset_was_modified(tmp_path):
+    """The run record's one line about the vote. A preset name alone would be a
+    lie the moment anything was overridden, and that line is the only place two
+    CSVs from one reference but different votes can be told apart."""
+    from submit_cluster_assignment import describe_vote, resolve_vote
+    plain = describe_vote(resolve_vote("tuned"), "tuned")
+    assert plain.startswith("tuned:") and "modified" not in plain
+    assert "--adaptive-margin 0.15" in plain
+
+    modified = describe_vote(resolve_vote("tuned", adaptive_margin=0.1), "tuned")
+    assert "(modified)" in modified
+    assert "--adaptive-margin 0.1 " in modified + " "
+
+
+def test_an_explicit_k_beats_the_presets_k(tmp_path):
+    """k is both a plain argument of the submitter and part of a preset. Two
+    resolution paths would mean a caller passing k=15 with the tuned preset
+    silently getting the preset's 10."""
+    from submit_cluster_assignment import resolve_vote
+    assert resolve_vote("tuned", k=15)["k"] == 15
+    assert resolve_vote("tuned", k=None)["k"] == 10
+
+
+def test_the_presets_reach_the_slurm_command(tmp_path):
+    """A preset that resolves correctly and never reaches the command line
+    would be the same bug as before, one level up."""
+    from submit_cluster_assignment import (_build_assignment_command,
+                                           resolve_vote, vote_flags)
+    common = dict(
+        singularity_bin="singularity", singularity_image=tmp_path / "i.sif",
+        extras_dir=tmp_path / "extras",
+        assign_script=BACKEND / "assign_hpc_clusters.py",
+        reference=tmp_path / "ref.npz", projections_h5=tmp_path / "q.h5",
+        out_csv=tmp_path / "out.csv", rep_key="z_latent",
+        batch_size=16_384, validate_against=None,
+    )
+    tuned = resolve_vote("tuned")
+    command = _build_assignment_command(
+        k=tuned["k"], vote=vote_flags(**tuned), **common)
+    for flag in ("--k 10", "--distance-weighted", "--distance-power 3",
+                 "--adaptive-margin 0.15", "--adaptive-k 25"):
+        assert flag in command, f"{flag} never reached the Slurm command"
+
+    legacy = resolve_vote("legacy")
+    plain = _build_assignment_command(
+        k=legacy["k"], vote=vote_flags(**legacy), **common)
+    for flag in ("--distance-weighted", "--adaptive-margin", "--class-weighted",
+                 "--local-scaling", "--k "):
+        assert flag not in plain, f"legacy must not pass {flag}"
+
+
+# --- the server / client / UI contract -----------------------------------
+#
+# Four modules have to agree about the vote: the submitter defines it, the
+# server forwards it, the client sends it, the UI displays it. Each seam fails
+# differently and none fails visibly, so each is pinned here. These import
+# tile_server_v2_, which is heavy but does import cleanly; if that ever stops
+# being true these tests say so loudly rather than being skipped.
+
+
+def test_the_servers_vote_kwargs_are_all_accepted_by_the_submitter(tmp_path):
+    """The seam that would 500 at submit time. The server unpacks vote_kwargs()
+    into submit_cluster_assignment_job, so a key it does not accept is a
+    TypeError on a real submission and on nothing before it."""
+    import inspect
+    import tile_server_v2_ as srv
+    from submit_cluster_assignment import submit_cluster_assignment_job
+
+    accepted = set(inspect.signature(submit_cluster_assignment_job).parameters)
+    sent = set(srv.ClusterAssignmentRequest().vote_kwargs())
+    assert sent <= accepted, f"the server sends {sorted(sent - accepted)}, which "\
+                             f"submit_cluster_assignment_job does not accept"
+
+
+def test_the_server_defaults_to_the_tuned_preset(tmp_path):
+    """The submitter defaults to legacy so no programmatic caller changes
+    behaviour by being upgraded; the request model defaults to tuned so the UI
+    queues the measured configuration. Both halves matter, so both are pinned."""
+    import inspect
+    import tile_server_v2_ as srv
+    from submit_cluster_assignment import (DEFAULT_VOTE_PRESET,
+                                           submit_cluster_assignment_job)
+
+    assert srv.ClusterAssignmentRequest().vote_preset == DEFAULT_VOTE_PRESET == "tuned"
+    # The test endpoint's model inherits it, so a sample run and a full run
+    # cannot silently use different votes.
+    assert srv.ClusterAssignmentTestRequest(
+        projections_h5="/x.h5").vote_preset == "tuned"
+    submitter_default = inspect.signature(
+        submit_cluster_assignment_job).parameters["vote_preset"].default
+    assert submitter_default is None, (
+        "the submitter must not default to a preset — an existing caller would "
+        "change behaviour just by being upgraded")
+
+
+def test_the_served_presets_carry_everything_the_ui_displays(tmp_path):
+    """The UI reads label/accuracy/summary/why/flags off this payload and shows
+    an accuracy figure next to a named configuration. A field missing here is a
+    blank caption; a field wrong here is a confident lie."""
+    import tile_server_v2_ as srv
+    from submit_cluster_assignment import VOTE_PRESETS
+
+    served = srv.list_vote_presets()
+    assert served["default"] in served["presets"]
+    assert set(served["presets"]) == set(VOTE_PRESETS)
+    for name, spec in served["presets"].items():
+        for field in ("label", "accuracy", "summary", "why", "flags"):
+            assert spec.get(field), f"{name} is missing {field}"
+        # And it must be the same numbers, not a copy that has drifted.
+        assert spec["flags"] == VOTE_PRESETS[name]["flags"]
+    # The UI's override inputs read these three off flags and format them with
+    # :g, so they have to be numbers rather than None.
+    tuned = served["presets"]["tuned"]["flags"]
+    for field in ("distance_power", "adaptive_margin", "adaptive_k"):
+        assert isinstance(tuned[field], (int, float)), field
+
+
+def test_the_api_client_sends_the_preset_and_the_overrides(tmp_path):
+    """Checked on the request body the client builds, because the UI passes the
+    preset and overrides separately and a dropped one is invisible: the server
+    would apply its default and the run would look fine."""
+    import sys
+    sys.path.insert(0, str(BACKEND.parent / "app"))
+    import api_client
+
+    sent = {}
+
+    class _Spy(api_client.TileServerClient):
+        def __init__(self):
+            pass
+
+        def _post_json(self, path, body, **kw):
+            sent["path"], sent["body"] = path, body
+            return {}
+
+    _Spy().start_cluster_assignment(
+        "run1", reference=None, overwrite=True,
+        vote_preset="tuned", vote_overrides={"adaptive_margin": 0.1})
+    assert sent["path"].endswith("/assign-clusters")
+    assert sent["body"]["vote_preset"] == "tuned"
+    assert sent["body"]["adaptive_margin"] == 0.1
+    assert sent["body"]["overwrite"] is True
+
+    # No preset and no overrides must leave the body clean, so the server's own
+    # default applies rather than a null overriding it.
+    _Spy().start_cluster_assignment("run1")
+    assert "vote_preset" not in sent["body"]
+    assert not any(k.startswith("adaptive") for k in sent["body"])
+
+    # And the test path carries it too, or a sample run would use a different
+    # vote from the full run it is meant to preview.
+    _Spy().start_test_cluster_assignment(
+        "run1", "/x.h5", vote_preset="legacy")
+    assert sent["path"].endswith("/assign-clusters-test")
+    assert sent["body"]["vote_preset"] == "legacy"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

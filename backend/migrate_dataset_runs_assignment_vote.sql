@@ -1,0 +1,25 @@
+-- ============================================================
+-- Which vote produced a run's cluster assignments.
+-- Run once on the HPCC PostgreSQL instance, after migrate_dataset_runs_assignment.sql.
+--
+-- Same reason kb_load_reference exists. A cluster ID is only meaningful
+-- relative to one reference AND one vote configuration, and until 2026-08-21
+-- Stage 4 could only ever run one vote (the plain unweighted one, because
+-- submit_cluster_assignment.py forwarded no vote setting at all). Now that it
+-- can run several, two assignment CSVs from the same reference are no longer
+-- interchangeable and nothing in the CSV distinguishes them --
+-- load_hpc_assignments.py identifies the cluster column by elimination, so an
+-- extra column there would break Stage 5.
+--
+-- Nullable with no default on purpose. NULL means "assigned before this was
+-- recorded", which is a different fact from any particular vote, and
+-- backfilling it with 'legacy' would turn an unknown into a claim. Every such
+-- run did in fact use the legacy vote, but that is inference, not record.
+--
+-- The server writes this best-effort and separately from the columns the UI
+-- gates on: a run whose sbatch succeeded must not report failure because a
+-- bookkeeping column is missing. So the pipeline keeps working without this
+-- migration -- the vote simply is not shown.
+-- ============================================================
+
+ALTER TABLE slurm_dataset_runs ADD COLUMN IF NOT EXISTS assignment_vote TEXT;

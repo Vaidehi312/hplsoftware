@@ -85,7 +85,11 @@ from submit_feature_extraction import (
     HPL_REPO_DIR,
 )
 
-from submit_cluster_assignment import submit_cluster_assignment_job
+from submit_cluster_assignment import (
+    DEFAULT_VOTE_PRESET,
+    VOTE_PRESETS,
+    submit_cluster_assignment_job,
+)
 
 from load_hpc_assignments import (
     read_assignments as _read_kb_assignments,
@@ -1838,6 +1842,31 @@ def list_dataset_roots():
     return {"root": str(LONG_TERM_SCRATCH), "datasets": _list_dataset_roots()}
 
 
+@app.get("/vote-presets")
+def list_vote_presets():
+    """The named vote configurations Stage 4 can run, for the UI to offer.
+
+    Served rather than hardcoded in the UI for the same reason they live in one
+    module: a preset is seven numbers, and a second copy of them is a copy that
+    can drift. The UI showing "97.27%" beside a configuration that is no longer
+    that configuration is precisely the kind of confidently-wrong display this
+    codebase is written against.
+    """
+    return {
+        "default": DEFAULT_VOTE_PRESET,
+        "presets": {
+            name: {
+                "label": spec["label"],
+                "accuracy": spec["accuracy"],
+                "summary": spec["summary"],
+                "why": spec["why"],
+                "flags": spec["flags"],
+            }
+            for name, spec in VOTE_PRESETS.items()
+        },
+    }
+
+
 @app.get("/tile-dataset-names")
 def list_tile_dataset_names():
     """Existing folders directly under PROCESSED_TILES_DIR, e.g. ["TCGA",
@@ -2057,6 +2086,25 @@ def _update_dataset_run(submission_id: str, **fields):
             text(f"UPDATE slurm_dataset_runs SET {set_clause} WHERE submission_id = :submission_id"),
             {**fields, "submission_id": submission_id},
         )
+
+
+def _update_dataset_run_best_effort(submission_id: str, **fields) -> None:
+    """Like _update_dataset_run, but a missing column is a caption the UI does
+    not get rather than a failed request.
+
+    For bookkeeping columns added by a migration that may not have been applied
+    yet. Every caller is on the far side of a successful sbatch, so the same
+    rule as _record_run_job applies: telling the caller nothing was queued while
+    the job runs anyway is worse than a gap in the record. The failure is logged
+    rather than swallowed, so a missing migration is findable.
+    """
+    try:
+        _update_dataset_run(submission_id, **fields)
+    except Exception as e:
+        print(f"[run {submission_id}] could not record {list(fields)}: {e}. "
+              f"If this is an undefined column, apply the matching "
+              f"backend/migrate_*.sql; the run itself is unaffected.",
+              flush=True)
 
 
 def _effective_h5_dataset_name(base_name: str, is_subset: bool) -> str:
@@ -3843,6 +3891,31 @@ class ClusterAssignmentRequest(BaseModel):
     k: int | None = None
     overwrite: bool = False
 
+    # Which vote to use, by name. Defaults to the tuned one here rather than in
+    # submit_cluster_assignment_job, so that queueing the measured
+    # configuration is explicit in the request while no programmatic caller of
+    # the submitter changes behaviour just by being upgraded.
+    vote_preset: str = DEFAULT_VOTE_PRESET
+    # Overrides on the preset. None means "leave the preset alone" — an unset
+    # field in a JSON body must not erase the preset it was sent with.
+    distance_weighted: bool | None = None
+    distance_power: float | None = None
+    class_weighted: bool | None = None
+    local_scaling: int | None = None
+    adaptive_margin: float | None = None
+    adaptive_k: int | None = None
+
+    def vote_kwargs(self) -> dict:
+        return {
+            "vote_preset": self.vote_preset,
+            "distance_weighted": self.distance_weighted,
+            "distance_power": self.distance_power,
+            "class_weighted": self.class_weighted,
+            "local_scaling": self.local_scaling,
+            "adaptive_margin": self.adaptive_margin,
+            "adaptive_k": self.adaptive_k,
+        }
+
 
 class ClusterAssignmentTestRequest(ClusterAssignmentRequest):
     # An arbitrary projections .h5, typically the one a test extraction wrote.
@@ -3913,10 +3986,17 @@ def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentReque
                 notify_email=row["notify_email"],
                 job_name=f"hpl_assign_{submission_id}",
                 overwrite=True,  # decided above; the stage is cheap to redo
+                **req.vote_kwargs(),
             )
         except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
             # Same split as the other stages: a missing reference or an input
             # that isn't a projections file is the user's to fix, not a fault.
+            raise HTTPException(400, str(e))
+        except SystemExit as e:
+            # resolve_vote/vote_flags refuse an unknown preset or a combination
+            # that cannot do anything. That is the caller's to fix, and it must
+            # not surface as a 500 — the whole point of refusing before the
+            # queue is that the reason reaches whoever asked.
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(500, f"Failed to submit cluster assignment job: {e}")
@@ -3927,6 +4007,13 @@ def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentReque
             assignment_output_path=result.get("out_csv"),
             assignment_reference=result.get("reference_path"),
         )
+        # Separate call, best-effort: this column arrives with
+        # migrate_dataset_runs_assignment_vote.sql, and folding it into the
+        # update above would make an unapplied migration lose the job id the
+        # whole stage gates on.
+        _update_dataset_run_best_effort(
+            submission_id, assignment_vote=result.get("vote"),
+        )
         _record_run_job(
             submission_id, "assignment", result.get("assignment_job_id"),
             output_path=result.get("out_csv"),
@@ -3934,6 +4021,14 @@ def start_cluster_assignment_job(submission_id: str, req: ClusterAssignmentReque
                 "reference": result.get("reference_path"),
                 "reference_rows": result.get("reference_rows"),
                 "n_clusters": result.get("n_clusters"),
+                # Which vote produced this CSV. The CSV itself cannot carry it:
+                # load_hpc_assignments.py identifies the cluster column by
+                # elimination, so an extra column there breaks Stage 5. This is
+                # the only place two CSVs from one reference but different votes
+                # are distinguishable.
+                "vote": result.get("vote"),
+                "vote_preset": result.get("vote_preset"),
+                "vote_flags": result.get("vote_flags"),
             },
         )
         return {"submission_id": submission_id, **result}
@@ -3962,8 +4057,11 @@ def start_test_cluster_assignment_job(submission_id: str, req: ClusterAssignment
             k=req.k,
             job_name=f"hpl_assign_test_{submission_id}",
             overwrite=True,
+            **req.vote_kwargs(),
         )
     except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+        raise HTTPException(400, str(e))
+    except SystemExit as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, f"Failed to submit test cluster assignment job: {e}")
@@ -3971,7 +4069,10 @@ def start_test_cluster_assignment_job(submission_id: str, req: ClusterAssignment
     _record_run_job(
         submission_id, "assignment_test", result.get("assignment_job_id"),
         output_path=result.get("out_csv"),
-        params={"projections_h5": str(projections), "reference": result.get("reference_path")},
+        params={"projections_h5": str(projections),
+                "reference": result.get("reference_path"),
+                "vote": result.get("vote"),
+                "vote_preset": result.get("vote_preset")},
     )
     return {"submission_id": submission_id, **result}
 
@@ -4612,6 +4713,9 @@ def dataset_job_status(submission_id: str):
         base["assignment_slurm_state"] = asg_state
         base["assignment_output_path"] = row.get("assignment_output_path")
         base["assignment_reference"] = row.get("assignment_reference")
+        # .get, so a deployment that has not applied
+        # migrate_dataset_runs_assignment_vote.sql reports None rather than 500.
+        base["assignment_vote"] = row.get("assignment_vote")
         if not base["assignment_ready"] and asg_path and asg_path.is_file():
             base["assignment_invalid_reason"] = _validate_assignment_output(asg_path)[1] or None
 

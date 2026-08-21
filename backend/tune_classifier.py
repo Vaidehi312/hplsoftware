@@ -166,7 +166,14 @@ def mcnemar(baseline_correct: np.ndarray, correct: np.ndarray) -> dict:
 
 def sweep(reference: dict, sample: int, seed: int, k_max: int, batch: int,
           ks, powers, scalings, adaptives, adaptive_ks,
-          class_weightings, cache: Path | None = None) -> list[dict]:
+          class_weightings, cache: Path | None = None
+          ) -> tuple[list[dict], float]:
+    """(one row per configuration, the baseline's accuracy).
+
+    The baseline comes back alongside the rows because it is not one of them:
+    it is scored whether or not the swept grid includes it, and every delta and
+    McNemar figure in the rows is relative to it.
+    """
     vectors, codes = reference["vectors"], reference["codes"]
     n_clusters = len(reference["categories"])
     total = len(vectors)
@@ -230,9 +237,10 @@ def sweep(reference: dict, sample: int, seed: int, k_max: int, batch: int,
     baseline_config = dict(BASELINE, adaptive_k=adaptive_ks[0])
     baseline_correct, _ = score(idx, dist, codes, n_clusters, truth,
                                 baseline_config, local_scales, class_weights)
+    baseline_accuracy = float(baseline_correct.mean())
     print(f"Baseline  : k={BASELINE['k']}, distance^{BASELINE['distance_power']:g}, "
           f"no local scaling, no adaptive k -> "
-          f"{baseline_correct.mean() * 100:.2f}%")
+          f"{baseline_accuracy * 100:.2f}%")
 
     results = []
     for config in configs:
@@ -240,7 +248,12 @@ def sweep(reference: dict, sample: int, seed: int, k_max: int, batch: int,
                            local_scales, class_weights)
         results.append({**config, "accuracy": float(correct.mean()),
                         **mcnemar(baseline_correct, correct)})
-    return results
+    # Returned rather than looked up again from `results`. The baseline is scored
+    # here unconditionally, but it is only *in* results when the swept grid
+    # happens to contain it -- so narrowing the sweep to, say, --distance-power 3
+    # alone used to kill the run with a bare StopIteration after paying for the
+    # whole search. It is measured; it does not need finding.
+    return results, baseline_accuracy
 
 
 def report(results: list[dict], baseline_accuracy: float, top: int) -> None:
@@ -342,12 +355,11 @@ def main() -> None:
 
     global _LOCAL_SCALE_BUDGET_SECONDS
     _LOCAL_SCALE_BUDGET_SECONDS = args.local_scale_budget * 60
-    results = sweep(reference, sample, args.seed, args.k_max, args.batch_size,
-                    args.k, args.distance_power, args.local_scaling,
-                    args.adaptive, args.adaptive_k,
-                    [bool(v) for v in args.class_weighted], args.neighbours_cache)
-    baseline = next(r["accuracy"] for r in results
-                    if all(r[key] == value for key, value in BASELINE.items()))
+    results, baseline = sweep(
+        reference, sample, args.seed, args.k_max, args.batch_size,
+        args.k, args.distance_power, args.local_scaling,
+        args.adaptive, args.adaptive_k,
+        [bool(v) for v in args.class_weighted], args.neighbours_cache)
     report(results, baseline, args.top)
 
 

@@ -637,6 +637,81 @@ def test_a_strong_monotone_trend_is_called_a_selector(tmp_path):
     assert "this is a selector" in out.getvalue(), out.getvalue()
 
 
+# --- sweeping the band ---------------------------------------------------
+
+
+def test_a_swept_band_matches_running_each_band_alone(tmp_path):
+    """Sweeping must be a pure convenience. If a band's numbers moved depending
+    on what else was swept alongside it, the table would not be comparable to
+    the single-band runs that produced every figure so far."""
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref, n=20000, ncomp=8, nclust=12, spread=1.0,
+                       centre_scale=1.4)
+    reference = load_reference(ref)
+    cache = tmp_path / "nbr.npz"
+    for threshold in (0.1, 0.25):
+        alone = compare(reference, 8000, 0, 10, 40, 3.0, threshold, 4096,
+                        cache=cache)
+        again = compare(reference, 8000, 0, 10, 40, 3.0, threshold, 4096,
+                        cache=cache)
+        assert alone["n_low"] == again["n_low"]
+        for rule in RULES:
+            assert _without_timing(alone["rules"][rule]) \
+                == _without_timing(again["rules"][rule]), rule
+
+
+def test_a_wider_band_never_holds_fewer_tiles(tmp_path):
+    """The band is margin < t, so it can only grow. A non-monotone count would
+    mean the bands are not nested and the table's trade-off reading is wrong."""
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref, n=20000, ncomp=8, nclust=12, spread=1.0,
+                       centre_scale=1.4)
+    reference = load_reference(ref)
+    cache = tmp_path / "nbr.npz"
+    counts = [compare(reference, 8000, 0, 10, 40, 3.0, t, 4096,
+                      cache=cache)["n_low"]
+              for t in (0.05, 0.1, 0.25, 0.5)]
+    assert counts == sorted(counts), counts
+
+
+def test_the_best_band_is_ranked_on_the_best_policy_not_just_the_rule(tmp_path):
+    """Which band gets printed in full is chosen by _band_headline_net. Ranking
+    on the tiebreak alone would pick a band whose hybrid and adaptive arms were
+    both worse -- exactly the case the production numbers showed, where band
+    0.25 loses on adaptive k and wins on the hybrid."""
+    from tiebreak_experiment import _band_headline_net
+    run = {"result": {"rules": {"restricted": {}},
+                      "sweep": {"restricted": {0.0: {"net": 10}}}},
+           "cmp": {"adaptive": {"net": 99},
+                   "hybrid_sweep": {0.1: {"net": 50}}}}
+    assert _band_headline_net(run) == 99
+
+    run["cmp"]["hybrid_sweep"][0.2] = {"net": 500}
+    assert _band_headline_net(run) == 500
+
+    # A band with no tiles must never be chosen over one with results.
+    empty = {"result": {"rules": {}}, "cmp": None}
+    assert _band_headline_net(empty) < _band_headline_net(run)
+
+
+def test_the_cli_sweeps_several_bands_in_one_run(tmp_path):
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref, n=20000, ncomp=8, nclust=12, spread=1.0,
+                       centre_scale=1.4)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--reference", str(ref),
+         "--sample", "8000", "--k-base", "10", "--k-expand", "40",
+         "--distance-power", "3", "--margin-threshold", "0.1", "0.25",
+         "--with-adaptive", "25", "--neighbours-cache", str(tmp_path / "n.npz")],
+        capture_output=True, text=True, cwd=str(BACKEND))
+    assert result.returncode == 0, result.stderr
+    assert "=== By band ===" in result.stdout, result.stdout
+    assert "Detail for the best band" in result.stdout
+    # The blind-swap table is a property of the baseline, so it must appear once
+    # however many bands were swept.
+    assert result.stdout.count("Taking the runner-up outright") == 1
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

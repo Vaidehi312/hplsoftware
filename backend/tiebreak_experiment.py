@@ -682,6 +682,63 @@ def _report_stratum_verdict(rows: list[dict]) -> None:
           f"{'monotone' if monotone else 'non-monotone'} — {verdict}.")
 
 
+def _band_headline_net(run: dict) -> int:
+    """The best net this band achieved by any policy measured for it.
+
+    Used to pick which band to print in full, so it has to rank by the best
+    thing available -- ranking on the tiebreak alone would pick a band whose
+    hybrid was worse.
+    """
+    result, cmp = run["result"], run["cmp"]
+    if not result["rules"]:
+        return -(10 ** 9)
+    nets = [row["net"] for by_margin in result["sweep"].values()
+            for row in by_margin.values()]
+    if cmp is not None:
+        nets.append(cmp["adaptive"]["net"])
+        nets.extend(row["net"] for row in cmp["hybrid_sweep"].values())
+    return max(nets)
+
+
+def report_bands(runs: list[dict]) -> None:
+    """One row per band, so the band can be chosen on evidence.
+
+    The band is not a neutral scope setting. A narrow one is the better band for
+    adaptive k on its own, while a wider one gives the hybrid more to work with
+    and raises the oracle ceiling substantially -- because a wider band holds
+    more fixable errors even though it also holds more correct tiles that a rule
+    can break. Only a table shows that trade.
+    """
+    print(f"\n=== By band ===")
+    print(f"  {'margin <':>8}  {'tiles':>7}  {'correct':>7}  "
+          f"{'best rule':>11}  {'flip':>5}  {'net':>6}  "
+          f"{'adaptive':>8}  {'hybrid':>7}  {'gate':>5}  {'oracle':>8}")
+    for run in runs:
+        result, cmp = run["result"], run["cmp"]
+        if not result["rules"]:
+            print(f"  {run['threshold']:>8.2f}  {result.get('n_low', 0):>7,}"
+                  f"       —  (no tiles in band)")
+            continue
+        rule, flip, row = max(
+            ((r, m, x) for r, bm in result["sweep"].items()
+             for m, x in bm.items()), key=lambda t: t[2]["net"])
+        cells = (f"  {run['threshold']:>8.2f}  {result['n_low']:>7,}  "
+                 f"{result['subset_before'] * 100:>6.1f}%  "
+                 f"{rule:>11}  {flip:>5.2f}  {row['net']:>+6,}")
+        if cmp is None:
+            print(cells)
+            continue
+        gate, hybrid = best_hybrid(cmp)
+        print(cells + f"  {cmp['adaptive']['net']:>+8,}  "
+                      f"{hybrid['net']:>+7,}  {gate:>5.2f}  "
+                      f"{cmp['oracle_union'] * 100:>7.2f}%")
+    print(f"\n  A wider band holds more fixable errors AND more correct tiles a "
+          f"rule can break, so the best band differs by policy. Every net above "
+          f"is best-of-sweep within its band, so all of them are biased upward — "
+          f"the comparison between bands is the sound part, the absolute values "
+          f"less so.")
+
+
 def report(result: dict, margin_threshold: float, k_base: int, k_expand: int) -> None:
     if not result["rules"]:
         print(f"\nNo tiles below margin {margin_threshold} — nothing to break ties on.")
@@ -765,8 +822,15 @@ def main() -> None:
                              "two candidate clusters are counted, so the extra "
                              "neighbours cannot add noise from a third.")
     parser.add_argument("--distance-power", type=float, default=2.0)
-    parser.add_argument("--margin-threshold", type=float, default=0.25,
-                        help="Only tiles below this vote_margin are re-decided.")
+    parser.add_argument("--margin-threshold", type=float, nargs="+",
+                        default=[0.25], metavar="MARGIN",
+                        help="Only tiles below this vote_margin are re-decided. "
+                             "Several may be given: the band interacts with every "
+                             "other knob -- 0.1 is the better band for adaptive k "
+                             "alone while 0.25 is better for the hybrid and has a "
+                             "far higher ceiling -- so it is a parameter to sweep, "
+                             "not to pick. Extra bands are nearly free: the search "
+                             "is shared and each band is a re-vote.")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--neighbours-cache", type=Path, default=None,
                         help="Reuse (or write) a neighbour matrix here — the same "
@@ -791,33 +855,49 @@ def main() -> None:
 
     reference = load_reference(args.reference)
     describe_reference(args.reference, reference)
-    result = compare(reference, args.sample, args.seed, args.k_base, args.k_expand,
-                     args.distance_power, args.margin_threshold, args.batch_size,
-                     flip_margins=tuple(args.flip_margins),
-                     cache=args.neighbours_cache)
-    # The cheap idea first: is any margin band wrong often enough that taking the
-    # runner-up outright would pay? Answered before the rules, because if it did
-    # pay there would be no need for a rule.
-    baseline = result["baseline"]
-    report_blind_swap(baseline, blind_swap_bands(baseline))
-    report(result, args.margin_threshold, args.k_base, args.k_expand)
+    bands = sorted(set(args.margin_threshold))
+    runs = []
+    for threshold in bands:
+        result = compare(reference, args.sample, args.seed, args.k_base,
+                         args.k_expand, args.distance_power, threshold,
+                         args.batch_size, flip_margins=tuple(args.flip_margins),
+                         cache=args.neighbours_cache)
+        cmp = None
+        if args.with_adaptive and result["rules"]:
+            # Cross-tabulate against whichever rule/flip-margin actually won,
+            # not a rule named up front: the point is to interrogate the best
+            # result this band produced.
+            best_rule, best_flip, _ = max(
+                ((rule, margin, row)
+                 for rule, by_margin in result["sweep"].items()
+                 for margin, row in by_margin.items()),
+                key=lambda t: t[2]["net"])
+            cmp = compare_policies(result, reference, args.with_adaptive,
+                                   args.distance_power, best_flip, best_rule)
+        runs.append({"threshold": threshold, "result": result, "cmp": cmp})
 
-    if args.with_adaptive and result["rules"]:
-        # Cross-tabulate against whichever rule/flip-margin actually won, not a
-        # rule named up front: the point is to interrogate the best result.
-        best_rule, best_margin, _ = max(
-            ((rule, margin, row)
-             for rule, by_margin in result["sweep"].items()
-             for margin, row in by_margin.items()),
-            key=lambda t: t[2]["net"])
-        cmp = compare_policies(result, reference, args.with_adaptive,
-                               args.distance_power, best_margin, best_rule)
-        report_policies(cmp, result["overall_before"])
+    # The blind-swap table is a property of the baseline, not of any band, so it
+    # is printed once however many bands were swept.
+    baseline = runs[0]["result"]["baseline"]
+    report_blind_swap(baseline, blind_swap_bands(baseline))
+
+    if len(runs) > 1:
+        report_bands(runs)
+
+    # Detail for the band that produced the best policy, since that is the one
+    # worth reading in full. With a single band this is just that band.
+    best = max(runs, key=_band_headline_net)
+    if len(runs) > 1:
+        print(f"\n{'=' * 72}\nDetail for the best band, margin < "
+              f"{best['threshold']:g}\n{'=' * 72}")
+    report(best["result"], best["threshold"], args.k_base, args.k_expand)
+    if best["cmp"] is not None:
+        report_policies(best["cmp"], best["result"]["overall_before"])
         # Only worth profiling if the two are actually complementary; if they
         # overlap there is nothing for a selector to select between.
         report_disagreement(disagreement_profile(
-            result, reference, args.with_adaptive, args.distance_power,
-            best_margin, best_rule))
+            best["result"], reference, args.with_adaptive, args.distance_power,
+            best["cmp"]["flip_margin"], best["cmp"]["rule"]))
 
 
 if __name__ == "__main__":

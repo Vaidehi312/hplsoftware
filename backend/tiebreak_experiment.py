@@ -46,7 +46,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from assign_hpc_clusters import Searcher, _WEIGHT_EPS  # noqa: E402
+from assign_hpc_clusters import Searcher, _WEIGHT_EPS, vote  # noqa: E402
 from tune_classifier import gather_neighbours  # noqa: E402
 from validate_reference import describe_reference, leave_one_out, load_reference  # noqa: E402
 from build_hpc_reference import HPC_REFERENCE_PATH  # noqa: E402
@@ -199,7 +199,8 @@ def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
         # Already self-excluded, so the low-margin rows of the cached matrix are
         # exactly what a k_expand search would have returned for them.
         idx = idx_all[low_mask, :k_expand]
-        dist = np.sqrt(np.maximum(dist_all_sq[low_mask, :k_expand], 0.0))
+        dist_sq = dist_all_sq[low_mask, :k_expand]
+        dist = np.sqrt(np.maximum(dist_sq, 0.0))
     else:
         searcher = Searcher(vectors)
         # k_expand + 1 for the same reason leave_one_out uses k + 1: every tile
@@ -212,7 +213,8 @@ def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
             self_mask[no_self, -1] = True
         keep = ~self_mask
         idx = idx[keep].reshape(len(rows), k_expand)
-        dist = np.sqrt(np.maximum(dist[keep].reshape(len(rows), k_expand), 0.0))
+        dist_sq = dist[keep].reshape(len(rows), k_expand)
+        dist = np.sqrt(np.maximum(dist_sq, 0.0))
 
     valid = idx >= 0
     labels_all = np.where(valid, codes[np.where(valid, idx, 0)], -1)
@@ -262,6 +264,12 @@ def compare(reference: dict, sample: int, seed: int, k_base: int, k_expand: int,
 
     return {
         "baseline": baseline, "low_mask": low_mask, "rules": results, "sweep": sweep,
+        # Everything a policy comparison needs, so it costs no second search.
+        "band": {"rows": rows, "winner": winner, "runner": runner, "truth": truth,
+                 "idx": idx, "dist_sq": dist_sq, "labels_all": labels_all,
+                 "queries": queries, "centroids": centroids, "k_base": k_base,
+                 "untouched_correct": untouched_correct,
+                 "n_total": baseline["n"]},
         "flip_margins": tuple(float(m) for m in flip_margins),
         "n_low": int(low_mask.sum()), "reachable": int(reachable.sum()),
         "subset_before": float(before_correct.mean()),
@@ -355,6 +363,168 @@ def report_blind_swap(baseline: dict, rows: list[dict]) -> None:
               f"there is worth {best['net']:+,} net. Still compare it against the "
               f"rules below, which should beat it by not swapping the tiles they "
               f"can tell are already right.")
+
+
+def adaptive_choice(band: dict, codes: np.ndarray, n_clusters: int,
+                    k_adaptive: int, distance_power: float) -> dict:
+    """The shipped adaptive-k policy, evaluated on the same band.
+
+    Not an A/B rule: it re-votes over *every* cluster at a wider k, so it can
+    land on a third cluster the base vote had nowhere near the top. Which is
+    exactly why it is worth cross-tabulating against a tiebreak rather than
+    assuming the two are interchangeable because they score the same.
+    """
+    winners, margins, _, counts = vote(
+        band["idx"][:, :k_adaptive], band["dist_sq"][:, :k_adaptive],
+        codes, n_clusters, distance_weighted=True,
+        distance_power=distance_power, return_counts=True)
+    order = np.argsort(counts, axis=1)
+    return {"chosen": winners, "margin": margins,
+            "winner": order[:, -1], "runner": order[:, -2]}
+
+
+def _band_score(band: dict, chosen: np.ndarray) -> dict:
+    truth, winner = band["truth"], band["winner"]
+    before, after = winner == truth, chosen == truth
+    fixed = int((~before & after).sum())
+    broke = int((before & ~after).sum())
+    return {
+        "fixed": fixed, "broke": broke, "net": fixed - broke,
+        "changed": int((chosen != winner).sum()),
+        "overall": (band["untouched_correct"] + int(after.sum())) / band["n_total"],
+        "correct": after,
+    }
+
+
+# Thresholds for the hybrid gate: how tied adaptive k's own re-vote still has
+# to be before the A/B rule is allowed to overrule it. Distinct from the flip
+# margin, which is how far ahead B must be -- conflating the two makes the gate
+# either never fire or fire on everything.
+HYBRID_GATES = (0.02, 0.05, 0.10, 0.20, 0.35)
+
+
+def compare_policies(result: dict, reference: dict, k_adaptive: int,
+                     distance_power: float, flip_margin: float,
+                     rule: str = "restricted",
+                     hybrid_gates: tuple[float, ...] = HYBRID_GATES) -> dict:
+    """Does the best tiebreak fix the same tiles adaptive k does?
+
+    They score the same on production -- both 97.23% -- which has two very
+    different explanations. Either they are one mechanism wearing two hats, in
+    which case this line of work is finished, or they fix different tiles and
+    the union is worth more than either. The 2x2 settles it, and the oracle
+    union bounds anything built out of the pair.
+    """
+    band = result["band"]
+    codes = reference["codes"]
+    n_clusters = len(reference["categories"])
+
+    adaptive = adaptive_choice(band, codes, n_clusters, k_adaptive, distance_power)
+    # Exactly the inputs compare() gave the rule, so this reproduces its row in
+    # the table rather than a near-miss of it. k_base comes from the band, not a
+    # literal: the base vote's neighbours are its first k_base columns.
+    k_base = band["k_base"]
+    dist = np.sqrt(np.maximum(band["dist_sq"], 0.0))
+    tiebreak_chosen = _pick(
+        rule, flip_margin=flip_margin,
+        labels_base=band["labels_all"][:, :k_base], dist_base=dist[:, :k_base],
+        labels_all=band["labels_all"], dist_all=dist,
+        winner=band["winner"], runner=band["runner"],
+        queries=band["queries"], centroids=band["centroids"],
+        distance_power=distance_power)
+
+    a = _band_score(band, adaptive["chosen"])
+    t = _band_score(band, tiebreak_chosen)
+    before = band["winner"] == band["truth"]
+
+    # An A/B rule can only ever reach a tile whose truth is one of the two it is
+    # choosing between. Adaptive k has no such limit -- it votes over all 71 --
+    # so the two have different ceilings as well as different answers.
+    reach_ab = (band["truth"] == band["winner"]) | (band["truth"] == band["runner"])
+
+    either = a["correct"] | t["correct"]
+    both = a["correct"] & t["correct"]
+    return {
+        "adaptive": a, "tiebreak": t,
+        "k_adaptive": k_adaptive, "flip_margin": flip_margin, "rule": rule,
+        "n_band": len(band["truth"]),
+        "before_correct": int(before.sum()),
+        # Fixes each finds that the other does not.
+        "only_adaptive": int((a["correct"] & ~t["correct"]).sum()),
+        "only_tiebreak": int((t["correct"] & ~a["correct"]).sum()),
+        "both_correct": int(both.sum()),
+        "neither": int((~either).sum()),
+        # The most any combination of exactly these two could reach.
+        "oracle_union": (band["untouched_correct"] + int(either.sum())) / band["n_total"],
+        "ab_reachable": int(reach_ab.sum()),
+        "agree": int((adaptive["chosen"] == tiebreak_chosen).sum()),
+        # The obvious hybrid: take adaptive k's answer, but let the A/B rule
+        # overrule it where adaptive's own re-vote came out a near-tie too. The
+        # gate is swept because there is no principled value for it, and best-of-
+        # a-few is reported as exactly that.
+        "hybrid_sweep": {
+            float(gate): _band_score(band, np.where(
+                adaptive["margin"] < gate, tiebreak_chosen, adaptive["chosen"]))
+            for gate in hybrid_gates},
+    }
+
+
+def best_hybrid(cmp: dict) -> tuple[float, dict]:
+    return max(cmp["hybrid_sweep"].items(), key=lambda kv: kv[1]["net"])
+
+
+def report_policies(cmp: dict, overall_before: float) -> None:
+    print(f"\n=== {cmp['rule']} (flip {cmp['flip_margin']:g}) vs adaptive "
+          f"k={cmp['k_adaptive']}: the same tiles, or different ones? ===")
+    a, t = cmp["adaptive"], cmp["tiebreak"]
+    print(f"  {'policy':<22}  {'changed':>7}  {'fixed':>6}  {'broke':>6}  "
+          f"{'net':>6}  {'overall':>8}")
+    gate, hybrid = best_hybrid(cmp)
+    for name, row in (("adaptive k", a), (cmp["rule"], t),
+                      (f"hybrid (gate {gate:g})", hybrid)):
+        print(f"  {name:<22}  {row['changed']:>7,}  {row['fixed']:>6,}  "
+              f"{row['broke']:>6,}  {row['net']:>+6,}  "
+              f"{row['overall'] * 100:>7.2f}% "
+              f"({(row['overall'] - overall_before) * 100:+.2f})")
+    print(f"\n  Hybrid by gate — how tied adaptive's own re-vote must still be "
+          f"for the rule to overrule it:")
+    print("    " + "".join(f"{g:>9.2f}" for g in sorted(cmp["hybrid_sweep"])))
+    print("    " + "".join(f"{cmp['hybrid_sweep'][g]['net']:>+9,}"
+                           for g in sorted(cmp["hybrid_sweep"])))
+    print(f"    Best of {len(cmp['hybrid_sweep'])} gates, so biased upward — "
+          f"confirm on another --seed.")
+
+    n = cmp["n_band"]
+    print(f"\n  Of the {n:,} tiles in the band, the two agree on "
+          f"{cmp['agree']:,} ({cmp['agree'] / n * 100:.1f}%).")
+    print(f"  Right after adaptive only : {cmp['only_adaptive']:,}")
+    print(f"  Right after tiebreak only : {cmp['only_tiebreak']:,}")
+    print(f"  Right after both          : {cmp['both_correct']:,}")
+    print(f"  Right after neither       : {cmp['neither']:,}")
+    print(f"\n  An oracle picking whichever of the two is right would reach "
+          f"{cmp['oracle_union'] * 100:.2f}% "
+          f"({(cmp['oracle_union'] - overall_before) * 100:+.2f}) — the ceiling on "
+          f"anything built from this pair.")
+
+    exclusive = cmp["only_adaptive"] + cmp["only_tiebreak"]
+    best = max(a["net"], t["net"], hybrid["net"])
+    headroom = cmp["oracle_union"] - max(a["overall"], t["overall"],
+                                         hybrid["overall"])
+    if exclusive < 0.15 * max(cmp["both_correct"], 1):
+        print(f"\n  They overlap almost entirely ({exclusive:,} tiles decided "
+              f"differently against {cmp['both_correct']:,} shared), so these are "
+              f"one mechanism: re-decide the near-ties with more neighbours. "
+              f"Combining them cannot help, and the remaining error needs "
+              f"different evidence, not another way of counting the same "
+              f"neighbours.")
+    else:
+        print(f"\n  {exclusive:,} tiles are decided differently, and the oracle "
+              f"union leaves {headroom * 100:+.2f} over the best single policy "
+              f"({best:+,} net). Worth building a selector — but only if some "
+              f"computable signal separates them; the oracle is not one.")
+    print(f"\n  Note the A/B rule can only reach {cmp['ab_reachable']:,} of "
+          f"{n:,} band tiles by construction, while adaptive k votes over every "
+          f"cluster and has no such ceiling.")
 
 
 def report(result: dict, margin_threshold: float, k_base: int, k_expand: int) -> None:
@@ -451,6 +621,13 @@ def main() -> None:
                              "been built at k_max >= --k-expand for the same "
                              "--sample and --seed; a mismatch re-searches rather "
                              "than serving the wrong tiles.")
+    parser.add_argument("--with-adaptive", type=int, default=0, metavar="K",
+                        help="Also evaluate the shipped adaptive-k policy at this "
+                             "k on the same band, and cross-tabulate it against "
+                             "the best tiebreak rule. Free — same neighbours, no "
+                             "extra search. Use it when a rule scores about the "
+                             "same as adaptive k, to find out whether they are "
+                             "fixing the same tiles or different ones.")
     parser.add_argument("--flip-margins", type=float, nargs="+", default=list(FLIP_MARGINS),
                         help="How far ahead the runner-up must be before the vote is "
                              "overridden. All are evaluated in one run — the scores are "
@@ -469,6 +646,18 @@ def main() -> None:
     baseline = result["baseline"]
     report_blind_swap(baseline, blind_swap_bands(baseline))
     report(result, args.margin_threshold, args.k_base, args.k_expand)
+
+    if args.with_adaptive and result["rules"]:
+        # Cross-tabulate against whichever rule/flip-margin actually won, not a
+        # rule named up front: the point is to interrogate the best result.
+        best_rule, best_margin, _ = max(
+            ((rule, margin, row)
+             for rule, by_margin in result["sweep"].items()
+             for margin, row in by_margin.items()),
+            key=lambda t: t[2]["net"])
+        cmp = compare_policies(result, reference, args.with_adaptive,
+                               args.distance_power, best_margin, best_rule)
+        report_policies(cmp, result["overall_before"])
 
 
 if __name__ == "__main__":

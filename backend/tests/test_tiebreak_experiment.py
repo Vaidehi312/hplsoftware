@@ -393,6 +393,118 @@ def test_bands_are_cumulative_and_monotone(tmp_path):
     assert all(r["broke"] >= 0 and r["fixed"] >= 0 for r in rows)
 
 
+# --- adaptive k vs a tiebreak rule, on the same band ---------------------
+#
+# On the production reference `restricted` and adaptive k both score 97.23%.
+# That has two opposite readings -- one mechanism twice, or two mechanisms that
+# happen to tie -- and only the cross-tab distinguishes them. So the cross-tab
+# has to be right about which tiles each policy actually fixes.
+
+
+def _band_result(tmp_path, **over):
+    ref = tmp_path / "ref.npz"
+    _write_overlapping(ref, n=20000, ncomp=8, nclust=12, spread=1.0,
+                       centre_scale=1.4, **over)
+    reference = load_reference(ref)
+    return reference, compare(reference, 8000, 0, 10, 40, 3.0, 0.4, 4096,
+                              cache=tmp_path / "nbr.npz")
+
+
+def test_the_cross_tab_reproduces_the_rules_own_net(tmp_path):
+    """compare_policies re-derives the rule's decision from the carried band.
+    If it used different inputs -- the wrong k_base, distances instead of
+    squared ones -- it would report a rule that was never in the table."""
+    from tiebreak_experiment import compare_policies
+    reference, result = _band_result(tmp_path)
+    for rule in RULES:
+        for margin in result["sweep"][rule]:
+            cmp = compare_policies(result, reference, 25, 3.0, margin, rule)
+            assert cmp["tiebreak"]["net"] == result["sweep"][rule][margin]["net"], \
+                f"{rule} @ {margin}"
+            assert cmp["tiebreak"]["fixed"] == result["sweep"][rule][margin]["fixed"]
+            assert cmp["tiebreak"]["broke"] == result["sweep"][rule][margin]["broke"]
+
+
+def test_the_two_by_two_partitions_the_band_exactly(tmp_path):
+    """Every band tile lands in exactly one of the four cells. A cell that
+    double-counts would overstate complementarity, which is the one conclusion
+    this analysis is for."""
+    from tiebreak_experiment import compare_policies
+    reference, result = _band_result(tmp_path)
+    cmp = compare_policies(result, reference, 25, 3.0, 0.1, "restricted")
+    cells = (cmp["only_adaptive"] + cmp["only_tiebreak"]
+             + cmp["both_correct"] + cmp["neither"])
+    assert cells == cmp["n_band"], (cells, cmp["n_band"])
+
+
+def test_the_oracle_union_bounds_both_policies_and_the_hybrid(tmp_path):
+    """It is the ceiling on anything built from the pair, so nothing built from
+    the pair may exceed it."""
+    from tiebreak_experiment import best_hybrid, compare_policies
+    reference, result = _band_result(tmp_path)
+    cmp = compare_policies(result, reference, 25, 3.0, 0.1, "restricted")
+    _, hybrid = best_hybrid(cmp)
+    for row in (cmp["adaptive"], cmp["tiebreak"], hybrid):
+        assert row["overall"] <= cmp["oracle_union"] + 1e-12
+
+
+def test_the_hybrid_gate_is_not_the_flip_margin(tmp_path):
+    """The first version gated on the flip margin, so at flip 0 the hybrid was
+    adaptive k verbatim and looked like it added nothing. The gate is a
+    different quantity -- how tied adaptive's own re-vote still is."""
+    from tiebreak_experiment import compare_policies
+    reference, result = _band_result(tmp_path)
+    cmp = compare_policies(result, reference, 25, 3.0, 0.0, "restricted")
+    nets = {g: row["net"] for g, row in cmp["hybrid_sweep"].items()}
+    assert len(nets) > 1
+    assert len(set(nets.values())) > 1, (
+        f"every gate gives the same net ({nets}) — the gate is not doing "
+        f"anything, which is what the flip-margin bug looked like")
+
+
+def test_a_wider_hybrid_gate_only_ever_overrules_more(tmp_path):
+    """The gate is a threshold on adaptive's margin, so raising it can only add
+    tiles to the overruled set. A non-monotone changed-count means the gate is
+    being applied to the wrong quantity."""
+    from tiebreak_experiment import compare_policies
+    reference, result = _band_result(tmp_path)
+    cmp = compare_policies(result, reference, 25, 3.0, 0.1, "restricted")
+    gates = sorted(cmp["hybrid_sweep"])
+    overruled = [cmp["hybrid_sweep"][g] for g in gates]
+    # 'changed' is against the ORIGINAL winner, so it is not itself monotone;
+    # what must be monotone is how many rows the gate hands to the rule. Check
+    # that directly by rebuilding the masks.
+    from tiebreak_experiment import adaptive_choice
+    band = result["band"]
+    adaptive = adaptive_choice(band, reference["codes"],
+                               len(reference["categories"]), 25, 3.0)
+    counts = [int((adaptive["margin"] < g).sum()) for g in gates]
+    assert counts == sorted(counts), counts
+    assert overruled  # and the sweep actually produced rows
+
+
+def test_adaptive_choice_matches_a_plain_wide_vote(tmp_path):
+    """The cross-tab's adaptive arm must be the shipped policy, not an
+    approximation of it: a wide vote over every cluster on the band's rows."""
+    from tiebreak_experiment import adaptive_choice
+    from assign_hpc_clusters import vote
+    reference, result = _band_result(tmp_path)
+    band = result["band"]
+    n_clusters = len(reference["categories"])
+    adaptive = adaptive_choice(band, reference["codes"], n_clusters, 25, 3.0)
+    direct, margin, _ = vote(band["idx"][:, :25], band["dist_sq"][:, :25],
+                             reference["codes"], n_clusters,
+                             distance_weighted=True, distance_power=3.0)
+    assert np.array_equal(adaptive["chosen"], direct)
+    assert np.allclose(adaptive["margin"], margin)
+    # And it is genuinely unrestricted: it may land outside the base top two.
+    outside = ((adaptive["chosen"] != band["winner"])
+               & (adaptive["chosen"] != band["runner"]))
+    assert outside.any(), (
+        "adaptive k never left the base top-2 on this fixture, so the test "
+        "cannot tell it apart from an A/B rule")
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

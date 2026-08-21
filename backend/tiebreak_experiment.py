@@ -527,6 +527,161 @@ def report_policies(cmp: dict, overall_before: float) -> None:
           f"cluster and has no such ceiling.")
 
 
+def disagreement_profile(result: dict, reference: dict, k_adaptive: int,
+                         distance_power: float, flip_margin: float,
+                         rule: str = "restricted") -> dict:
+    """Where the two policies disagree, is there a signal saying which to trust?
+
+    The oracle union is only reachable if something computable separates them.
+    Two structurally different kinds of disagreement, which have to be counted
+    apart or they average each other out:
+
+      out-of-band   adaptive k picked a cluster that was neither the base
+                    winner nor the base runner-up. The A/B rule could not have
+                    chosen it at all, so this measures what the A/B restriction
+                    costs -- or what adaptive k's extra freedom costs.
+      same-pair     both were choosing between the same A and B and picked
+                    differently. This is a straight contest between two
+                    decision rules on identical options.
+
+    Also profiled: within same-pair, whether the strength of either rule's own
+    evidence predicts who is right. If it does, that is the selector. If both
+    split near 50/50 in every stratum, the oracle union is not reachable and
+    the honest move is to take the hybrid and stop.
+    """
+    band = result["band"]
+    codes = reference["codes"]
+    n_clusters = len(reference["categories"])
+    k_base = band["k_base"]
+    dist = np.sqrt(np.maximum(band["dist_sq"], 0.0))
+
+    adaptive = adaptive_choice(band, codes, n_clusters, k_adaptive, distance_power)
+    score_a, score_b = _scores(
+        rule, labels_base=band["labels_all"][:, :k_base],
+        dist_base=dist[:, :k_base], labels_all=band["labels_all"],
+        dist_all=dist, winner=band["winner"], runner=band["runner"],
+        queries=band["queries"], centroids=band["centroids"],
+        distance_power=distance_power)
+    advantage = _advantage(score_a, score_b)
+    tiebreak = np.where(advantage > flip_margin, band["runner"], band["winner"])
+
+    truth = band["truth"]
+    disagree = adaptive["chosen"] != tiebreak
+    in_pair = ((adaptive["chosen"] == band["winner"])
+               | (adaptive["chosen"] == band["runner"]))
+
+    def _split(mask: np.ndarray) -> dict:
+        n = int(mask.sum())
+        if not n:
+            return {"n": 0}
+        a_right = int((adaptive["chosen"][mask] == truth[mask]).sum())
+        t_right = int((tiebreak[mask] == truth[mask]).sum())
+        return {"n": n, "adaptive_right": a_right, "tiebreak_right": t_right,
+                "neither": n - a_right - t_right,
+                "adaptive_share": a_right / max(a_right + t_right, 1)}
+
+    out_of_pair = disagree & ~in_pair
+    same_pair = disagree & in_pair
+
+    # Does either rule's own confidence predict who wins the same-pair contest?
+    # Stratified on both, because a selector only exists if some stratum is
+    # lopsided -- a uniform 50/50 means the disagreement is irreducible.
+    strata = {}
+    if same_pair.any():
+        for name, signal in (("adaptive margin", adaptive["margin"]),
+                             ("rule advantage", np.abs(advantage))):
+            edges = np.quantile(signal[same_pair], [0.0, 0.25, 0.5, 0.75, 1.0])
+            rows = []
+            for lo, hi, last in zip(edges[:-1], edges[1:],
+                                    [False, False, False, True]):
+                band_mask = same_pair & (signal >= lo) & (
+                    (signal <= hi) if last else (signal < hi))
+                row = _split(band_mask)
+                row.update({"lo": float(lo), "hi": float(hi)})
+                rows.append(row)
+            strata[name] = rows
+
+    return {
+        "rule": rule, "flip_margin": flip_margin, "k_adaptive": k_adaptive,
+        "n_band": len(truth), "n_disagree": int(disagree.sum()),
+        "out_of_pair": _split(out_of_pair),
+        "same_pair": _split(same_pair),
+        "strata": strata,
+        # How often adaptive k leaves the base top two at all, agreement aside.
+        "left_the_pair": int((~in_pair).sum()),
+        "left_and_right": int(((~in_pair) & (adaptive["chosen"] == truth)).sum()),
+    }
+
+
+def report_disagreement(prof: dict) -> None:
+    print(f"\n=== Where they disagree, can anything tell us which to trust? ===")
+    print(f"  {prof['n_disagree']:,} of {prof['n_band']:,} band tiles are decided "
+          f"differently. Adaptive k left the base top-2 on "
+          f"{prof['left_the_pair']:,} tiles and was right on "
+          f"{prof['left_and_right']:,} of them "
+          f"({prof['left_and_right'] / max(prof['left_the_pair'], 1) * 100:.1f}%).")
+
+    print(f"\n  {'kind':<26}  {'tiles':>7}  {'adaptive':>9}  {'rule':>7}  "
+          f"{'neither':>8}  {'adaptive wins':>14}")
+    for label, key in (("out-of-pair (rule can't)", "out_of_pair"),
+                       ("same-pair (head to head)", "same_pair")):
+        row = prof[key]
+        if not row["n"]:
+            print(f"  {label:<26}  {0:>7}")
+            continue
+        print(f"  {label:<26}  {row['n']:>7,}  {row['adaptive_right']:>9,}  "
+              f"{row['tiebreak_right']:>7,}  {row['neither']:>8,}  "
+              f"{row['adaptive_share'] * 100:>13.1f}%")
+
+    for name, rows in prof["strata"].items():
+        print(f"\n  Same-pair disagreements by {name} (quartiles) — a selector "
+              f"exists only if these are lopsided:")
+        print(f"    {'range':>16}  {'tiles':>6}  {'adaptive':>9}  {'rule':>6}  "
+              f"{'adaptive wins':>14}")
+        for row in rows:
+            if not row["n"]:
+                continue
+            print(f"    {row['lo']:>7.3f}-{row['hi']:<8.3f}  {row['n']:>6,}  "
+                  f"{row['adaptive_right']:>9,}  {row['tiebreak_right']:>6,}  "
+                  f"{row['adaptive_share'] * 100:>13.1f}%")
+        _report_stratum_verdict(rows)
+
+
+def _report_stratum_verdict(rows: list[dict]) -> None:
+    """Is the trend across strata real, and is it usable?
+
+    Spread alone is not enough. Each quartile here holds a few hundred decisive
+    tiles, so a share of ~0.4 carries a standard error of several points and a
+    15-point spread across four bins can be pure wobble — which is exactly what
+    the adaptive-margin cut looks like while the rule-advantage cut is a clean
+    monotone slide. A selector needs the trend to be BOTH bigger than its noise
+    and ordered, because a non-monotone lurch gives nothing to threshold on.
+    """
+    usable = [r for r in rows if r.get("n") and
+              (r["adaptive_right"] + r["tiebreak_right"]) > 0]
+    if len(usable) < 2:
+        return
+    shares = [r["adaptive_share"] for r in usable]
+    decisive = [r["adaptive_right"] + r["tiebreak_right"] for r in usable]
+    lo, hi = min(range(len(shares)), key=shares.__getitem__), \
+        max(range(len(shares)), key=shares.__getitem__)
+    spread = shares[hi] - shares[lo]
+    # Binomial standard error on the difference of two independent shares.
+    se = sum(shares[i] * (1 - shares[i]) / max(decisive[i], 1) for i in (lo, hi)) ** 0.5
+    sigma = spread / se if se else 0.0
+    monotone = (shares == sorted(shares)) or (shares == sorted(shares, reverse=True))
+
+    if sigma < 2.0:
+        verdict = "within noise — no signal here"
+    elif not monotone:
+        verdict = ("real but not ordered, so there is no threshold to set — "
+                   "look for a different cut")
+    else:
+        verdict = "monotone and beyond noise — this is a selector"
+    print(f"    spread {spread * 100:.1f} points, {sigma:.1f} sigma, "
+          f"{'monotone' if monotone else 'non-monotone'} — {verdict}.")
+
+
 def report(result: dict, margin_threshold: float, k_base: int, k_expand: int) -> None:
     if not result["rules"]:
         print(f"\nNo tiles below margin {margin_threshold} — nothing to break ties on.")
@@ -658,6 +813,11 @@ def main() -> None:
         cmp = compare_policies(result, reference, args.with_adaptive,
                                args.distance_power, best_margin, best_rule)
         report_policies(cmp, result["overall_before"])
+        # Only worth profiling if the two are actually complementary; if they
+        # overlap there is nothing for a selector to select between.
+        report_disagreement(disagreement_profile(
+            result, reference, args.with_adaptive, args.distance_power,
+            best_margin, best_rule))
 
 
 if __name__ == "__main__":

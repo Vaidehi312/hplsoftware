@@ -505,6 +505,138 @@ def test_adaptive_choice_matches_a_plain_wide_vote(tmp_path):
         "cannot tell it apart from an A/B rule")
 
 
+# --- the disagreement profile --------------------------------------------
+#
+# This is the tool that decides whether the oracle union is reachable, so its
+# failure mode is a false positive: declaring a selector exists because four
+# quartiles of a few hundred tiles happened to slope. The verdict therefore has
+# to be able to come out negative, and it has to distinguish a monotone trend
+# from noise that merely spreads.
+
+
+def test_the_two_kinds_of_disagreement_partition_it(tmp_path):
+    """out-of-pair and same-pair must together be every disagreement. If they
+    did not, one kind would be silently dropped from the analysis."""
+    from tiebreak_experiment import disagreement_profile
+    reference, result = _band_result(tmp_path)
+    prof = disagreement_profile(result, reference, 25, 3.0, 0.1, "restricted")
+    assert (prof["out_of_pair"].get("n", 0) + prof["same_pair"].get("n", 0)
+            == prof["n_disagree"])
+
+
+def test_out_of_pair_is_exactly_what_the_rule_cannot_reach(tmp_path):
+    """An A/B rule can only ever return one of its two candidates, so an
+    out-of-pair tile is by definition one adaptive k reached and it could not.
+    Counting any same-pair tile there would overstate the cost of the A/B
+    restriction, which is the one thing this cut is for."""
+    from tiebreak_experiment import adaptive_choice, disagreement_profile
+    reference, result = _band_result(tmp_path)
+    band = result["band"]
+    adaptive = adaptive_choice(band, reference["codes"],
+                               len(reference["categories"]), 25, 3.0)
+    outside = ((adaptive["chosen"] != band["winner"])
+               & (adaptive["chosen"] != band["runner"]))
+    prof = disagreement_profile(result, reference, 25, 3.0, 0.1, "restricted")
+    # Every out-of-pair tile is a disagreement by construction, so the count of
+    # tiles adaptive took outside the pair IS the out-of-pair disagreement count.
+    assert prof["left_the_pair"] == int(outside.sum())
+    assert prof["out_of_pair"]["n"] == int(outside.sum())
+    assert prof["left_and_right"] == int(
+        (outside & (adaptive["chosen"] == band["truth"])).sum())
+
+
+def test_every_stratum_counts_only_decisive_tiles_in_its_share(tmp_path):
+    """adaptive_share is a head-to-head share, so tiles where NEITHER policy is
+    right must not sit in its denominator — they would drag every stratum
+    toward each other and flatten a real signal into noise."""
+    from tiebreak_experiment import disagreement_profile
+    reference, result = _band_result(tmp_path)
+    prof = disagreement_profile(result, reference, 25, 3.0, 0.1, "restricted")
+    for rows in prof["strata"].values():
+        for row in rows:
+            if not row["n"]:
+                continue
+            decisive = row["adaptive_right"] + row["tiebreak_right"]
+            assert row["n"] == decisive + row["neither"]
+            if decisive:
+                assert abs(row["adaptive_share"]
+                           - row["adaptive_right"] / decisive) < 1e-12
+
+
+def test_a_flat_stratum_is_reported_as_noise_not_a_selector(tmp_path):
+    """The false positive this guards. Equal shares across strata must never
+    read as a selector, however many tiles there are."""
+    import io
+    import contextlib
+    from tiebreak_experiment import _report_stratum_verdict
+    rows = [{"n": 400, "adaptive_right": 150, "tiebreak_right": 150,
+             "neither": 100, "adaptive_share": 0.5, "lo": 0.0, "hi": 1.0}
+            for _ in range(4)]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        _report_stratum_verdict(rows)
+    assert "no signal" in out.getvalue(), out.getvalue()
+
+
+def test_a_small_spread_on_few_tiles_is_noise_not_a_selector(tmp_path):
+    """15 points across four bins of ~30 decisive tiles is well within binomial
+    noise. Judging on spread alone -- the first version of this -- called it a
+    selector."""
+    import io
+    import contextlib
+    from tiebreak_experiment import _report_stratum_verdict
+    shares = (0.35, 0.42, 0.45, 0.50)
+    rows = []
+    for share in shares:
+        right = int(round(share * 30))
+        rows.append({"n": 40, "adaptive_right": right,
+                     "tiebreak_right": 30 - right, "neither": 10,
+                     "adaptive_share": right / 30, "lo": 0.0, "hi": 1.0})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        _report_stratum_verdict(rows)
+    assert "no signal" in out.getvalue(), out.getvalue()
+
+
+def test_a_non_monotone_trend_is_not_called_a_selector(tmp_path):
+    """A real but disordered difference gives nothing to threshold on, so it
+    must be reported differently from a usable trend."""
+    import io
+    import contextlib
+    from tiebreak_experiment import _report_stratum_verdict
+    shares = (0.30, 0.70, 0.32, 0.35)
+    rows = []
+    for share in shares:
+        right = int(round(share * 400))
+        rows.append({"n": 500, "adaptive_right": right,
+                     "tiebreak_right": 400 - right, "neither": 100,
+                     "adaptive_share": right / 400, "lo": 0.0, "hi": 1.0})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        _report_stratum_verdict(rows)
+    text = out.getvalue()
+    assert "non-monotone" in text and "no threshold" in text, text
+
+
+def test_a_strong_monotone_trend_is_called_a_selector(tmp_path):
+    """And the verdict must be able to come out positive, or it is just a
+    rubber stamp in the other direction."""
+    import io
+    import contextlib
+    from tiebreak_experiment import _report_stratum_verdict
+    shares = (0.65, 0.55, 0.40, 0.25)
+    rows = []
+    for share in shares:
+        right = int(round(share * 400))
+        rows.append({"n": 500, "adaptive_right": right,
+                     "tiebreak_right": 400 - right, "neither": 100,
+                     "adaptive_share": right / 400, "lo": 0.0, "hi": 1.0})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        _report_stratum_verdict(rows)
+    assert "this is a selector" in out.getvalue(), out.getvalue()
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

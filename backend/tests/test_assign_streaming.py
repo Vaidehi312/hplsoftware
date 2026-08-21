@@ -846,6 +846,139 @@ def test_the_api_client_sends_the_preset_and_the_overrides(tmp_path):
     assert sent["body"]["vote_preset"] == "legacy"
 
 
+# --- a truth file that disagrees with itself -----------------------------
+#
+# Kai's TCGA label CSV lists 100 tiles twice, 96 with two different Leiden
+# labels, all on one slide. validate() merges one_to_one so a duplicated key
+# cannot silently multiply rows, which meant the acceptance test -- the gate
+# CLAUDE.md calls a defect below 99% -- died on a pandas MergeError naming
+# neither the file nor the slide. Dropping duplicates blindly would be worse:
+# 96 tiles would be scored against whichever label happened to come first.
+
+
+def _truth(rows) -> "object":
+    import pandas as pd
+    return pd.DataFrame(rows, columns=["samples", "slides", "tiles", "leiden_2.5"])
+
+
+def test_conflicting_duplicates_are_excluded_not_resolved(tmp_path):
+    from assign_hpc_clusters import _dedupe_truth
+    truth = _truth([
+        ("S1", "sl1", "1_1.jpeg", 5),
+        ("S1", "sl1", "1_1.jpeg", 9),      # same tile, different label
+        ("S1", "sl1", "2_2.jpeg", 7),
+    ])
+    clean, ambiguous, redundant = _dedupe_truth(truth, "leiden_2.5")
+    assert ambiguous == [("sl1", "1_1.jpeg")]
+    assert redundant == 0
+    # Excluded entirely — neither 5 nor 9 may survive as "the" answer.
+    assert list(clean["tiles"]) == ["2_2.jpeg"]
+
+
+def test_redundant_duplicates_are_deduplicated_and_kept(tmp_path):
+    """The same label twice carries no ambiguity, so the tile stays scoreable."""
+    from assign_hpc_clusters import _dedupe_truth
+    truth = _truth([
+        ("S1", "sl1", "1_1.jpeg", 5),
+        ("S1", "sl1", "1_1.jpeg", 5),
+        ("S1", "sl1", "2_2.jpeg", 7),
+    ])
+    clean, ambiguous, redundant = _dedupe_truth(truth, "leiden_2.5")
+    assert ambiguous == [] and redundant == 1
+    assert sorted(clean["tiles"]) == ["1_1.jpeg", "2_2.jpeg"]
+    assert clean.loc[clean["tiles"] == "1_1.jpeg", "leiden_2.5"].tolist() == [5]
+
+
+def test_every_row_is_accounted_for(tmp_path):
+    """kept + 2 per conflicting pair + redundant must equal the input, or rows
+    are going missing somewhere other than the two documented reasons."""
+    from assign_hpc_clusters import _dedupe_truth
+    truth = _truth([
+        ("S1", "sl1", "1_1.jpeg", 5), ("S1", "sl1", "1_1.jpeg", 9),
+        ("S1", "sl1", "2_2.jpeg", 7), ("S1", "sl1", "2_2.jpeg", 7),
+        ("S1", "sl2", "3_3.jpeg", 1),
+    ])
+    clean, ambiguous, redundant = _dedupe_truth(truth, "leiden_2.5")
+    assert len(clean) + 2 * len(ambiguous) + redundant == len(truth)
+
+
+def test_a_clean_truth_file_is_returned_untouched(tmp_path):
+    from assign_hpc_clusters import _dedupe_truth
+    truth = _truth([("S1", "sl1", "1_1.jpeg", 5), ("S1", "sl1", "2_2.jpeg", 7)])
+    clean, ambiguous, redundant = _dedupe_truth(truth, "leiden_2.5")
+    assert ambiguous == [] and redundant == 0
+    assert clean.equals(truth)
+
+
+def test_a_tile_is_dropped_by_key_not_by_position(tmp_path):
+    """The exclusion is an anti-join on (slides, tiles). Matching on the tile
+    name alone would drop the same tile coordinate from every other slide —
+    silently shrinking the comparison across the whole cohort."""
+    from assign_hpc_clusters import _dedupe_truth
+    truth = _truth([
+        ("S1", "sl1", "1_1.jpeg", 5), ("S1", "sl1", "1_1.jpeg", 9),
+        ("S2", "sl2", "1_1.jpeg", 3),      # same tile name, different slide
+    ])
+    clean, ambiguous, _ = _dedupe_truth(truth, "leiden_2.5")
+    assert ambiguous == [("sl1", "1_1.jpeg")]
+    assert list(clean["slides"]) == ["sl2"], "the other slide's tile was dropped too"
+
+
+def test_validate_scores_no_tile_against_an_arbitrary_label(tmp_path):
+    """Goes through validate(), not the helper, because that is where the naive
+    fix lives. `drop_duplicates(keep="first")` would score a conflicting tile
+    against whichever of its two labels the CSV happened to list first — this
+    hands it the OTHER one, so the naive path reports a disagreement where the
+    honest path reports an excluded tile."""
+    import contextlib
+    import io
+    import pandas as pd
+    from assign_hpc_clusters import validate
+
+    truth_path = tmp_path / "truth.csv"
+    _truth([
+        ("S1", "sl1", "1_1.jpeg", 5),      # listed first
+        ("S1", "sl1", "1_1.jpeg", 9),      # and again, differently
+        ("S1", "sl1", "2_2.jpeg", 7),
+    ]).to_csv(truth_path, index=False)
+
+    frame = pd.DataFrame({
+        "samples": ["S1", "S1"], "slides": ["sl1", "sl1"],
+        "tiles": ["1_1.jpeg", "2_2.jpeg"],
+        "leiden_2.5": [9, 7],              # 9 is the label keep="first" discards
+        "vote_margin": [0.9, 0.9],
+    })
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        agreed = validate(frame, truth_path, "leiden_2.5")
+    text = out.getvalue()
+
+    # Honest: the ambiguous tile is excluded, so 1 tile matched and it agrees.
+    # Naive keep-first: 2 matched, one scored against 5, agreement 50%.
+    assert agreed is True, text
+    assert "1 of 2 tiles matched" in text, text
+    assert "excluded" in text and "DIFFERENT" in text, text
+    assert "agreement 100.000%" in text, text
+
+
+def test_validate_survives_the_real_label_files_duplicates(tmp_path):
+    """End to end on Kai's actual CSV if it is present, since that is the file
+    the acceptance test names and the one that used to crash."""
+    import pandas as pd
+    from assign_hpc_clusters import validate
+    real = BACKEND.parent / "TCGA_LUAD_5x_he_train_filtered_leiden_2p5__fold2.csv"
+    if not real.is_file():
+        return          # not on this machine; the unit tests above still hold
+    truth = pd.read_csv(real)
+
+    # An "assignment" that agrees with the truth everywhere it is defined, built
+    # from the truth itself so the only thing under test is the join.
+    frame = truth.drop_duplicates(["slides", "tiles"], keep=False).copy()
+    frame["vote_margin"] = 0.9
+    assert validate(frame, real, "leiden_2.5") is True
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

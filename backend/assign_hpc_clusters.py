@@ -743,6 +743,48 @@ def assign(args) -> dict:
     }
 
 
+def _dedupe_truth(truth: pd.DataFrame, groupby: str
+                  ) -> tuple[pd.DataFrame, list[tuple], int]:
+    """Make (slides, tiles) unique in the truth file, and say what was dropped.
+
+    Kai's TCGA label CSV lists 100 tiles twice, 96 of them with two *different*
+    Leiden labels — all on one slide, which looks like a slide tiled twice and
+    clustered independently each time. The merge below asks for one_to_one
+    precisely so a duplicated key cannot silently multiply rows, so before this
+    the whole acceptance test died on a pandas MergeError naming neither the file
+    nor the slide.
+
+    Dropping duplicates blindly would be worse than crashing: whichever row came
+    first would become "the" truth, and 96 tiles would be scored against a label
+    chosen by CSV ordering. So:
+
+      * duplicated with the same label — redundant, keep one, nothing changes.
+      * duplicated with different labels — there is no fact to be right about,
+        so the tile is excluded from the comparison and counted out loud.
+
+    Returns (unique truth, ambiguous keys, redundant row count).
+    """
+    key = ["slides", "tiles"]
+    duplicated = truth[truth.duplicated(key, keep=False)]
+    if duplicated.empty:
+        return truth, [], 0
+
+    labels_per_key = duplicated.groupby(key)[groupby].nunique()
+    ambiguous_keys = labels_per_key[labels_per_key > 1].index
+    ambiguous = list(ambiguous_keys)
+
+    cleaned = truth
+    if len(ambiguous):
+        # An index-based anti-join, so a tile is dropped by its (slides, tiles)
+        # pair rather than by position.
+        flat = set(ambiguous)
+        keep = ~pd.MultiIndex.from_frame(truth[key]).isin(flat)
+        cleaned = truth[keep]
+    redundant = int(len(cleaned) - len(cleaned.drop_duplicates(key)))
+    cleaned = cleaned.drop_duplicates(key)
+    return cleaned, ambiguous, redundant
+
+
 def validate(frame: pd.DataFrame, truth_path: Path, groupby: str) -> bool:
     """Agreement against labels produced by the reference implementation.
 
@@ -752,6 +794,8 @@ def validate(frame: pd.DataFrame, truth_path: Path, groupby: str) -> bool:
     truth = pd.read_csv(truth_path)
     if groupby not in truth.columns:
         raise SystemExit(f"{truth_path} has no '{groupby}' column: {list(truth.columns)}")
+
+    truth, ambiguous, redundant = _dedupe_truth(truth, groupby)
 
     merged = frame.merge(
         truth[["slides", "tiles", groupby]].rename(columns={groupby: "expected"}),
@@ -770,6 +814,14 @@ def validate(frame: pd.DataFrame, truth_path: Path, groupby: str) -> bool:
 
     print(f"\nValidation: {len(merged):,} of {len(frame):,} tiles matched by "
           f"(slides, tiles)")
+    if redundant:
+        print(f"  {redundant:,} tile(s) listed more than once with the SAME label "
+              f"— deduplicated, no effect on the number below.")
+    if ambiguous:
+        print(f"  {len(ambiguous):,} tile(s) listed more than once with DIFFERENT "
+              f"labels — excluded, since there is no label to be right about. "
+              f"Slides affected: {', '.join(sorted({s for s, _ in ambiguous})[:3])}"
+              + (" ..." if len({s for s, _ in ambiguous}) > 3 else ""))
     print(f"  agreement {agreement*100:.3f}%  ({int(same.sum()):,} / {len(merged):,})")
 
     if not same.all():

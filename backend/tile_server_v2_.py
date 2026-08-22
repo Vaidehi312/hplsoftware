@@ -85,6 +85,8 @@ from submit_feature_extraction import (
     HPL_REPO_DIR,
 )
 
+import cohort_shift
+from build_hpc_reference import HPC_REFERENCE_PATH
 from submit_cluster_assignment import (
     DEFAULT_VOTE_PRESET,
     VOTE_PRESETS,
@@ -1840,6 +1842,94 @@ def list_dataset_roots():
     doesn't require picking from this list.
     """
     return {"root": str(LONG_TERM_SCRATCH), "datasets": _list_dataset_roots()}
+
+
+class CohortShiftRequest(BaseModel):
+    # Defaults to this run's tracked assignment CSV. Overridable for the same
+    # reason Stage 5's csv_path is: Stage 4's test mode records no path.
+    csv_path: str | None = None
+    top_slides: int = 10
+
+
+@app.post("/dataset-jobs/{submission_id}/cohort-shift")
+def check_cohort_shift(submission_id: str, req: CohortShiftRequest):
+    """Is this dataset's tissue represented in the reference at all?
+
+    Read-only and cheap — it reads two columns of the assignments CSV and
+    compares them against precomputed reference quantiles. No search, no GPU.
+
+    Deliberately separate from /kb-load-preview even though both are read-only
+    checks on the same CSV. Stage 5's preview answers "will this load cleanly",
+    which is about naming and coverage. This answers "should it be loaded at
+    all", which is about whether the cluster IDs mean anything for this cohort.
+    A clean preview and a shifted cohort is a perfectly possible combination,
+    and the whole point is that it looks fine.
+    """
+    row = _get_dataset_run_row(submission_id)
+    csv_path = Path(req.csv_path) if req.csv_path else (
+        Path(row["assignment_output_path"]) if row.get("assignment_output_path")
+        else None)
+    if csv_path is None:
+        raise HTTPException(
+            400,
+            "This run has no assignment CSV yet, and no csv_path was given. "
+            "Run Stage 4 first, or pass the path of a CSV from its test mode.",
+        )
+    if not csv_path.is_file():
+        raise HTTPException(400, f"{csv_path} does not exist.")
+
+    # The profile has to describe the vote that produced this CSV. The run record
+    # is the only place that is written down -- the CSV cannot carry it, since
+    # load_hpc_assignments.py identifies its cluster column by elimination.
+    recorded = row.get("assignment_vote") or ""
+    preset = DEFAULT_VOTE_PRESET
+    for name in VOTE_PRESETS:
+        if recorded.startswith(name):
+            preset = name
+            break
+    reference = Path(row.get("assignment_reference") or HPC_REFERENCE_PATH)
+    profile_path = cohort_shift.default_profile_path(reference, preset)
+    if not profile_path.is_file():
+        raise HTTPException(
+            400,
+            f"No reference profile for the '{preset}' vote at {profile_path}. "
+            f"Build it once per (reference, vote) pair — it needs a leave-one-out "
+            f"run over the reference, which takes ~20 minutes and is then reused "
+            f"by every dataset:\n"
+            f"  python validate_reference.py --reference {reference} "
+            f"--sample 200000 --save-profile {profile_path}\n"
+            f"adding the same vote flags the assignment used.",
+        )
+
+    try:
+        profile = cohort_shift.load_profile(profile_path)
+        frame = pd.read_csv(csv_path, usecols=lambda c: c in (
+            "neighbor_distance", "vote_margin", "slides"))
+        result = cohort_shift.compare(frame, profile)
+    except SystemExit as e:
+        # load_profile and compare refuse with SystemExit; that is the caller's
+        # to fix, not a fault.
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Cohort-shift check failed: {e}")
+
+    level, sentence = cohort_shift.verdict(result)
+    return {
+        "submission_id": submission_id,
+        "csv_path": str(csv_path),
+        "profile_path": str(profile_path),
+        "vote_preset": preset,
+        "recorded_vote": recorded or None,
+        "profile_vote": profile.get("vote"),
+        "level": level,
+        "verdict": sentence,
+        "slide_spread": cohort_shift.slide_concentration(result),
+        # Trimmed to what the UI draws: the full per-slide list can be thousands
+        # of rows and nothing renders them all.
+        **{key: value for key, value in result.items() if key != "per_slide"},
+        "per_slide": (result.get("per_slide") or [])[:max(req.top_slides, 0)],
+        "n_slides": len(result.get("per_slide") or []),
+    }
 
 
 @app.get("/vote-presets")

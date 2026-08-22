@@ -2348,6 +2348,10 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
         # migrate_dataset_runs_assignment_vote.sql applied.
         if status.get("assignment_vote"):
             st.caption(f"Vote: {status['assignment_vote']}")
+        # Offered here rather than in Stage 5 because it decides whether to go on
+        # to Stage 5 at all. The load can be perfectly clean while the cluster
+        # IDs mean nothing for this cohort.
+        _render_cohort_shift(submission_id, key_prefix)
         return
 
     if state == "blocked":
@@ -2378,6 +2382,87 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
         status, submission_id, key_prefix,
         button_label="Retry cluster assignment" if assignment_job_id else "Start cluster assignment",
     )
+
+
+_SHIFT_STYLE = {
+    "consistent": ("✅", st.success),
+    "notice": ("⚠️", st.warning),
+    "alarm": ("🛑", st.error),
+}
+
+
+def _render_cohort_shift(submission_id: str, key_prefix: str) -> None:
+    """Is this cohort's tissue in the reference at all?
+
+    Not run automatically. It is cheap, but it is a distinct question from "did
+    Stage 4 work", and a result nobody asked for is a result nobody reads. The
+    button states the question so the answer means something when it appears.
+    """
+    with st.expander("Is this cohort represented in the reference?", expanded=False):
+        st.caption(
+            "k-NN gives every tile its nearest cluster however far away that "
+            "cluster is, and reports nothing. So a cohort from a different "
+            "scanner or stain still produces a complete assignment and per-slide "
+            "proportions that differ — differences that read as biology. This "
+            "compares this dataset's distance-to-reference against the "
+            "reference's own, which is the cheapest way to tell the two apart."
+        )
+        if not st.button("Check", key=f"{key_prefix}shift_{submission_id}"):
+            return
+        try:
+            result = client.check_cohort_shift(submission_id)
+        except requests.exceptions.HTTPError as e:
+            detail = e.response.text if e.response is not None else str(e)
+            st.error(detail)
+            return
+
+        icon, box = _SHIFT_STYLE.get(result.get("level"), ("", st.info))
+        box(f"{icon} {result.get('level', '?').upper()} — {result.get('verdict', '')}")
+
+        left, middle, right = st.columns(3)
+        left.metric(
+            "Tiles beyond the reference's 99th percentile",
+            f"{result.get('beyond_envelope', 0) * 100:.1f}%",
+            delta=f"{result.get('novelty_ratio', float('nan')):.1f}x expected",
+            delta_color="inverse",
+        )
+        middle.metric(
+            "Median tile sits at reference percentile",
+            f"{result.get('median_percentile', float('nan')):.0f}th",
+        )
+        spread = result.get("slide_spread")
+        right.metric(
+            "Spread across slides",
+            "n/a" if spread is None else f"{spread * 100:.0f} pts",
+            help="Wide means some slides carry it — look at those rather than "
+                 "rejecting the cohort. Narrow means it is the cohort itself.",
+        )
+
+        levels = result.get("levels") or []
+        if levels and result.get("cohort_distance"):
+            st.caption("Distance to the reference, by quantile")
+            st.dataframe(
+                {
+                    "quantile": [f"{x * 100:g}%" for x in levels],
+                    "reference": result.get("reference_distance", []),
+                    "this cohort": result.get("cohort_distance", []),
+                },
+                hide_index=True, width="stretch",
+            )
+
+        rows = result.get("per_slide") or []
+        if rows:
+            st.caption(
+                f"Worst {len(rows)} of {result.get('n_slides', len(rows))} slides "
+                f"by share beyond the envelope"
+            )
+            st.dataframe(rows, hide_index=True, width="stretch")
+
+        # Which baseline this was measured against. A profile built under a
+        # different vote is not a valid comparison, and the server picks by
+        # preset — so showing both is how a mismatch becomes visible.
+        st.caption(f"Vote: {result.get('recorded_vote') or result.get('vote_preset')}")
+        st.caption(f"Reference profile: {result.get('profile_vote')}")
 
 
 def _render_vote_picker(submission_id: str, key_prefix: str) -> tuple[str, dict]:

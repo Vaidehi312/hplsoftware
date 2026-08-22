@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from assign_hpc_clusters import Searcher, compute_local_scale, vote  # noqa: E402
 from build_hpc_reference import HPC_REFERENCE_PATH  # noqa: E402
+from cohort_shift import build_profile, save_profile  # noqa: E402
 from superclusters import load_mapping, report as report_superclusters, summarise  # noqa: E402
 
 # Enough for a tight confidence interval on an accuracy near 0.9 (±0.4% at
@@ -272,6 +273,7 @@ def leave_one_out(reference: dict, sample: int, k: int,
     # The cluster that came second. A tiebreak rule only ever chooses between
     # this and the winner, so it is the other half of what such a rule needs.
     runner_up = np.empty(len(query_index), dtype=np.int64)
+    distances = np.empty(len(query_index), dtype=np.float32)
     n_revoted = 0
     started = time.perf_counter()
 
@@ -304,12 +306,13 @@ def leave_one_out(reference: dict, sample: int, k: int,
         trimmed_idx = wide_idx[:, :k]
         trimmed_dist = wide_dist[:, :k]
 
-        winners, margin, _, counts = vote(trimmed_idx, trimmed_dist, codes, n_clusters,
-                                          distance_weighted=distance_weighted,
-                                          distance_power=distance_power,
-                                          class_weights=class_weights,
-                                          local_scale=local_scale,
-                                          return_counts=True)
+        winners, margin, distance, counts = vote(
+            trimmed_idx, trimmed_dist, codes, n_clusters,
+            distance_weighted=distance_weighted,
+            distance_power=distance_power,
+            class_weights=class_weights,
+            local_scale=local_scale,
+            return_counts=True)
         if adaptive_margin > 0:
             low = margin < adaptive_margin
             if low.any():
@@ -331,6 +334,11 @@ def leave_one_out(reference: dict, sample: int, k: int,
 
         predicted[start:stop] = winners
         margins[start:stop] = margin
+        # The mean distance to the k nearest reference tiles, kept rather than
+        # discarded: it is the reference's own novelty distribution, and the only
+        # baseline a new cohort's distances can be compared against. Recomputing
+        # it later would mean another search over 2.5M rows.
+        distances[start:stop] = distance
         row_truth = codes[rows]
         # faiss pads a short result with -1, and codes[-1] is the *last
         # reference row's* cluster — so counting without masking would credit
@@ -365,6 +373,7 @@ def leave_one_out(reference: dict, sample: int, k: int,
         "truth": truth,
         "predicted": predicted,
         "margins": margins,
+        "distances": distances,
         "truth_neighbours": truth_neighbours,
         "truth_rank": truth_rank,
         "runner_up": runner_up,
@@ -482,6 +491,7 @@ def holdout_accuracy(reference: dict, holdout: dict, k: int, batch: int,
     margins = np.empty(len(queries), dtype=np.float32)
     truth_neighbours = np.empty(len(queries), dtype=np.int32)
     truth_rank = np.empty(len(queries), dtype=np.int32)
+    distances = np.empty(len(queries), dtype=np.float32)
     n_revoted = 0
 
     started = time.perf_counter()
@@ -489,7 +499,7 @@ def holdout_accuracy(reference: dict, holdout: dict, k: int, batch: int,
         stop = min(start + batch, len(queries))
         idx, dist = searcher.search(
             np.ascontiguousarray(queries[start:stop]), k_search)
-        winners, margin, _, counts = vote(
+        winners, margin, distance, counts = vote(
             idx[:, :k], dist[:, :k], codes, n_clusters,
             distance_weighted=distance_weighted, distance_power=distance_power,
             class_weights=class_weights, local_scale=local_scale,
@@ -511,6 +521,7 @@ def holdout_accuracy(reference: dict, holdout: dict, k: int, batch: int,
 
         predicted[start:stop] = winners
         margins[start:stop] = margin
+        distances[start:stop] = distance
         row_truth = truth[start:stop]
         # Same -1 padding guard as leave_one_out: codes[-1] is a real cluster,
         # so counting without masking credits every padded slot to it.
@@ -533,6 +544,7 @@ def holdout_accuracy(reference: dict, holdout: dict, k: int, batch: int,
         "truth": truth,
         "predicted": predicted,
         "margins": margins,
+        "distances": distances,
         "truth_neighbours": truth_neighbours,
         "truth_rank": truth_rank,
         "categories": reference["categories"],
@@ -799,6 +811,15 @@ def main() -> None:
                         help="How many weakest clusters to list.")
     parser.add_argument("--min-accuracy", type=float, default=None,
                         help="Exit non-zero below this, for use as a gate.")
+    parser.add_argument("--save-profile", type=Path, default=None,
+                        help="Write this reference's own neighbor_distance and "
+                             "vote_margin distribution here, as quantiles. It is "
+                             "the baseline cohort_shift.py compares a new "
+                             "dataset against — the cheapest probe for whether a "
+                             "new cohort's tissue is represented at all, which "
+                             "accuracy cannot answer without labels. Pinned to "
+                             "the vote settings of this run, since distances "
+                             "depend on k and margins on every knob.")
     parser.add_argument("--holdout", type=Path, default=None,
                         help="A holdout .npz from build_hpc_reference.py "
                              "--holdout-slides, evaluated against the reduced "
@@ -899,6 +920,40 @@ def main() -> None:
         "embeddings into it — for that, run assign_hpc_clusters.py "
         "--validate-against with labels you already trust."
     )
+
+    if args.save_profile is not None:
+        # From the leave-one-out result, not the holdout: the baseline has to
+        # describe the reference as it ships, and a holdout reference is missing
+        # whole slides.
+        vote = " ".join(filter(None, [
+            f"k={k}",
+            "--distance-weighted" if args.distance_weighted else "",
+            f"--distance-power {args.distance_power:g}"
+            if args.distance_weighted else "",
+            "--class-weighted" if args.class_weighted else "",
+            f"--local-scaling {args.local_scaling}" if args.local_scaling else "",
+            f"--adaptive-margin {args.adaptive_margin:g}"
+            if args.adaptive_margin > 0 else "",
+            f"--adaptive-k {args.adaptive_k}" if args.adaptive_margin > 0 else "",
+        ]))
+        profile = build_profile(
+            result["distances"], result["margins"], result["truth"],
+            [str(c) for c in result["categories"]],
+            reference=args.reference.name,
+            reference_rows=len(reference["vectors"]),
+            groupby=reference["groupby"], vote=vote, seed=args.seed)
+        if reference.get("holdout_slides"):
+            print(f"\nNOT writing a profile: {args.reference} is a slide-holdout "
+                  f"reference, so its distances describe a reference that is "
+                  f"missing whole slides. Build the profile from the full one.",
+                  file=sys.stderr)
+        else:
+            save_profile(profile, args.save_profile)
+            print(f"\nReference profile written to {args.save_profile}")
+            print(f"  vote  {vote}")
+            print(f"  Compare a dataset against it with:")
+            print(f"    python cohort_shift.py --assignments <dataset>.csv "
+                  f"--profile {args.save_profile}")
 
     if args.min_accuracy is not None and result["accuracy"] < args.min_accuracy:
         raise SystemExit(

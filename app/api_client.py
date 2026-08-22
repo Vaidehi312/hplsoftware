@@ -406,6 +406,22 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/assign-clusters-test", body,
         )
 
+    def check_cohort_shift(self, submission_id: str, csv_path: str | None = None,
+                          top_slides: int = 10) -> dict:
+        """Is this dataset's tissue represented in the reference at all?
+
+        Read-only and cheap: two columns of the assignment CSV against
+        precomputed reference quantiles. Separate from the Stage 5 preview on
+        purpose — that one asks whether the load will be clean, this one asks
+        whether the cluster IDs mean anything for this cohort, and a clean
+        preview on a shifted cohort is exactly the combination that looks fine
+        and is not.
+        """
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/cohort-shift",
+            {"csv_path": csv_path, "top_slides": top_slides},
+        )
+
     def preview_kb_load(self, submission_id: str, min_margin: float = 0.0,
                         csv_path: str | None = None) -> dict:
         """Stage 5 dry run: what loading an assignment CSV into the

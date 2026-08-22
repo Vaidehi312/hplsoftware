@@ -658,3 +658,56 @@ Two independent tools agreeing is worth noting: `tune_classifier`'s sweep and
 `tiebreak_experiment`'s adaptive arm both give **97.23%** for `k=10 / pow 3 /
 adapt 0.1 / k=25`, computed through separately written code paths from the
 baseline vote down.
+
+## §21 The acceptance test, finally run — and what 99.619% does and does not say
+
+Run 2026-08-22 at the **default (legacy) vote**, against
+`hdf5_TCGA_LUAD_5x_he_train_reps.h5` (545,185 tiles) and the production reference:
+
+```
+Validation: 499,108 of 545,185 tiles matched by (slides, tiles)
+  agreement 99.619%  (497,204 / 499,108)
+  disagreements 1,904; vote_margin median 0.004 vs 0.632 for agreements
+  highest-margin disagreements: 0.048, 0.044, 0.044, 0.040, 0.040
+Agreement acceptable.
+```
+
+**The gate is closed.** `CLAUDE.md` calls below 99% a defect, and this is the
+first time the number has existed. It had never run before for two reasons found
+in getting here, both fixed: the truth file lists 100 tiles twice and 96 with
+conflicting labels, which the `one_to_one` merge correctly refused (`f8d6f67`);
+and passing `--validate-against` as a bare filename produced `--bind .:.`, which
+Singularity refuses, killing the job in seconds with an error naming an absolute
+path and complaining a path was not absolute (`5adf46b`).
+
+**What it validates: the plumbing.** This is the only check that exercises the PCA
+projection, `--centering query`, the `varm/PCs` basis, and the `(slides, tiles)`
+join end to end on real embeddings. Leave-one-out covers none of it — it starts
+from vectors already in the reference's space. So 99.619% confirms that the path
+from encoder output to cluster ID is wired correctly across 499,108 tiles. Given
+this pipeline's failure mode, that is the single most valuable thing it could
+have told us.
+
+**What it does not say: how accurate the classifier is.** The margin split gives
+it away. Disagreements have a median `vote_margin` of **0.004** against **0.632**
+for agreements, and the *highest*-margin disagreement in 545,185 tiles is
+**0.048**. Every single disagreement is a dead tie.
+
+That is not what a genuine transfer looks like. Leave-one-out errors spread across
+the whole margin range — 4,861 of 6,375 below margin 0.25, but with errors present
+up to 0.75 (§20). Here they are confined to a band 15x narrower. The explanation
+is that these tiles are in the reference: for any tile that is not exactly tied,
+the answer is already determined before the vote does any work. So the honest
+accuracy estimate remains leave-one-out's ~97%, and that is still optimistic for
+a new cohort because a tile's own slide-mates stay in the reference.
+
+**Also learned:** 499,108 tiles matched, not the ~360,000 predicted from the local
+copy of the label CSV (360,471 unique keys after dedup). So the cluster's
+`TCGA_LUAD_5x_he_train_filtered_leiden_2p5__fold2.csv` is a **third** distinct file
+with that name — there are already two locally, one carrying `leiden_2.5` and one
+carrying `hpc_id`. Any statement about "the label CSV" has to name which machine.
+
+**Still outstanding**, unchanged by this: the same test at `--vote-preset tuned`
+(expected to come out *lower*, per §19 — the tuned vote deliberately stops
+imitating `sc.tl.ingest`), and the slide-level holdout, which is the only design
+here that would produce an accuracy figure predictive of a new cohort.

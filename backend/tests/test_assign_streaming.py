@@ -1011,8 +1011,20 @@ def test_the_symlink_and_its_target_are_still_bound_separately(tmp_path):
     link.symlink_to(target)
 
     specs = [b.split(":", 1)[0] for b in _bind_args(link / "file.txt") if ":" in b]
+    # Compared by realpath, not by string: on macOS tempfile hands back
+    # /var/folders/... where /var is itself a symlink to /private/var, so the
+    # bound realpath form resolves two links at once and never equals
+    # str(target). Under pytest tmp_path is already resolved and it does — which
+    # is why this passed there and failed standalone.
+    import os
     assert str(link) in specs, f"the symlink form was not bound: {specs}"
-    assert str(target) in specs, f"the realpath form was not bound: {specs}"
+    resolved = {os.path.realpath(spec) for spec in specs}
+    assert os.path.realpath(target) in resolved, \
+        f"the realpath form was not bound: {specs}"
+    # Two distinct entries, which is the property that matters: collapsing them
+    # is what resolve() would do and what would break the /hpc-home side.
+    assert len({os.path.realpath(link), os.path.realpath(target)}) == 1
+    assert str(link) not in {str(target)}, "the fixture did not create a symlink"
 
 
 def test_a_relative_validate_against_is_bound_absolutely(tmp_path):

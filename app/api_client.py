@@ -406,6 +406,16 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/assign-clusters-test", body,
         )
 
+    def cohort_shift_readiness(self, submission_id: str) -> dict:
+        """Can the cohort check run for this run yet, and what is missing?
+
+        Separate GET so the UI can state the prerequisite before anyone clicks.
+        The reference profile is a one-off ~20 minute job reused by every
+        dataset, so "not built yet" is a setup step, not an error.
+        """
+        return self._get_json(
+            f"/dataset-jobs/{submission_id}/cohort-shift-readiness")
+
     def check_cohort_shift(self, submission_id: str, csv_path: str | None = None,
                           top_slides: int = 10) -> dict:
         """Is this dataset's tissue represented in the reference at all?

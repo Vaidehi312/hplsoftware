@@ -90,7 +90,9 @@ from build_hpc_reference import HPC_REFERENCE_PATH
 from submit_cluster_assignment import (
     DEFAULT_VOTE_PRESET,
     VOTE_PRESETS,
+    resolve_vote,
     submit_cluster_assignment_job,
+    vote_flags,
 )
 
 from load_hpc_assignments import (
@@ -1842,6 +1844,45 @@ def list_dataset_roots():
     doesn't require picking from this list.
     """
     return {"root": str(LONG_TERM_SCRATCH), "datasets": _list_dataset_roots()}
+
+
+@app.get("/dataset-jobs/{submission_id}/cohort-shift-readiness")
+def cohort_shift_readiness(submission_id: str):
+    """Can the cohort check run for this run yet, and if not, what is missing?
+
+    So the UI can state the prerequisite before anyone clicks, rather than
+    turning a 400 into a wall of text. The profile is a one-off ~20 minute
+    leave-one-out over the reference and is then reused by every dataset, so the
+    common case is that it already exists and this returns ready.
+    """
+    row = _get_dataset_run_row(submission_id)
+    csv_path = (Path(row["assignment_output_path"])
+                if row.get("assignment_output_path") else None)
+    recorded = row.get("assignment_vote") or ""
+    preset = DEFAULT_VOTE_PRESET
+    for name in VOTE_PRESETS:
+        if recorded.startswith(name):
+            preset = name
+            break
+    reference = Path(row.get("assignment_reference") or HPC_REFERENCE_PATH)
+    profile_path = cohort_shift.default_profile_path(reference, preset)
+
+    flags = " ".join(vote_flags(**resolve_vote(preset)))
+    return {
+        "submission_id": submission_id,
+        "ready": bool(csv_path and csv_path.is_file() and profile_path.is_file()),
+        "has_assignments": bool(csv_path and csv_path.is_file()),
+        "assignments_path": str(csv_path) if csv_path else None,
+        "has_profile": profile_path.is_file(),
+        "profile_path": str(profile_path),
+        "vote_preset": preset,
+        # No assumption about the deployment's cwd: absolute paths throughout,
+        # since a relative one is what broke the acceptance test's container.
+        "build_profile_command": (
+            f"python validate_reference.py --reference {reference} "
+            f"--sample 200000 {flags} --save-profile {profile_path}"
+        ),
+    }
 
 
 class CohortShiftRequest(BaseModel):

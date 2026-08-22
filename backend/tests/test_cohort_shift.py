@@ -358,6 +358,86 @@ def test_the_api_client_posts_to_the_cohort_shift_endpoint(tmp_path):
     assert sent["body"] == {"csv_path": "/x.csv", "top_slides": 3}
 
 
+# --- the UI must be able to state the prerequisite -----------------------
+
+
+def test_the_readiness_endpoint_reports_what_is_missing(tmp_path):
+    """Without this the first click returns a 400 whose message is a command,
+    rendered as a JSON envelope with the newlines escaped. A check nobody can
+    run is the same as no check."""
+    import tile_server_v2_ as srv
+    import inspect
+
+    src = inspect.getsource(srv.cohort_shift_readiness)
+    for field in ("ready", "has_assignments", "has_profile", "profile_path",
+                  "build_profile_command", "vote_preset"):
+        assert f'"{field}"' in src, f"readiness does not report {field}"
+    # The command it hands out must be absolute: a relative path is what turned
+    # the acceptance test into a container that would not start.
+    assert "--reference {reference}" in src
+    assert "--save-profile {profile_path}" in src
+
+
+def test_the_suggested_command_actually_builds_the_expected_profile(tmp_path):
+    """The path in the command and the path the check reads must be the same
+    file, or the operator runs a 20-minute job and the button still fails."""
+    from submit_cluster_assignment import resolve_vote, vote_flags
+
+    reference = tmp_path / "hpc_reference_leiden_2p5_fold2.npz"
+    for preset in ("tuned", "legacy"):
+        expected = cs.default_profile_path(reference, preset)
+        flags = " ".join(vote_flags(**resolve_vote(preset)))
+        command = (f"python validate_reference.py --reference {reference} "
+                   f"--sample 200000 {flags} --save-profile {expected}")
+        assert str(expected) in command
+        # And the flags must be the ones that preset actually means, so the
+        # baseline describes the vote the assignment used.
+        if preset == "tuned":
+            assert "--adaptive-margin 0.15" in command
+            assert "--distance-power 3" in command
+        else:
+            assert "--adaptive-margin" not in command
+
+
+def test_the_ui_reads_the_detail_not_the_json_envelope(tmp_path):
+    """_http_detail exists because st.error(e.response.text) shows
+    {"detail":"...\\n..."} with escaped newlines."""
+    import sys as _sys
+    _sys.path.insert(0, str(BACKEND.parent / "app"))
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_app_probe", BACKEND.parent / "app" / "app_v28.py")
+    # app_v28 imports streamlit and much else at module level, so pull the
+    # function out by source rather than importing the module.
+    source = (BACKEND.parent / "app" / "app_v28.py").read_text()
+    start = source.index("def _http_detail")
+    end = source.index("_SHIFT_STYLE = {")
+    namespace: dict = {}
+    exec(compile(source[start:end], "probe", "exec"), namespace)
+    http_detail = namespace["_http_detail"]
+
+    class _Response:
+        def __init__(self, payload, text):
+            self._payload, self.text = payload, text
+
+        def json(self):
+            if self._payload is None:
+                raise ValueError("not json")
+            return self._payload
+
+    class _Error(Exception):
+        def __init__(self, response):
+            self.response = response
+
+    multiline = "No reference profile.\n  python validate_reference.py ..."
+    assert http_detail(_Error(_Response({"detail": multiline}, "{...}"))) == multiline
+    # Non-JSON falls back to the raw text rather than exploding.
+    assert http_detail(_Error(_Response(None, "gateway timeout"))) == "gateway timeout"
+    # And no response at all is still a string.
+    assert http_detail(Exception("boom")) == "boom"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

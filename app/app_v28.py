@@ -2384,6 +2384,24 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
     )
 
 
+def _http_detail(error) -> str:
+    """FastAPI's `detail`, not the JSON envelope around it.
+
+    The convention elsewhere in this file is to show e.response.text, which for a
+    long multi-line message renders as {"detail":"...\n..."} with the newlines
+    escaped — unreadable exactly when the message matters most.
+    """
+    response = getattr(error, "response", None)
+    if response is None:
+        return str(error)
+    try:
+        payload = response.json()
+    except Exception:
+        return response.text
+    detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+    return detail if isinstance(detail, str) else str(detail)
+
+
 _SHIFT_STYLE = {
     "consistent": ("✅", st.success),
     "notice": ("⚠️", st.warning),
@@ -2407,13 +2425,36 @@ def _render_cohort_shift(submission_id: str, key_prefix: str) -> None:
             "compares this dataset's distance-to-reference against the "
             "reference's own, which is the cheapest way to tell the two apart."
         )
+        # State the prerequisite before the button, not after. The reference
+        # profile is a one-off job reused by every dataset, so "not built yet" is
+        # a setup step — turning it into a 400 that renders as a JSON envelope
+        # with a command mangled inside is how a check nobody can run gets built.
+        try:
+            readiness = client.cohort_shift_readiness(submission_id)
+        except Exception:
+            readiness = None
+
+        if readiness and not readiness.get("has_profile"):
+            st.warning(
+                f"No reference baseline for the '{readiness.get('vote_preset')}' "
+                f"vote yet. It is a one-off leave-one-out over the reference "
+                f"(~20 minutes) and is then reused by every dataset. Run this "
+                f"once on the cluster:"
+            )
+            st.code(readiness.get("build_profile_command", ""), language="bash")
+            st.caption(f"It will be written to {readiness.get('profile_path')}, "
+                       f"where this page looks for it.")
+            return
+        if readiness and not readiness.get("has_assignments"):
+            st.info("No assignment CSV for this run yet — finish Stage 4 first.")
+            return
+
         if not st.button("Check", key=f"{key_prefix}shift_{submission_id}"):
             return
         try:
             result = client.check_cohort_shift(submission_id)
         except requests.exceptions.HTTPError as e:
-            detail = e.response.text if e.response is not None else str(e)
-            st.error(detail)
+            st.error(_http_detail(e))
             return
 
         icon, box = _SHIFT_STYLE.get(result.get("level"), ("", st.info))

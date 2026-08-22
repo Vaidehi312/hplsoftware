@@ -979,6 +979,71 @@ def test_validate_survives_the_real_label_files_duplicates(tmp_path):
     assert validate(frame, real, "leiden_2.5") is True
 
 
+# --- container binds -----------------------------------------------------
+#
+# A real failure: `--validate-against <bare filename.csv>` made
+# validate_against.parent == Path("."), which _bind_args turned into
+# "--bind .:.". Singularity resolves the source against the job's cwd but leaves
+# the destination relative, so it refused with an error naming an ABSOLUTE source
+# path and complaining the destination was not absolute -- pointing nowhere near
+# the relative argument that caused it. The job died in seconds after queueing.
+
+
+def test_a_relative_path_never_produces_a_relative_bind(tmp_path):
+    from submit_feature_extraction import _bind_args
+    specs = [b for b in _bind_args("assign_hpc_clusters.py") if ":" in b]
+    assert specs, "no binds produced at all"
+    for spec in specs:
+        source, destination = spec.split(":", 1)
+        assert destination.startswith("/"), f"relative bind destination: {spec}"
+        assert source.startswith("/"), f"relative bind source: {spec}"
+
+
+def test_the_symlink_and_its_target_are_still_bound_separately(tmp_path):
+    """The fix uses abspath, not resolve(). resolve() would follow the symlink
+    and collapse the two candidates into one, losing the /hpc-home side -- which
+    is the entire reason _bind_args binds each path twice."""
+    from submit_feature_extraction import _bind_args
+    target = tmp_path / "real"
+    target.mkdir()
+    (target / "file.txt").write_text("x")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+
+    specs = [b.split(":", 1)[0] for b in _bind_args(link / "file.txt") if ":" in b]
+    assert str(link) in specs, f"the symlink form was not bound: {specs}"
+    assert str(target) in specs, f"the realpath form was not bound: {specs}"
+
+
+def test_a_relative_validate_against_is_bound_absolutely(tmp_path):
+    """End to end through the command builder, which is where the relative path
+    actually entered — _bind_args is only reached via validate_against.parent."""
+    from submit_cluster_assignment import _build_assignment_command
+    truth = tmp_path / "truth.csv"
+    truth.write_text("samples,slides,tiles,leiden_2.5\n")
+
+    import os
+    previous = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        command = _build_assignment_command(
+            singularity_bin="singularity", singularity_image=tmp_path / "i.sif",
+            extras_dir=tmp_path / "extras",
+            assign_script=BACKEND / "assign_hpc_clusters.py",
+            reference=tmp_path / "ref.npz", projections_h5=tmp_path / "q.h5",
+            out_csv=tmp_path / "out.csv", rep_key="z_latent", k=None,
+            batch_size=16_384,
+            validate_against=Path("truth.csv"),   # bare filename, as a user types
+            vote=[],
+        )
+    finally:
+        os.chdir(previous)
+
+    assert " .:." not in command and "--bind .:." not in command, command
+    # And the truth file still reaches the job as an absolute path.
+    assert str(truth.resolve()) in command or str(truth) in command, command
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

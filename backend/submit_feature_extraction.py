@@ -705,6 +705,18 @@ def _bind_args(*paths: Path | str) -> list[str]:
     seen: set[str] = set()
 
     def add(target: Path) -> None:
+        # Absolute first. A relative path here becomes "--bind .:." and
+        # Singularity refuses it: it resolves the source against the job's cwd
+        # but leaves the destination relative, so the error names an absolute
+        # source and complains the destination is not absolute -- pointing
+        # nowhere near the relative argument that caused it. Reached by passing
+        # any path as a bare filename, e.g. --validate-against on a CSV in the
+        # working directory.
+        #
+        # abspath, not resolve(): resolve() would follow the symlink and collapse
+        # the two candidates into one, losing the /hpc-home side that the whole
+        # bind-it-twice rule above exists for.
+        target = Path(os.path.abspath(target))
         for candidate in (target, Path(os.path.realpath(target))):
             key = str(candidate)
             # "/" would bind the host root over the image.

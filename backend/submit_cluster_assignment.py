@@ -55,6 +55,27 @@ from submit_mask_tile_slurm import _run_sbatch_with_retry
 
 ASSIGN_SCRIPT = "assign_hpc_clusters.py"
 
+# Slurm walltime for the three jobs this module can submit. Named rather than
+# scattered as literals because they used to be one settable default and two
+# hardcoded 2-hour limits: raising the one that was settable left two that could
+# still kill a long run late, after the expensive part had already succeeded.
+#
+# The assignment itself dominates. It is one faiss flat-L2 scan of the reference
+# per query batch, so its cost is (queries x reference rows) and it grows with
+# the dataset: 545,185 TCGA queries against 2.5M reference rows took about an
+# hour, so a 14,000-slide cohort is a different order of magnitude. Two days is
+# not an estimate, it is headroom -- a job that finishes early costs nothing,
+# and one that hits the wall at 95% has to be redone from the start because the
+# assigner has no resume.
+ASSIGN_TIME_LIMIT = "2-00:00:00"
+# One full pass over the projections .h5 to compute the shared query mean. Same
+# I/O as the assignment without the search, so much cheaper -- but it scales with
+# the same input, which is why it is no longer 2 hours.
+MEAN_TIME_LIMIT = "08:00:00"
+# Concatenating the shard CSVs. Pure I/O over the outputs, but a 14,000-slide
+# cohort's CSVs are tens of gigabytes.
+MERGE_TIME_LIMIT = "04:00:00"
+
 # Default location of the reference artifact, matching the constant
 # build_hpc_reference.py writes to. Imported lazily in _reference_path()
 # because that module is a sibling script, not a package, and a hard import at
@@ -527,7 +548,9 @@ def submit_cluster_assignment_job(
     partition: str = MERGE_PARTITION,
     cpus: int = 16,
     memory: str = "64G",
-    time_limit: str = "04:00:00",
+    time_limit: str = ASSIGN_TIME_LIMIT,
+    mean_time_limit: str = MEAN_TIME_LIMIT,
+    merge_time_limit: str = MERGE_TIME_LIMIT,
     job_name: str = "hpl_cluster_assign",
     notify_email: str | None = None,
     singularity_image: Path = SINGULARITY_IMAGE,
@@ -629,7 +652,7 @@ def submit_cluster_assignment_job(
             mean_sbatch = [
                 "sbatch", f"--job-name={job_name}_mean",
                 f"--partition={partition}", "--cpus-per-task=4", "--mem=16G",
-                "--time=02:00:00",
+                f"--time={mean_time_limit}",
                 f"--output={log_dir}/hpl_assign_mean_%j.out",
                 f"--error={log_dir}/hpl_assign_mean_%j.err",
                 f"--chdir={backend_dir}",
@@ -747,7 +770,7 @@ def submit_cluster_assignment_job(
         merge_sbatch = [
             "sbatch", f"--job-name={job_name}_merge",
             f"--partition={partition}", "--cpus-per-task=2", "--mem=8G",
-            "--time=02:00:00",
+            f"--time={merge_time_limit}",
             # afterok, not afterany: concatenating around a failed shard is the
             # silent corruption this whole path is built to avoid.
             f"--dependency=afterok:{info['assignment_job_id']}",
@@ -829,7 +852,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--partition", type=str, default=MERGE_PARTITION)
     parser.add_argument("--cpus", type=int, default=16)
     parser.add_argument("--memory", type=str, default="64G")
-    parser.add_argument("--time-limit", type=str, default="04:00:00")
+    parser.add_argument("--time-limit", type=str, default=ASSIGN_TIME_LIMIT,
+                        help=f"Slurm walltime for the assignment job. Default "
+                             f"{ASSIGN_TIME_LIMIT}. The assigner has no resume, "
+                             f"so hitting the wall means redoing the whole run — "
+                             f"prefer headroom. Refused if the partition's MaxTime "
+                             f"is lower, so check `sinfo -o \"%P %l\"` before "
+                             f"raising it.")
+    parser.add_argument("--mean-time-limit", type=str, default=MEAN_TIME_LIMIT,
+                        help=f"Walltime for the shared query-mean job, submitted "
+                             f"only when sharding with --centering query. Default "
+                             f"{MEAN_TIME_LIMIT}.")
+    parser.add_argument("--merge-time-limit", type=str, default=MERGE_TIME_LIMIT,
+                        help=f"Walltime for the shard-merge job. Default "
+                             f"{MERGE_TIME_LIMIT}.")
     parser.add_argument("--notify-email", type=str, default=None)
     parser.add_argument("--shards", type=int, default=1,
                         help="Split the assignment across N array tasks. A mean job "
@@ -867,6 +903,8 @@ def main() -> None:
             cpus=args.cpus,
             memory=args.memory,
             time_limit=args.time_limit,
+            mean_time_limit=args.mean_time_limit,
+            merge_time_limit=args.merge_time_limit,
             notify_email=args.notify_email,
             overwrite=args.overwrite,
         )

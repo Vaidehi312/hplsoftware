@@ -1056,6 +1056,73 @@ def test_a_relative_validate_against_is_bound_absolutely(tmp_path):
     assert str(truth.resolve()) in command or str(truth) in command, command
 
 
+# --- Slurm walltime ------------------------------------------------------
+#
+# The assigner has no resume: it opens its output with mode='w' before encoding
+# and its "output already exists" path crashes on an unbound local. So hitting
+# the walltime does not cost the remaining fraction, it costs the whole run —
+# and the retry then fails in seconds on the stale output with an error pointing
+# nowhere near the cause.
+#
+# This path submits up to three jobs. Two of them were hardcoded at 2 hours
+# while only the third was settable, so raising the limit for a long run left
+# two that could still kill it late, after the expensive part had succeeded.
+
+
+def test_all_three_walltimes_are_settable(tmp_path):
+    import inspect
+    from submit_cluster_assignment import submit_cluster_assignment_job
+
+    parameters = inspect.signature(submit_cluster_assignment_job).parameters
+    for name in ("time_limit", "mean_time_limit", "merge_time_limit"):
+        assert name in parameters, f"{name} is not settable"
+
+
+def test_no_walltime_is_hardcoded_in_an_sbatch(tmp_path):
+    """The regression guard. A literal --time= next to an sbatch is a limit
+    nobody can raise from the command line."""
+    import re
+    source = (BACKEND / "submit_cluster_assignment.py").read_text()
+    # A literal is "--time=" followed by a digit; "--time={...}" is an
+    # interpolation and is what we want. Grepping for the flag alone matches
+    # both, which is how the first version of this test failed on correct code.
+    literal = re.compile(r"--time=\d")
+    hardcoded = [line.strip() for line in source.splitlines()
+                 if literal.search(line)]
+    assert not hardcoded, f"hardcoded walltime(s): {hardcoded}"
+
+
+def test_the_assignment_gets_the_longest_limit(tmp_path):
+    """It is the only one whose cost is queries x reference rows; the other two
+    are single passes over the input and the output. A mean job outliving the
+    assignment would mean the numbers were picked without thinking about which
+    job actually takes the time."""
+    from submit_cluster_assignment import (ASSIGN_TIME_LIMIT, MEAN_TIME_LIMIT,
+                                           MERGE_TIME_LIMIT)
+
+    def seconds(limit: str) -> int:
+        days, _, rest = limit.partition("-")
+        if not rest:
+            rest, days = days, "0"
+        hours, minutes, secs = (int(x) for x in rest.split(":"))
+        return int(days) * 86400 + hours * 3600 + minutes * 60 + secs
+
+    assert seconds(ASSIGN_TIME_LIMIT) == 2 * 86400
+    assert seconds(ASSIGN_TIME_LIMIT) > seconds(MEAN_TIME_LIMIT)
+    assert seconds(MEAN_TIME_LIMIT) >= seconds(MERGE_TIME_LIMIT)
+
+
+def test_every_default_is_a_walltime_slurm_accepts(tmp_path):
+    """A malformed --time is rejected by sbatch at submit, which is at least
+    loud — but only once someone tries, and these are defaults."""
+    import re
+    from submit_cluster_assignment import (ASSIGN_TIME_LIMIT, MEAN_TIME_LIMIT,
+                                           MERGE_TIME_LIMIT)
+    pattern = re.compile(r"^(\d+-)?\d{1,2}:\d{2}:\d{2}$")
+    for limit in (ASSIGN_TIME_LIMIT, MEAN_TIME_LIMIT, MERGE_TIME_LIMIT):
+        assert pattern.match(limit), f"{limit!r} is not a Slurm walltime"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

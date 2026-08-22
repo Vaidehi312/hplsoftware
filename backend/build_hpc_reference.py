@@ -106,6 +106,119 @@ def read_categorical(content: h5py.File, column: str) -> tuple[np.ndarray, np.nd
     return inverse, categories
 
 
+def read_slide_names(h5ad_path: Path, column: str = "slides") -> np.ndarray:
+    """One slide name per reference row, for splitting the reference by slide."""
+    with h5py.File(h5ad_path, "r") as content:
+        codes, categories = read_categorical(content, column)
+    codes = np.asarray(codes, dtype=np.int64)
+    if (codes < 0).any():
+        raise SystemExit(
+            f"obs/{column} has {int((codes < 0).sum()):,} missing values. A tile "
+            f"with no slide can be neither held out nor deliberately kept, and "
+            f"guessing either way risks leaving part of a held-out slide in the "
+            f"reference — which is the one thing this split exists to prevent."
+        )
+    return np.asarray(categories, dtype=object)[codes]
+
+
+def hold_out_slides(artifact: dict, slide_names: np.ndarray, n_slides: int,
+                    seed: int = 0) -> tuple[dict, dict]:
+    """Split whole slides out of a reference, for a closed-book accuracy test.
+
+    Whole slides, not random tiles, and that is the entire point. Leave-one-out
+    removes one tile and leaves its ~5,000 slide-mates in the reference — same
+    scanner, same staining, often contiguous tissue — so a tile is largely
+    classified by near-duplicates of itself. The resulting number is optimistic
+    by an unknown amount relative to what a genuinely new slide would score,
+    which is the thing anyone actually wants to know before running a new cohort.
+
+    Returns (reduced reference, holdout). Three things are deliberately NOT
+    recomputed for the reduced side:
+
+      categories  the codes index this table, so renumbering it would silently
+                  reassign every cluster ID on both sides of the split.
+      mean        the PCA mean is a property of the original fit, not of the rows
+                  kept. Recomputing it from a subset would move the space the
+                  queries are already expressed in.
+      n_neighbors a property of the graph the reference was clustered on.
+    """
+    rows = int(artifact["reference"].shape[0])
+    if len(slide_names) != rows:
+        raise SystemExit(
+            f"{len(slide_names):,} slide names for {rows:,} reference rows — "
+            f"these do not describe the same .h5ad."
+        )
+
+    unique = np.unique(slide_names)          # sorted, so the seed alone decides
+    if n_slides < 1:
+        raise SystemExit("--holdout-slides must be at least 1.")
+    if n_slides >= len(unique):
+        raise SystemExit(
+            f"--holdout-slides {n_slides} of only {len(unique)} slides would "
+            f"leave nothing to classify against."
+        )
+
+    rng = np.random.default_rng(seed)
+    held = np.sort(rng.choice(unique, size=n_slides, replace=False))
+    in_holdout = np.isin(slide_names, held)
+    keep = ~in_holdout
+    if not in_holdout.any() or not keep.any():
+        raise SystemExit("The split left one side empty.")
+
+    reduced = dict(artifact)
+    reduced["reference"] = artifact["reference"][keep]
+    reduced["codes"] = np.asarray(artifact["codes"])[keep]
+    reduced["holdout_slides"] = [str(s) for s in held]
+
+    holdout = {
+        "queries": artifact["reference"][in_holdout],
+        "codes": np.asarray(artifact["codes"])[in_holdout],
+        "slides": np.asarray([str(s) for s in slide_names[in_holdout]]),
+        "categories": np.asarray([str(c) for c in artifact["categories"]]),
+        "groupby": artifact["groupby"],
+        "source": artifact["source"],
+        "held_slides": [str(s) for s in held],
+        "reference_rows": int(reduced["reference"].shape[0]),
+    }
+
+    # A cluster that exists only on a held-out slide is now unreachable: no
+    # query can be assigned to it, so every one of its held-out tiles is wrong
+    # by construction and the accuracy figure carries that as if it were a
+    # classifier error. Reported rather than silently absorbed.
+    kept_clusters = set(np.unique(reduced["codes"]).tolist())
+    lost = sorted(set(np.unique(holdout["codes"]).tolist()) - kept_clusters)
+    holdout["unreachable_clusters"] = lost
+    return reduced, holdout
+
+
+def save_holdout(holdout: dict, out_path: Path) -> None:
+    """The held-out tiles, as their own file.
+
+    Not extra keys on the reference .npz: readers there are pinned by
+    test_reference_keys_match_the_builder precisely so they cannot drift, and a
+    reference carrying its own test set is a reference somebody will eventually
+    assign against by accident.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        out_path,
+        queries=holdout["queries"],
+        codes=np.asarray(holdout["codes"]),
+        slides=holdout["slides"],
+        categories=holdout["categories"],
+        meta=np.asarray(json.dumps({
+            "groupby": holdout["groupby"],
+            "source": holdout["source"],
+            "held_slides": holdout["held_slides"],
+            "n_held_slides": len(holdout["held_slides"]),
+            "n_queries": int(holdout["queries"].shape[0]),
+            "n_clusters": int(len(holdout["categories"])),
+            "reference_rows": holdout["reference_rows"],
+            "unreachable_clusters": holdout["unreachable_clusters"],
+        })),
+    )
+
+
 def _read_raw_embedding(content: h5py.File) -> np.ndarray:
     if "X" not in content:
         raise KeyError("X missing — no raw embedding to read.")
@@ -218,6 +331,13 @@ def save(artifact: dict, out_path: Path) -> None:
                     "n_clusters": int(len(artifact["categories"])),
                     "has_mean": artifact["mean"] is not None,
                     "embedding_space": artifact.get("embedding_space", "pca"),
+                    # Present only on a slide-holdout split. Without it such a
+                    # reference is indistinguishable from production — same
+                    # groupby, same 71 clusters, just fewer rows — and would be
+                    # reported as production by describe_reference while
+                    # missing whole slides.
+                    **({"holdout_slides": artifact["holdout_slides"]}
+                       if artifact.get("holdout_slides") else {}),
                 }
             )
         ),
@@ -250,7 +370,38 @@ def main() -> None:
              "PCA — comparable to 'pca' via validate_reference.py on the same "
              "--groupby, since leave-one-out never calls project().",
     )
+    parser.add_argument(
+        "--holdout-slides", type=int, default=0, metavar="N",
+        help="Build a reference with N whole slides removed, and write those "
+             "slides' tiles to --holdout-out as a held-out test set. Whole "
+             "slides rather than random tiles: leave-one-out leaves a tile's "
+             "~5,000 slide-mates in the reference, so it measures recovery from "
+             "near-duplicates of itself and overstates what a genuinely new "
+             "slide would score. 0 (default) builds the full reference.",
+    )
+    parser.add_argument(
+        "--holdout-out", type=Path, default=None,
+        help="Where the held-out tiles go. Defaults to the reference's own name "
+             "with '_holdout' appended. A separate file, not extra keys on the "
+             "reference: a reference carrying its own test set is one somebody "
+             "eventually assigns against by accident.",
+    )
+    parser.add_argument(
+        "--holdout-seed", type=int, default=0,
+        help="Which slides get held out. Report it with the result — a single "
+             "20-slide draw is one sample, not a population.",
+    )
+    parser.add_argument(
+        "--holdout-column", default="slides",
+        help="obs column naming each tile's slide.",
+    )
     args = parser.parse_args()
+
+    if args.holdout_out and not args.holdout_slides:
+        raise SystemExit(
+            "--holdout-out does nothing without --holdout-slides. Set the "
+            "number of slides to hold out, or drop the path."
+        )
 
     groupby = args.groupby
     if groupby is None:
@@ -266,9 +417,40 @@ def main() -> None:
         groupby = "leiden_" + resolution.replace("p", ".")
 
     artifact = build(args.h5ad, groupby, embedding_space=args.embedding_space)
+
+    holdout = None
+    if args.holdout_slides:
+        full_rows = int(artifact["reference"].shape[0])
+        slide_names = read_slide_names(args.h5ad, args.holdout_column)
+        artifact, holdout = hold_out_slides(
+            artifact, slide_names, args.holdout_slides, args.holdout_seed)
+        holdout_path = args.holdout_out or args.out.with_name(
+            f"{args.out.stem}_holdout{args.out.suffix}")
+        save_holdout(holdout, holdout_path)
+
     save(artifact, args.out)
 
+    if holdout is not None:
+        print(f"Holdout written to {holdout_path}")
+        print(f"  slides held out {len(holdout['held_slides'])} "
+              f"(seed {args.holdout_seed})")
+        print(f"  tiles held out  {holdout['queries'].shape[0]:,} of "
+              f"{full_rows:,} ({holdout['queries'].shape[0] / full_rows * 100:.1f}%)")
+        print(f"  first few       {', '.join(holdout['held_slides'][:3])}"
+              + (" ..." if len(holdout["held_slides"]) > 3 else ""))
+        if holdout["unreachable_clusters"]:
+            # These tiles cannot be got right by any classifier now, so the
+            # accuracy figure would carry them as errors. Said here, before the
+            # number exists, rather than left to explain it afterwards.
+            print(f"  WARNING: cluster(s) {holdout['unreachable_clusters']} exist "
+                  f"only on held-out slides, so no query can be assigned to them "
+                  f"and their held-out tiles are wrong by construction. Consider "
+                  f"another --holdout-seed.")
+        print()
+
     print(f"Reference written to {args.out}")
+    if holdout is not None:
+        print(f"  *** SLIDE-HOLDOUT REFERENCE — not for real assignments ***")
     print(f"  embedding space {artifact['embedding_space']}")
     print(f"  labels from     obs/{groupby}")
     print(f"  reference tiles {artifact['reference'].shape[0]:,}")

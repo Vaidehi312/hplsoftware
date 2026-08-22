@@ -73,6 +73,11 @@ def load_reference(path: Path) -> dict:
         "categories": bundle["categories"],
         "n_neighbors": int(bundle["n_neighbors"]),
         "groupby": meta.get("groupby", "leiden"),
+        # Present only on a slide-holdout split. Carried through so
+        # describe_reference cannot call such a reference "production": it has
+        # the same groupby and the same 71 clusters, and differs only in having
+        # whole slides missing.
+        "holdout_slides": meta.get("holdout_slides") or [],
     }
 
 
@@ -96,6 +101,23 @@ def describe_reference(path: Path, reference: dict) -> None:
     groupby = reference["groupby"]
     n_clusters = len(reference["categories"])
     print(f"Reference file: {path}")
+    held = reference.get("holdout_slides") or []
+    if held:
+        # Checked before the production comparison, because a holdout split
+        # passes that comparison: same groupby, same cluster count, just missing
+        # whole slides. Silence here is how a deliberately crippled reference
+        # gets used for a real assignment.
+        print(
+            f"                *** SLIDE-HOLDOUT REFERENCE — {len(held)} slide(s) "
+            f"removed ***\n"
+            f"                Built to measure closed-book accuracy. Cluster IDs "
+            f"from it are NOT interchangeable with production ones and it must "
+            f"never be used for a real assignment.\n"
+            f"                Held out: {', '.join(held[:3])}"
+            + (" ..." if len(held) > 3 else ""),
+            file=sys.stderr,
+        )
+        return
     if groupby == _PRODUCTION_GROUPBY and n_clusters == _PRODUCTION_CLUSTERS:
         print(f"                production reference "
               f"({groupby}, {n_clusters} clusters)")
@@ -295,6 +317,208 @@ def leave_one_out(reference: dict, sample: int, k: int,
         "rate": len(query_index) / max(elapsed, 1e-9),
         "elapsed": elapsed,
     }
+
+
+def load_holdout(path: Path, reference: dict) -> dict:
+    """The held-out tiles, checked against the reference they were split from.
+
+    A holdout only means anything paired with its own reduced reference. Given
+    the full reference instead, every query would find itself at distance zero
+    and the result would read as near-perfect accuracy — the most flattering
+    possible wrong answer, which is exactly the shape of mistake this pipeline
+    produces. So the pairing is verified rather than assumed.
+    """
+    if not path.is_file():
+        raise SystemExit(f"No holdout at {path}. Build it with "
+                         f"build_hpc_reference.py --holdout-slides N.")
+    bundle = np.load(path, allow_pickle=False)
+    meta = {}
+    try:
+        meta = json.loads(str(bundle["meta"]))
+    except (ValueError, TypeError, KeyError):
+        pass
+
+    holdout = {
+        "queries": bundle["queries"],
+        "codes": bundle["codes"].astype(np.int64),
+        "slides": bundle["slides"],
+        "categories": bundle["categories"],
+        "groupby": meta.get("groupby", "leiden"),
+        "held_slides": meta.get("held_slides", []),
+        "reference_rows": meta.get("reference_rows"),
+        "unreachable_clusters": meta.get("unreachable_clusters", []),
+    }
+
+    if holdout["groupby"] != reference["groupby"]:
+        raise SystemExit(
+            f"Holdout labels are {holdout['groupby']} but the reference is "
+            f"{reference['groupby']} — different clusterings entirely."
+        )
+    if len(holdout["categories"]) != len(reference["categories"]):
+        raise SystemExit(
+            f"Holdout has {len(holdout['categories'])} clusters, reference has "
+            f"{len(reference['categories'])}. The codes index the category "
+            f"table, so these would compare different clusters under the same "
+            f"numbers."
+        )
+    if not np.array_equal(np.asarray(holdout["categories"], dtype=str),
+                          np.asarray(reference["categories"], dtype=str)):
+        raise SystemExit(
+            "Holdout and reference category tables differ. Cluster codes mean "
+            "different things on the two sides."
+        )
+    expected = holdout["reference_rows"]
+    if expected is not None and int(expected) != len(reference["vectors"]):
+        raise SystemExit(
+            f"This holdout was split from a reference of {int(expected):,} rows "
+            f"but the given reference has {len(reference['vectors']):,}. Pair it "
+            f"with its own reduced reference — against the full one every query "
+            f"finds itself and the accuracy is meaningless."
+        )
+    if not reference.get("holdout_slides"):
+        raise SystemExit(
+            "The given reference carries no holdout marker, so it is not the "
+            "reduced reference this holdout was split from. Using the full "
+            "reference here would score every tile against a copy of itself."
+        )
+    return holdout
+
+
+def holdout_accuracy(reference: dict, holdout: dict, k: int, batch: int,
+                     distance_weighted: bool = False,
+                     distance_power: float = 1.0,
+                     class_weighted: bool = False,
+                     local_scaling: int = 0,
+                     metric: str = "l2",
+                     adaptive_margin: float = 0.0,
+                     adaptive_k: int = 0) -> dict:
+    """Closed-book accuracy: held-out slides against a reference without them.
+
+    No self-match handling, and none needed — that is the whole difference from
+    leave_one_out. These tiles are genuinely absent from the reference, so
+    nothing has to be masked out and no slide-mate is available to vote for them.
+
+    Returns the same shape leave_one_out does, so report() can print the same
+    error budget, margin bands and per-cluster breakdown for both and the two
+    numbers can be read side by side.
+    """
+    vectors, codes = reference["vectors"], reference["codes"]
+    n_clusters = len(reference["categories"])
+    queries, truth = holdout["queries"], holdout["codes"]
+
+    searcher = Searcher(vectors, metric=metric)
+    print(f"Backend   : {searcher.backend}")
+    print(f"Reference : {len(vectors):,} tiles, {vectors.shape[1]} comps, "
+          f"{n_clusters} clusters ({reference['groupby']})")
+    print(f"Holdout   : {len(queries):,} tiles from "
+          f"{len(holdout['held_slides'])} slide(s) never seen by the reference, "
+          f"k={k}")
+
+    local_scale = None
+    if local_scaling:
+        local_scale = compute_local_scale(vectors, r=local_scaling)
+    class_weights = None
+    if class_weighted:
+        class_weights = 1.0 / np.maximum(np.bincount(codes, minlength=n_clusters), 1)
+
+    k_search = max(k, adaptive_k) if adaptive_margin > 0 else k
+    predicted = np.empty(len(queries), dtype=np.int64)
+    margins = np.empty(len(queries), dtype=np.float32)
+    truth_neighbours = np.empty(len(queries), dtype=np.int32)
+    truth_rank = np.empty(len(queries), dtype=np.int32)
+    n_revoted = 0
+
+    started = time.perf_counter()
+    for start in range(0, len(queries), batch):
+        stop = min(start + batch, len(queries))
+        idx, dist = searcher.search(
+            np.ascontiguousarray(queries[start:stop]), k_search)
+        winners, margin, _, counts = vote(
+            idx[:, :k], dist[:, :k], codes, n_clusters,
+            distance_weighted=distance_weighted, distance_power=distance_power,
+            class_weights=class_weights, local_scale=local_scale,
+            return_counts=True)
+
+        if adaptive_margin > 0:
+            low = margin < adaptive_margin
+            if low.any():
+                w2, m2, _, c2 = vote(
+                    idx[low, :adaptive_k], dist[low, :adaptive_k], codes,
+                    n_clusters, distance_weighted=distance_weighted,
+                    distance_power=distance_power, class_weights=class_weights,
+                    local_scale=local_scale, return_counts=True)
+                winners, margin = winners.copy(), margin.copy()
+                winners[low], margin[low] = w2, m2
+                counts = counts.copy()
+                counts[low] = c2
+                n_revoted += int(low.sum())
+
+        predicted[start:stop] = winners
+        margins[start:stop] = margin
+        row_truth = truth[start:stop]
+        # Same -1 padding guard as leave_one_out: codes[-1] is a real cluster,
+        # so counting without masking credits every padded slot to it.
+        valid = idx[:, :k] >= 0
+        truth_neighbours[start:stop] = (
+            (codes[np.where(valid, idx[:, :k], 0)] == row_truth[:, None]) & valid
+        ).sum(axis=1)
+        truth_score = np.take_along_axis(counts, row_truth[:, None], 1).ravel()
+        truth_rank[start:stop] = (counts > truth_score[:, None]).sum(axis=1) + 1
+
+    elapsed = time.perf_counter() - started
+    correct = predicted == truth
+    if n_revoted:
+        print(f"Adaptive  : re-voted {n_revoted:,} tiles "
+              f"({n_revoted / len(queries) * 100:.1f}%) at k={adaptive_k}")
+    return {
+        "accuracy": float(correct.mean()),
+        "n": len(queries),
+        "correct": correct,
+        "truth": truth,
+        "predicted": predicted,
+        "margins": margins,
+        "truth_neighbours": truth_neighbours,
+        "truth_rank": truth_rank,
+        "categories": reference["categories"],
+        "n_clusters": n_clusters,
+        "rate": len(queries) / max(elapsed, 1e-9),
+        "elapsed": elapsed,
+        "held_slides": holdout["held_slides"],
+        "slides": holdout["slides"],
+    }
+
+
+def report_holdout_extras(result: dict, holdout: dict) -> None:
+    """What report() cannot say, because it does not know about slides."""
+    slides = np.asarray(result["slides"])
+    correct = result["correct"]
+    print(f"\nPer held-out slide — a single slide's tiles are highly correlated, "
+          f"so the spread across slides is the honest error bar, not the "
+          f"binomial one above:")
+    rows = []
+    for slide in np.unique(slides):
+        mask = slides == slide
+        rows.append((str(slide), int(mask.sum()), float(correct[mask].mean())))
+    rows.sort(key=lambda r: r[2])
+    for name, n, acc in rows:
+        print(f"    {acc * 100:>6.2f}%  {n:>7,} tiles  {name}")
+    accuracies = [r[2] for r in rows]
+    if len(accuracies) > 1:
+        spread = max(accuracies) - min(accuracies)
+        mean = sum(accuracies) / len(accuracies)
+        variance = sum((a - mean) ** 2 for a in accuracies) / (len(accuracies) - 1)
+        # Standard error over slides, which is the unit that actually varies.
+        print(f"\n    unweighted slide mean {mean * 100:.2f}%, "
+              f"between-slide SD {variance ** 0.5 * 100:.2f} points, "
+              f"range {spread * 100:.1f} points")
+        print(f"    Report the tile-weighted accuracy above as the headline, but "
+              f"quote this spread with it: {len(accuracies)} slides is a small "
+              f"sample and one atypical slide moves the total.")
+    if holdout["unreachable_clusters"]:
+        print(f"\n    Cluster(s) {holdout['unreachable_clusters']} exist only on "
+              f"held-out slides, so no query could be assigned to them and their "
+              f"tiles are counted wrong by construction. Rebuild with another "
+              f"--holdout-seed to remove that penalty.")
 
 
 def report(result: dict, worst: int) -> None:
@@ -519,20 +743,82 @@ def main() -> None:
                         help="How many weakest clusters to list.")
     parser.add_argument("--min-accuracy", type=float, default=None,
                         help="Exit non-zero below this, for use as a gate.")
+    parser.add_argument("--holdout", type=Path, default=None,
+                        help="A holdout .npz from build_hpc_reference.py "
+                             "--holdout-slides, evaluated against the reduced "
+                             "reference it was split from. This is the "
+                             "closed-book number: the slides were never in the "
+                             "reference, so nothing votes for a tile except "
+                             "other slides. Leave-one-out is also reported, on "
+                             "the same reduced reference, so the gap between "
+                             "them is the size of the slide-mate leakage.")
+    parser.add_argument("--adaptive-margin", type=float, default=0.0,
+                        metavar="MARGIN",
+                        help="Re-vote tiles below this margin at --adaptive-k. "
+                             "Holdout evaluation only, so the shipped "
+                             "configuration can be measured closed-book.")
+    parser.add_argument("--adaptive-k", type=int, default=0, metavar="K",
+                        help="The wider neighbourhood for --adaptive-margin.")
     args = parser.parse_args()
+
+    if args.adaptive_margin > 0 and args.adaptive_k <= (args.k or 0):
+        raise SystemExit(
+            "--adaptive-margin needs --adaptive-k wider than --k, and an "
+            "explicit --k to compare it against."
+        )
 
     reference = load_reference(args.reference)
     describe_reference(args.reference, reference)
     k = args.k or reference["n_neighbors"]
     sample = args.sample if args.sample > 0 else len(reference["vectors"])
 
+    vote_kwargs = dict(distance_weighted=args.distance_weighted,
+                       distance_power=args.distance_power,
+                       class_weighted=args.class_weighted,
+                       local_scaling=args.local_scaling,
+                       metric=args.metric)
+
+    holdout_result = None
+    if args.holdout is not None:
+        holdout = load_holdout(args.holdout, reference)
+        print("\n" + "=" * 72)
+        print("CLOSED BOOK — held-out slides against a reference without them")
+        print("=" * 72)
+        holdout_result = holdout_accuracy(
+            reference, holdout, k, args.batch_size,
+            adaptive_margin=args.adaptive_margin, adaptive_k=args.adaptive_k,
+            **vote_kwargs)
+        report(holdout_result, args.worst)
+        report_holdout_extras(holdout_result, holdout)
+        print("\n" + "=" * 72)
+        print("OPEN BOOK — leave-one-out on the same reduced reference")
+        print("=" * 72)
+
     result = leave_one_out(reference, sample, k, args.batch_size, args.seed,
-                           distance_weighted=args.distance_weighted,
-                           distance_power=args.distance_power,
-                           class_weighted=args.class_weighted,
-                           local_scaling=args.local_scaling,
-                           metric=args.metric)
+                           **vote_kwargs)
     report(result, args.worst)
+
+    if holdout_result is not None:
+        gap = (result["accuracy"] - holdout_result["accuracy"]) * 100
+        print("\n" + "=" * 72)
+        print(f"Leave-one-out {result['accuracy'] * 100:.2f}%  vs  "
+              f"slide holdout {holdout_result['accuracy'] * 100:.2f}%  "
+              f"— gap {gap:+.2f} points")
+        print("=" * 72)
+        print(
+            "The gap IS the slide-mate leakage. Leave-one-out removes one tile "
+            "and leaves its slide-mates in the reference, so it measures "
+            "recovery from near-duplicates of the tile itself. The holdout "
+            "number is the one that predicts a genuinely new slide, and "
+            "therefore the one to quote for a new cohort."
+        )
+        if gap < 0:
+            print(
+                "  The holdout scored HIGHER, which leave-one-out cannot "
+                "normally do. Either the held-out slides are unusually easy "
+                "— check the per-slide spread above — or the two runs used "
+                "different vote settings."
+            )
 
     if args.superclusters:
         mapping = load_mapping()

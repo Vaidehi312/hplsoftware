@@ -711,3 +711,66 @@ carrying `hpc_id`. Any statement about "the label CSV" has to name which machine
 (expected to come out *lower*, per §19 — the tuned vote deliberately stops
 imitating `sc.tl.ingest`), and the slide-level holdout, which is the only design
 here that would produce an accuracy figure predictive of a new cohort.
+
+## §22 The production reference is LATTICeA, not TCGA — and §21 reads differently
+
+Established 2026-08-22 by reading the reference's own provenance:
+
+```
+$ python -c "...json.loads(str(np.load('hpc_reference_leiden_2p5_fold2.npz')['meta']))['source']"
+/mnt/.../Vaidehi/cluster reference/
+  LATTICeA_5x_he_complete_surv_sex_filtered_leiden_2p5__fold2_subsample.h5ad
+```
+
+`hpc_reference_leiden_2p5_fold2.npz` — 2.5M tiles, 127 comps, 71 clusters,
+leiden_2.5 — is a **LATTICeA** subsample. §14 and this document elsewhere
+described it as TCGA LUAD. That was wrong, and it changes three readings.
+
+**The TCGA acceptance test is not tautological.** §21 argued that 99.619% was
+near-tautological because those tiles were probably inside the reference. They
+are not: the reference is LATTICeA and the queries are TCGA. So the run was a
+genuine cross-cohort transfer of 499,108 tiles, and 99.619% says our pipeline
+reproduces `sc.tl.ingest`'s transfer of LATTICeA-defined clusters onto TCGA. That
+is a much stronger result than §21 credited.
+
+The margin evidence still holds and now makes better sense. Disagreements sat at
+median margin 0.004 with a maximum of 0.048 — because both sides are exact k-NN
+in the same space, so they can only differ on near-ties, plus whatever float
+precision the projection introduces. Confinement to dead ties is what agreement
+between two implementations of the same function looks like, not what a
+self-match looks like.
+
+**But it is still agreement, not accuracy.** Kai's TCGA labels were themselves
+produced by transferring LATTICeA clusters, so there is no TCGA ground truth
+anywhere. 99.619% means "we put TCGA tiles where the reference implementation puts
+them", which is the operationally right target — those are the labels the KB
+holds — and says nothing about whether either is biologically correct.
+
+**The 97.27% is within-LATTICeA.** Leave-one-out asks whether k-NN recovers a
+LATTICeA tile's own label given the rest of LATTICeA. §21 called it a within-TCGA
+number; wrong cohort, same conclusion — it is still an upper bound for a third
+cohort, and still optimistic because a tile's slide-mates stay in the reference.
+
+**Consequences for the slide holdout.** It holds out **LATTICeA** slides, which is
+correct and unchanged in value: it measures a slide the reference has never seen.
+Note the h5ad is a `_subsample`, so confirm `obs` carries a slide column and check
+how many distinct slides survived subsampling before choosing N.
+
+**What we now have, honestly labelled:**
+
+| measurement | what it is | number |
+|---|---|---|
+| leave-one-out on the reference | LATTICeA tile vs rest of LATTICeA, slide-mates included | 97.27% |
+| slide holdout (to run) | LATTICeA slide the reference never saw | unknown |
+| TCGA acceptance test | agreement with `ingest`'s cross-cohort transfer | 99.619% |
+| Radiogenomics | no ground truth exists | unmeasured |
+
+**Why this went unnoticed:** the reference file is named
+`hpc_reference_leiden_2p5_fold2.npz` and Kai's label file
+`TCGA_LUAD_5x_he_train_filtered_leiden_2p5__fold2.csv`. Same `leiden_2p5__fold2`
+stem, because it is the same clustering config — one is where the clusters were
+defined, the other is where they were transferred. Nothing in either name says
+which. `build_hpc_reference.save()` records `meta["source"]` precisely so this is
+answerable, and reading it is a one-liner; the code comment in
+`validate_reference.describe_reference` asserted TCGA from memory instead, and has
+been corrected to say where to look.

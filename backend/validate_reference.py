@@ -92,11 +92,21 @@ _PRODUCTION_CLUSTERS = 71
 def describe_reference(path: Path, reference: dict) -> None:
     """Say which reference this is, loudly, before any number is printed.
 
-    Every accuracy figure is relative to one reference. Two were in play here —
-    the production leiden_2.5 (TCGA LUAD, 71 clusters) and an exploratory
-    leiden_5.0 (LATTICeA, 109 clusters, a deliberately over-split QC pass) — and
-    a run against the second reads exactly like a run against the first once the
-    command line has scrolled away.
+    Every accuracy figure is relative to one reference. Two are in play: the
+    production leiden_2.5 (71 clusters) and an exploratory leiden_5.0 (109
+    clusters, a deliberately over-split QC pass), and a run against the second
+    reads exactly like a run against the first once the command line has
+    scrolled away.
+
+    Both are built from **LATTICeA**, not TCGA — the production reference's
+    meta["source"] is LATTICeA_5x_he_complete_surv_sex_filtered_leiden_2p5__
+    fold2_subsample.h5ad. This comment used to say the production one was TCGA
+    LUAD, which is wrong and cost real time: it makes the leave-one-out figure
+    look like a within-TCGA number and makes the TCGA acceptance test look
+    tautological, when in fact TCGA tiles are absent from the reference and that
+    test is a genuine cross-cohort check. The HPCs were defined on LATTICeA and
+    transferred onto TCGA, which is what assign_hpc_clusters.py
+    --validate-against reproduces.
     """
     groupby = reference["groupby"]
     n_clusters = len(reference["categories"])

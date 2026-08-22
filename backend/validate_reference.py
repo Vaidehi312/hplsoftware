@@ -147,7 +147,8 @@ def leave_one_out(reference: dict, sample: int, k: int,
                   distance_power: float = 1.0, class_weighted: bool = False,
                   local_scaling: int = 0,
                   metric: str = "l2", query_index: np.ndarray | None = None,
-                  neighbours: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
+                  neighbours: tuple[np.ndarray, np.ndarray] | None = None,
+                  adaptive_margin: float = 0.0, adaptive_k: int = 0) -> dict:
     """Leave-one-out over `sample` random reference rows (or exactly
     `query_index`, when given).
 
@@ -156,6 +157,14 @@ def leave_one_out(reference: dict, sample: int, k: int,
     fresh random sample. `sample` and `seed` are ignored in that case: the
     caller already knows exactly which rows it wants, and re-deriving them from
     a seed would risk silently drifting from the set the caller actually meant.
+
+    adaptive_margin / adaptive_k apply the shipped adaptive-k policy here too.
+    Without them this could only ever measure a classifier that is not the one
+    running in production, and any comparison against a holdout measured WITH
+    them would silently be a comparison of two different classifiers — which is
+    exactly what happened the first time this was run against a slide holdout:
+    the holdout came out 0.53 points *higher*, read as "the held-out slides are
+    easy", when the real cause was that only one side re-voted its near-ties.
 
     neighbours skips the search entirely, taking `(idx, dist)` a caller already
     has — `tune_classifier.gather_neighbours` caches exactly this, and the search
@@ -184,6 +193,16 @@ def leave_one_out(reference: dict, sample: int, k: int,
         else:
             query_index = np.sort(rng.choice(total, size=sample, replace=False))
 
+    if adaptive_margin > 0 and adaptive_k <= k:
+        raise SystemExit(
+            f"adaptive_k {adaptive_k} is not wider than k={k}; the re-vote would "
+            f"see the same neighbours and change nothing."
+        )
+    # One search at the wider width, voted on a prefix -- same reasoning as
+    # assign_hpc_clusters.assign(): the flat scan is the cost and does not depend
+    # on k, so widening is nearly free and both votes see the same neighbours.
+    k_wide = max(k, adaptive_k) if adaptive_margin > 0 else k
+
     given_idx = given_dist = None
     if neighbours is not None:
         given_idx, given_dist = neighbours
@@ -195,10 +214,10 @@ def leave_one_out(reference: dict, sample: int, k: int,
             raise ValueError(
                 f"neighbours has {given_idx.shape[0]} rows for "
                 f"{len(query_index)} queries — these are not the same tiles.")
-        if given_idx.shape[1] < k:
+        if given_idx.shape[1] < k_wide:
             raise ValueError(
                 f"neighbours has only {given_idx.shape[1]} columns, so it cannot "
-                f"answer k={k}. Re-search at k_max >= {k}.")
+                f"answer k={k_wide}. Re-search at k_max >= {k_wide}.")
 
     searcher = None
     if given_idx is None:
@@ -253,6 +272,7 @@ def leave_one_out(reference: dict, sample: int, k: int,
     # The cluster that came second. A tiebreak rule only ever chooses between
     # this and the winner, so it is the other half of what such a rule needs.
     runner_up = np.empty(len(query_index), dtype=np.int64)
+    n_revoted = 0
     started = time.perf_counter()
 
     for start in range(0, len(query_index), batch):
@@ -260,25 +280,29 @@ def leave_one_out(reference: dict, sample: int, k: int,
         rows = query_index[start:stop]
         if given_idx is not None:
             # Already self-excluded and ordered, so a prefix is the k nearest.
-            trimmed_idx = given_idx[start:stop, :k]
-            trimmed_dist = given_dist[start:stop, :k]
+            wide_idx = given_idx[start:stop, :k_wide]
+            wide_dist = given_dist[start:stop, :k_wide]
         else:
-            # k+1 so that dropping each tile's self-match still leaves k voters,
-            # keeping the margin denominator comparable to a real assignment.
-            idx, dist = searcher.search(np.ascontiguousarray(vectors[rows]), k + 1)
+            # k_wide+1 so that dropping each tile's self-match still leaves
+            # k_wide voters, keeping the margin denominator comparable to a real
+            # assignment.
+            idx, dist = searcher.search(
+                np.ascontiguousarray(vectors[rows]), k_wide + 1)
 
             # Mask the self-match rather than assuming it is column 0: with
             # duplicate vectors or ties it need not be.
             self_mask = idx == rows[:, None]
-            # A row with no self-match (possible if k+1 exceeds the reference
-            # size) would otherwise keep an extra neighbour; drop its last
-            # column so every row votes on k.
+            # A row with no self-match (possible if k_wide+1 exceeds the
+            # reference size) would otherwise keep an extra neighbour; drop its
+            # last column so every row votes on k_wide.
             no_self = ~self_mask.any(axis=1)
             if no_self.any():
                 self_mask[no_self, -1] = True
             keep = ~self_mask
-            trimmed_idx = idx[keep].reshape(len(rows), k)
-            trimmed_dist = dist[keep].reshape(len(rows), k)
+            wide_idx = idx[keep].reshape(len(rows), k_wide)
+            wide_dist = dist[keep].reshape(len(rows), k_wide)
+        trimmed_idx = wide_idx[:, :k]
+        trimmed_dist = wide_dist[:, :k]
 
         winners, margin, _, counts = vote(trimmed_idx, trimmed_dist, codes, n_clusters,
                                           distance_weighted=distance_weighted,
@@ -286,6 +310,25 @@ def leave_one_out(reference: dict, sample: int, k: int,
                                           class_weights=class_weights,
                                           local_scale=local_scale,
                                           return_counts=True)
+        if adaptive_margin > 0:
+            low = margin < adaptive_margin
+            if low.any():
+                w2, m2, _, c2 = vote(
+                    wide_idx[low, :adaptive_k], wide_dist[low, :adaptive_k],
+                    codes, n_clusters,
+                    distance_weighted=distance_weighted,
+                    distance_power=distance_power,
+                    class_weights=class_weights, local_scale=local_scale,
+                    return_counts=True)
+                winners, margin = winners.copy(), margin.copy()
+                winners[low], margin[low] = w2, m2
+                # counts feeds truth_rank below, so it has to follow the vote
+                # that actually decided the label or the error budget describes
+                # a vote that was discarded.
+                counts = counts.copy()
+                counts[low] = c2
+                n_revoted += int(low.sum())
+
         predicted[start:stop] = winners
         margins[start:stop] = margin
         row_truth = codes[rows]
@@ -310,6 +353,9 @@ def leave_one_out(reference: dict, sample: int, k: int,
     elapsed = time.perf_counter() - started
     truth = codes[query_index]
     correct = predicted == truth
+    if n_revoted:
+        print(f"Adaptive  : re-voted {n_revoted:,} tiles "
+              f"({n_revoted / len(query_index) * 100:.1f}%) at k={adaptive_k}")
 
     return {
         "accuracy": float(correct.mean()),
@@ -764,9 +810,12 @@ def main() -> None:
                              "them is the size of the slide-mate leakage.")
     parser.add_argument("--adaptive-margin", type=float, default=0.0,
                         metavar="MARGIN",
-                        help="Re-vote tiles below this margin at --adaptive-k. "
-                             "Holdout evaluation only, so the shipped "
-                             "configuration can be measured closed-book.")
+                        help="Re-vote tiles below this margin at --adaptive-k, "
+                             "the shipped adaptive-k policy. Applied to BOTH the "
+                             "holdout and leave-one-out, so the two numbers "
+                             "describe the same classifier — measuring one with "
+                             "it and one without makes the gap between them "
+                             "meaningless.")
     parser.add_argument("--adaptive-k", type=int, default=0, metavar="K",
                         help="The wider neighbourhood for --adaptive-margin.")
     args = parser.parse_args()
@@ -805,7 +854,8 @@ def main() -> None:
         print("=" * 72)
 
     result = leave_one_out(reference, sample, k, args.batch_size, args.seed,
-                           **vote_kwargs)
+                           adaptive_margin=args.adaptive_margin,
+                           adaptive_k=args.adaptive_k, **vote_kwargs)
     report(result, args.worst)
 
     if holdout_result is not None:
@@ -824,10 +874,12 @@ def main() -> None:
         )
         if gap < 0:
             print(
-                "  The holdout scored HIGHER, which leave-one-out cannot "
-                "normally do. Either the held-out slides are unusually easy "
-                "— check the per-slide spread above — or the two runs used "
-                "different vote settings."
+                "  The holdout scored HIGHER. Both sides here use the same vote, "
+                "so this is not a settings mismatch — check the per-slide spread "
+                "above for one unusually easy slide, and note that a gap this "
+                "small mainly says the slide-mate leakage is negligible: a tile's "
+                "own slide contributes a tiny share of a reference with thousands "
+                "of slides in it, so removing that slide costs almost nothing."
             )
 
     if args.superclusters:

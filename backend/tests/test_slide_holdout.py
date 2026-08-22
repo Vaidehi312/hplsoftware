@@ -396,6 +396,104 @@ def test_holdout_out_without_holdout_slides_is_refused(tmp_path):
     assert "does nothing without" in (run.stdout + run.stderr)
 
 
+# --- the two sides must be the same classifier ---------------------------
+#
+# The first real run of this reported the holdout 0.53 points HIGHER than
+# leave-one-out and blamed easy slides. The actual cause: --adaptive-margin
+# reached holdout_accuracy but leave_one_out did not accept it at all, so the
+# closed-book side re-voted its near-ties and the open-book side did not. Two
+# different classifiers, and the gap between them -- the entire output of this
+# tool -- meant nothing.
+
+
+def test_leave_one_out_applies_adaptive_k(tmp_path):
+    """It has to, or the open-book number describes a classifier that is not the
+    one in production and not the one the holdout measured."""
+    import contextlib
+    import io
+    ref_path, _, _ = _write_pair(tmp_path)
+    reference = vr.load_reference(ref_path)
+    plain = vr.leave_one_out(reference, 600, 10, 256, 0,
+                             distance_weighted=True, distance_power=3.0)
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        adaptive = vr.leave_one_out(reference, 600, 10, 256, 0,
+                                    distance_weighted=True, distance_power=3.0,
+                                    adaptive_margin=0.9, adaptive_k=25)
+
+    # Asserted on the margin, not the label. A re-voted row records the WIDE
+    # vote's margin, so that must move; whether the wider neighbourhood also
+    # changes the winner is data-dependent and on a separable fixture it often
+    # does not.
+    assert not np.allclose(plain["margins"], adaptive["margins"]), \
+        "no margin moved, so the adaptive gate never re-voted anything"
+    assert "re-voted" in log.getvalue(), log.getvalue()
+    # Same tiles either way, so the comparison stays paired.
+    assert np.array_equal(plain["truth"], adaptive["truth"])
+    # And the rows it left alone are untouched, label and margin both.
+    moved = ~np.isclose(plain["margins"], adaptive["margins"])
+    assert (plain["predicted"][~moved] == adaptive["predicted"][~moved]).all()
+
+
+def test_adaptive_off_leaves_leave_one_out_unchanged(tmp_path):
+    """The widened search only happens when the gate is on, so every existing
+    number stays reproducible."""
+    ref_path, _, _ = _write_pair(tmp_path)
+    reference = vr.load_reference(ref_path)
+    a = vr.leave_one_out(reference, 600, 10, 256, 0, distance_weighted=True,
+                         distance_power=3.0)
+    b = vr.leave_one_out(reference, 600, 10, 256, 0, distance_weighted=True,
+                         distance_power=3.0, adaptive_margin=0.0, adaptive_k=0)
+    assert a["accuracy"] == b["accuracy"]
+    assert np.array_equal(a["predicted"], b["predicted"])
+    assert np.allclose(a["margins"], b["margins"])
+
+
+def test_an_adaptive_k_no_wider_than_k_is_refused(tmp_path):
+    ref_path, _, _ = _write_pair(tmp_path)
+    reference = vr.load_reference(ref_path)
+    try:
+        vr.leave_one_out(reference, 600, 25, 256, 0, adaptive_margin=0.1,
+                         adaptive_k=25)
+    except SystemExit as e:
+        assert "not wider" in str(e), str(e)
+    else:
+        raise AssertionError("an adaptive_k equal to k must be refused")
+
+
+def test_the_cli_applies_adaptive_k_to_both_sides(tmp_path):
+    """The bug, at the level it actually occurred. Both report blocks must show
+    a re-vote line — one of each is what made the gap meaningless."""
+    h5ad = tmp_path / "TCGA_fake_leiden_2p5__fold2.h5ad"
+    _write_h5ad(h5ad)
+    ref = tmp_path / "ref.npz"
+    build = subprocess.run(
+        [sys.executable, str(BACKEND / "build_hpc_reference.py"),
+         "--h5ad", str(h5ad), "--out", str(ref),
+         "--holdout-slides", "5", "--holdout-seed", "0"],
+        capture_output=True, text=True, cwd=str(BACKEND))
+    assert build.returncode == 0, build.stderr
+
+    run = subprocess.run(
+        [sys.executable, str(BACKEND / "validate_reference.py"),
+         "--reference", str(ref), "--holdout", str(tmp_path / "ref_holdout.npz"),
+         "--k", "10", "--distance-weighted", "--distance-power", "3",
+         "--adaptive-margin", "0.9", "--adaptive-k", "25",
+         "--sample", "800", "--worst", "2"],
+        capture_output=True, text=True, cwd=str(BACKEND))
+    assert run.returncode == 0, run.stderr
+    revotes = run.stdout.count("Adaptive  : re-voted")
+    assert revotes == 2, (
+        f"expected a re-vote line under both CLOSED BOOK and OPEN BOOK, saw "
+        f"{revotes}:\n{run.stdout}")
+
+    # And each must sit in its own section, not both in one.
+    closed = run.stdout.index("CLOSED BOOK")
+    openbook = run.stdout.index("OPEN BOOK")
+    assert run.stdout.index("Adaptive  : re-voted") < openbook
+    assert run.stdout.rindex("Adaptive  : re-voted") > openbook > closed
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

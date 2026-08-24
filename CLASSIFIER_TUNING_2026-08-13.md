@@ -172,6 +172,12 @@ so the curve has plateaued. Cosine stays deprioritised given the root cause
 above.
 
 ### 12. Margin-gated adaptive k — best result of the session
+> **Deleted 2026-08-24.** `adaptive_k_experiment.py` and its test were removed:
+> the question below was answered, `tune_classifier.py` now sweeps adaptive k as
+> one knob among many, and `assign_hpc_clusters.py` ships it as
+> `--adaptive-margin` / `--adaptive-k`. Nothing imported it but its own test. The
+> section is kept as the record of how the answer was reached.
+
 New script `backend/adaptive_k_experiment.py` (uncommitted) tests a specific,
 motivated idea rather than "bigger k everywhere": item 2's own k-sweep already
 proved a *global* larger k hurts (250→92.41%, 10→96.13%), so the only version

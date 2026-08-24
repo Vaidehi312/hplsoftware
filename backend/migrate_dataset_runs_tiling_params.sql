@@ -1,0 +1,28 @@
+-- ============================================================
+-- Records the tiling parameters each dataset run actually used, so a resume
+-- (or any follow-up submission derived from the run) can reproduce them
+-- exactly instead of silently falling back to whatever the defaults are at
+-- the time it runs. Run once on the HPCC PostgreSQL instance, after
+-- migrate_dataset_runs_dataset_name.sql.
+--
+-- Before this column, only min_tissue was carried on the request at all, and
+-- resume_dataset_job() built its DatasetJobRequest without it — so resuming a
+-- run tiled at min_tissue=10 re-tiled the missing slides at the 30.0 default,
+-- producing tiles under a different threshold than the rest of the same
+-- dataset. The other seven parameters (target_mpp, target_tile_px, level,
+-- jpeg_quality, mask_max_size, mask_saturation, mask_value) came from
+-- submit_mask_tile_slurm.submit_array()'s own defaults and were never recorded
+-- anywhere, so a run tiled before any of those defaults changed could not be
+-- reproduced at all.
+--
+-- JSONB rather than one column per parameter: the set is decided by
+-- submit_array()'s signature, and adding a tiling knob should not require a
+-- schema migration to keep runs reproducible.
+--
+-- NULL for rows created before this migration. Callers treat that as "unknown"
+-- and fall back to the current defaults — the same behaviour those runs
+-- already got — but the API reports the fallback rather than presenting a
+-- guess as fact.
+-- ============================================================
+
+ALTER TABLE slurm_dataset_runs ADD COLUMN IF NOT EXISTS tiling_params JSONB;

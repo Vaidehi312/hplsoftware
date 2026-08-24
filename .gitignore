@@ -1,0 +1,44 @@
+# Secrets. app/.streamlit/secrets.toml exists in this working tree and has never
+# been committed; this is what keeps a `git add -A` from being the first time.
+#
+# `**/` and not `.streamlit/secrets.toml`: a pattern containing a slash is
+# anchored to this file's directory, so the unanchored-looking version would
+# have covered the root copy and missed app/'s — which is the one that exists.
+# Verified with `git check-ignore -v`.
+**/.streamlit/secrets.toml
+secrets.toml
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# macOS, and Finder's clipboard files — several are already in the tree
+.DS_Store
+*.textClipping
+.Rhistory
+
+# Generated at run time, not source.
+backend/slurm_logs/
+backend/slurm_manifests/
+work/
+.nextflow*/
+
+# Data and derived artifacts. These are large, are rebuilt by the pipeline, and
+# are only meaningful next to the embeddings they came from.
+*.h5
+*.h5ad
+*.npz
+*.sif
+h5_exports/
+loaded_data/
+
+# The reference profile is derived from a reference by validate_reference.py
+# --save-profile, and is pinned to one reference plus one vote configuration —
+# so it belongs beside the reference, not in git.
+*_profile_*.json

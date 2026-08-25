@@ -780,3 +780,84 @@ which. `build_hpc_reference.save()` records `meta["source"]` precisely so this i
 answerable, and reading it is a one-liner; the code comment in
 `validate_reference.describe_reference` asserted TCGA from memory instead, and has
 been corrected to say where to look.
+
+## §23 Closed-book accuracy: 97.33% on unseen slides, and a wrong prediction
+
+Run 2026-08-23. `build_hpc_reference.py --holdout-slides 20` removed 20 whole
+LATTICeA slides (16,468 tiles) from the reference; `validate_reference.py
+--holdout` then classified them against the reduced reference.
+
+```
+Accuracy  : 97.33% ± 0.25 (95% CI, n=16,468)
+Error budget: 440 wrong — 440 (100%) had the true cluster among the k neighbours
+unweighted slide mean 97.35%, between-slide SD 0.60 points, range 2.1 points
+```
+
+**The prediction that motivated it was wrong.** The argument for building it was
+that leave-one-out must be optimistic, because a tile's ~5,000 slide-mates stay
+in the reference and are near-duplicates of it. Measured, the leakage is
+**negligible**. The arithmetic was wrong: 20 slides came to 16,468 tiles, so a
+slide contributes ~820 tiles and the reference holds roughly **3,000 slides**. A
+tile's own slide is 0.03% of the reference — removing it costs almost nothing.
+
+So 97.27% was not overstating anything, and the closed-book number *confirms* it
+rather than deflating it.
+
+**The first run of the comparison was itself broken**, in the way this document
+keeps recording. It reported the holdout 0.53 points *higher* than leave-one-out
+and blamed easy slides. The real cause: `--adaptive-margin` reached
+`holdout_accuracy` but `leave_one_out` did not accept the argument at all, so
+only the closed-book side re-voted its near-ties. Two different classifiers, and
+the gap between them — the whole output of the tool — meant nothing. Visible in
+the output as a `re-voted 845 tiles` line under CLOSED BOOK and none under OPEN
+BOOK. Fixed in `ebc536f`; both sides now take the same vote and a test counts the
+re-vote lines.
+
+**What holds up.** Retrieval is perfect even on unseen slides: all 440 errors had
+the true cluster among the k neighbours, so every error is a lost vote and not a
+failed search. And `vote_margin` stays calibrated off-reference — 0.75–1.00 is
+100% correct over 11,482 tiles (70% of them) while 0.00–0.10 is 59.4%, which is
+what makes Stage 5's `--min-margin` meaningful for a new cohort.
+
+**Between-slide SD is the honest error bar**, not the binomial one. A slide's
+tiles are highly correlated, so ±0.25 over 16,468 tiles is far too tight; 0.60
+points across 20 slides is the number to quote.
+
+## §24 What the holdout leaves open, and the tool for it
+
+The holdout is LATTICeA → LATTICeA. It establishes that a **new slide** costs
+nothing, which narrows the remaining risk to **cohort shift** — different
+scanner, stain, mpp — and that cannot be measured by accuracy at all, because a
+new cohort has no ground truth.
+
+`backend/cohort_shift.py` (`47624a6`) probes it by distance instead, as
+`migrate_tile_registry_confidence.sql` proposed when the column was added.
+`validate_reference.py --save-profile` stores the reference's own
+`neighbor_distance` and `vote_margin` quantiles — free, from the leave-one-out it
+already runs — and a dataset's assignment CSV is compared against them. One
+profile per (reference, vote preset), since distances depend on k and margins on
+every knob.
+
+Two signals, deliberately, and the calibration took two attempts:
+
+- **novelty_ratio** — tiles past the reference's 99th percentile, over the 1%
+  expected. Sensitive but explosive: a one-SD shift sends it past 5x, and three
+  bad slides in ten past 20x while 70% of the cohort is untouched.
+- **median_percentile** — where the cohort's *typical* tile sits. Bounded, so it
+  separates "mostly fine with a tail" from "the whole cohort moved".
+
+The first version keyed the verdict on the ratio alone and called a mild shift
+and a few bad slides both ALARM. Those need different actions — extend the
+reference, versus drop or re-scan some slides — so the verdict now keys on the
+median, the ratio raises a notice, and per-slide spread is reported so
+localisation is visible.
+
+Novelty and ambiguity stay separate throughout: a cohort that *is* represented
+but sits on cluster boundaries has normal distances and a high low-margin share,
+and the lever for that is Stage 5's `--min-margin`, which does nothing for
+novelty.
+
+**Already suggestive for Radiogenomics.** Its 10-slide dry run showed 9.1% of
+tiles below margin 0.1 against 3.7% for the reference — but under the legacy
+unweighted vote, so not like-for-like. Re-run under the tuned preset before
+reading anything into it.

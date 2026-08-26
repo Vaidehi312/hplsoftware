@@ -14,9 +14,9 @@ and are recorded as overturned.
 
 ## TL;DR
 
-A cohort that goes through all five pipeline stages ends up with **nothing in the Knowledge Bank**.
-Not partially loaded — empty, and Stage 5 refuses at a 0% match rate, correctly, with a message
-about slide naming.
+A cohort that went through all five pipeline stages ended up with **nothing in the Knowledge
+Bank**. Not partially loaded — empty, and the KB load refused at a 0% match rate, correctly, with a
+message about slide naming.
 
 The cause was never a bug. `load_hpc_assignments.load()` only ever `UPDATE`s
 `tile_registry.hpc_id`; the row it updates has to already exist, and nothing created it. Every row
@@ -28,8 +28,10 @@ already covered two of those five tables — but only from the command line. It 
 client method and no UI step, so "automated" was never true of it either.
 
 **What changed in this session:** registration now covers all five tables in one transaction,
-runs from the UI as pipeline step 5, and the KB load is step 6 and gated on it. The eight tables
-that had no `CREATE TABLE` anywhere in git now have one. 46 new tests, 384 passing.
+runs from the UI as pipeline step 5 (both frontends), and the KB load is step 6 and gated on it.
+Stage 6 also refreshes `slide_hpc_membership`, which turned out to have a live reader a grep cannot
+see (§4.1). The eight tables that had no `CREATE TABLE` anywhere in git now have one. 53 new tests,
+391 passing.
 
 **What is still open, and is a modelling problem rather than plumbing:** `tile_hpc_heatmap` — 149 MB,
 71 probability columns, read into memory at server startup, and nothing has ever written it.
@@ -58,7 +60,7 @@ extraction → classification → registration → KB load.
 | 13 | `hpc_survival_analysis` | nothing — static Cox coefficients | survival overlay, HPC panels | ⚪ correct by standing still |
 | 14 | `tile_hpc_heatmap` | **nothing, ever** | `_load_heatmap_probs()` at startup → merged into every `tiles_meta` response | ❌ **empty for the cohort; globally stale** |
 | 15 | `h_latent_vectors` | nothing — 4.4 GB of 2025 hand-loaded rows | nothing live | ❌ stale, and nothing notices |
-| 16 | `slide_hpc_membership` | nothing — 19,493 rows from ~501 old slides | nothing live | ❌ stale, and nothing notices |
+| 16 | `slide_hpc_membership` | **Stage 6**, alongside the aggregates | the chatbot, via a dynamic table scan — see §4.1 | ✅ filled *(was stale and being shown to users)* |
 | 17 | `tile_hpc_heatmap_old` | nothing — 141 MB legacy twin | nothing | ❌ dead storage |
 | — | `slide_metadata` (view) | n/a — a view has no storage | nothing | ⚪ n/a |
 
@@ -182,9 +184,7 @@ Recommending work on a table nothing reads is worse than saying nothing, so, pla
   **no live reader**: the only references are in `app/app_v3` … `app_v21`, all superseded by
   `app_v28`. Stage 3 does produce the input (`<set>_h_latent` is in every projections `.h5`), so
   filling it is possible; there is no reason to.
-- **`slide_hpc_membership`** — no `dataset_id` column at all, so it cannot be scoped per cohort
-  even in principle. Structurally a denormalised index of `tile_registry`
-  (`SELECT DISTINCT slides, hpc_id FROM tile_registry`) and referenced by nothing.
+- ~~**`slide_hpc_membership`**~~ — **this was wrong, see §4.1.** It has a live reader.
 - **`tile_hpc_heatmap_old`** — 141 MB, no reader. Note its primary key is named
   `tile_hpc_heatmap_pkey` while the *live* table's is named `hpc_heatmap_pkey`; the names are
   transposed relative to the tables, which is what renaming a live table leaves behind. Anyone
@@ -193,6 +193,41 @@ Recommending work on a table nothing reads is worse than saying nothing, so, pla
   repository: `hpl_kb_dump.pgsql` predates the `wsi_*` tables and contains no view at all. The 20
   textual occurrences of the name in the codebase are all a Python identifier, never SQL. Recover
   it with `SELECT pg_get_viewdef('public.slide_metadata'::regclass, true);` if it is ever wanted.
+
+### 4.1 A correction: `slide_hpc_membership` is read, and a grep cannot see it
+
+The first pass of this audit called it unreferenced. That was wrong, and the way it was wrong is
+worth keeping, because it is a trap anyone auditing this database will fall into.
+
+`app/hpc_chat_handlers_v23.py:334` does not query tables by name. It enumerates the entire database
+with `insp.get_table_names()`, keeps every table carrying an `hpc_id` or `dominant_hpc` column —
+skipping only `hpc_dictionary` and `h_latent_vectors` — and renders up to five matching rows
+straight to the user:
+
+```python
+tables = insp.get_table_names()
+for table in tables:
+    if table in ["hpc_dictionary", "h_latent_vectors"]:
+        continue
+    cols = [c["name"] for c in insp.get_columns(table)]
+    id_col = "hpc_id" if "hpc_id" in cols else ("dominant_hpc" if "dominant_hpc" in cols else None)
+    ...
+    rows = conn.execute(text(f"SELECT * FROM {table} WHERE {where_sql} LIMIT 5"), params)
+```
+
+So the table's name appears in no query anywhere, and `grep slide_hpc_membership` finds nothing —
+while every question about a cluster puts its rows in front of a user. It held 19,493 rows from
+~501 slides of an older cohort, and had been answering questions with them.
+
+**Consequence for anyone extending this:** before concluding a table is dead, check whether it has
+an `hpc_id` column. That is the reader.
+
+Stage 6 now refreshes it beside the aggregates, derived from the same `proportions` frame so
+`min_margin` applies to both — a cluster excluded from a slide's proportions but still listed as
+present would let the chatbot report a slide as containing an HPC the aggregate table has no row
+for, and the two are shown side by side. Scoped by `slide_id`, since the table has no `dataset_id`
+and so cannot be scoped per cohort: two cohorts holding the same slide id share these rows, which
+is a property of the schema and is recorded rather than worked around.
 
 ---
 

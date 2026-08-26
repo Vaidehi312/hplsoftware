@@ -1022,10 +1022,27 @@ table with nothing to distinguish them — which is this codebase's failure mode
 schema. Three options are set out in `KB_TABLE_COVERAGE_2026-08-26.md` §3.4; choosing between them
 is a modelling decision, not plumbing.
 
-**`h_latent_vectors` and `slide_hpc_membership` are left alone.** Both are stale, and both have
-**no live reader** — the only references are in `app_v3`…`app_v21`, superseded by `app_v28`.
-Filling a table nothing reads is worse than saying nothing, so this says nothing beyond recording
-why.
+**`h_latent_vectors` is left alone.** Stale, and with **no live reader** — the only references are
+in `app_v3`…`app_v21`, superseded by `app_v28`, and the chatbot's dynamic scan (below) skips it by
+name. Filling a table nothing reads is worse than saying nothing.
+
+**`slide_hpc_membership` is now refreshed, after the audit was wrong about it twice over.** The
+first pass called it unreferenced; the adversarial check found the reader, and it is one a grep
+structurally cannot find. `app/hpc_chat_handlers_v23.py:334` enumerates the whole database with
+`insp.get_table_names()`, keeps every table with an `hpc_id` or `dominant_hpc` column — skipping
+only `hpc_dictionary` and `h_latent_vectors` — and renders up to five matching rows straight to the
+user. The table's name appears in no query, and its 19,493 stale rows from an older cohort were
+being shown to anyone who asked about a cluster.
+
+So Stage 6 now refreshes it beside the aggregates, derived from the same `proportions` frame so
+`min_margin` applies to both: a cluster excluded from a slide's proportions but still listed as
+present would let the chatbot report a slide as containing an HPC the aggregate table has no row
+for, and the two are shown side by side. Scoped by `slide_id`, because the table has no
+`dataset_id` — two cohorts holding the same slide id share these rows, which is recorded rather
+than worked around.
+
+**The general lesson, and it applies to any future audit of this database: before concluding a
+table is dead, check whether it has an `hpc_id` column.** That is the reader.
 
 **The hard-coded scan geometry is left in place.** `tile_server_v2_.py:216-218` computes
 `TILE_SIZE_NATIVE` from `SCALE = 1.8 / 0.252` — every slide in every cohort assumed to be scanned
@@ -1036,8 +1053,8 @@ existing slide. Recorded as the next change, not made as part of this one.
 
 ### §25.6 State
 
-Tests **338 → 384**. Three suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
-(16, new), `test_register_dataset.py` (10 → 26). Each new check has a companion that proves it can
+Tests **338 → 391**. Four suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
+(16, new), `test_register_dataset.py` (10 → 26), `test_kb_load.py` (18 → 25). Each new check has a companion that proves it can
 come out bad, per this project's own rule.
 
 **Not run against a real PostgreSQL** — there is none on the machine this was written on, so the

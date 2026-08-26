@@ -456,6 +456,152 @@ def test_missing_aggregate_column_does_not_abort_the_load(tmp_path):
         assert len(pd.read_sql(text("SELECT * FROM hpl_profile_summary"), conn)) == 1
 
 
+# --- slide_hpc_membership -------------------------------------------------
+#
+# The reader is not obvious and that is the point: app/hpc_chat_handlers_v23.py
+# :334 enumerates every table in the database, keeps any with an hpc_id or
+# dominant_hpc column, skipping only hpc_dictionary and h_latent_vectors, and
+# renders matching rows straight to the user. So this table is answered out of
+# the chatbot without ever being named in a query — a grep for it finds nothing,
+# which is exactly how it came to hold 19,493 rows for cohorts nobody was asking
+# about while looking unreferenced.
+
+
+def _add_membership_table(engine, rows=()):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE slide_hpc_membership (
+                slide_id TEXT NOT NULL, hpc_id INTEGER NOT NULL,
+                PRIMARY KEY (slide_id, hpc_id))"""))
+        for slide, hpc in rows:
+            conn.execute(
+                text("INSERT INTO slide_hpc_membership (slide_id, hpc_id) "
+                     "VALUES (:s, :h)"), {"s": slide, "h": hpc})
+
+
+def test_membership_is_refreshed_with_the_aggregates(tmp_path):
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    _add_membership_table(engine)
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": 3, "proportion": 0.6},
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": 7, "proportion": 0.4},
+    ])
+    with engine.begin() as conn:
+        n = loader.replace_slide_membership(conn, proportions)
+    assert n == 2
+    with engine.connect() as conn:
+        got = set(conn.execute(text(
+            "SELECT slide_id, hpc_id FROM slide_hpc_membership")).fetchall())
+    assert got == {("SLIDE-A", 3), ("SLIDE-A", 7)}
+
+
+def test_a_cluster_that_no_longer_appears_loses_its_row(tmp_path):
+    """Delete-then-insert, not upsert: a slide's cluster set changes between
+    references, and a cluster left behind would be reported by the chatbot as
+    present on a slide whose proportions have no row for it."""
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    _add_membership_table(engine, rows=[("SLIDE-A", 3), ("SLIDE-A", 99)])
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": 3, "proportion": 1.0},
+    ])
+    with engine.begin() as conn:
+        loader.replace_slide_membership(conn, proportions)
+    with engine.connect() as conn:
+        got = set(conn.execute(text(
+            "SELECT slide_id, hpc_id FROM slide_hpc_membership")).fetchall())
+    assert got == {("SLIDE-A", 3)}, "cluster 99 survived a load that dropped it"
+
+
+def test_another_slides_membership_is_untouched(tmp_path):
+    """Scoped by slide, like the aggregates. Loading ten slides must not empty
+    the membership of every other slide in the Knowledge Bank."""
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    _add_membership_table(engine, rows=[("OTHER-SLIDE", 42)])
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": 3, "proportion": 1.0},
+    ])
+    with engine.begin() as conn:
+        loader.replace_slide_membership(conn, proportions)
+    with engine.connect() as conn:
+        got = set(conn.execute(text(
+            "SELECT slide_id, hpc_id FROM slide_hpc_membership")).fetchall())
+    assert ("OTHER-SLIDE", 42) in got
+
+
+def test_slide_id_is_upper_cased_to_match_the_normalised_columns(tmp_path):
+    """migrate_indexes.sql normalised the live identity columns to
+    UPPER(TRIM(...)). A row written in the CSV's own casing is a row the
+    DELETE will not find on the next load, so the slide accumulates two
+    memberships that both look plausible."""
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    _add_membership_table(engine)
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "  slide-a  ", "hpc_id": 3, "proportion": 1.0},
+    ])
+    with engine.begin() as conn:
+        loader.replace_slide_membership(conn, proportions)
+    with engine.connect() as conn:
+        got = conn.execute(text("SELECT slide_id FROM slide_hpc_membership")).scalar()
+    assert got == "SLIDE-A"
+
+
+def test_a_missing_membership_table_does_not_fail_the_load(tmp_path):
+    """It has no CREATE TABLE in git older than migrate_kb_base_tables.sql, so a
+    database that predates that migration has no such table — and losing the
+    whole tile_registry update over an optional aggregate would be far worse
+    than not writing it."""
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    # deliberately no _add_membership_table
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": 3, "proportion": 1.0},
+    ])
+    with engine.begin() as conn:
+        assert loader.replace_slide_membership(conn, proportions) is None
+
+
+def test_string_cluster_ids_from_the_csv_are_coerced(tmp_path):
+    """compute_profiles carries hpc_id as a string, and a float-typed CSV column
+    yields "3.0" — int("3.0") raises, and this runs inside the transaction that
+    carries the tile_registry update."""
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    _add_membership_table(engine)
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": "3.0", "proportion": 0.5},
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": "7", "proportion": 0.5},
+    ])
+    with engine.begin() as conn:
+        assert loader.replace_slide_membership(conn, proportions) == 2
+    with engine.connect() as conn:
+        got = set(conn.execute(text(
+            "SELECT slide_id, hpc_id FROM slide_hpc_membership")).fetchall())
+    assert got == {("SLIDE-A", 3), ("SLIDE-A", 7)}
+
+
+def test_a_non_numeric_cluster_id_skips_the_whole_table(tmp_path):
+    """All or nothing. A membership missing whichever clusters are not numeric
+    is a table that looks complete and under-reports — worse than one that was
+    not refreshed and said so. And it must not take the load down with it."""
+    engine = _make_kb(tmp_path, [])
+    _add_profile_tables(engine)
+    _add_membership_table(engine, rows=[("SLIDE-A", 1)])
+    proportions = pd.DataFrame([
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": "3", "proportion": 0.5},
+        {"samples": "S1", "slides": "SLIDE-A", "hpc_id": "stroma", "proportion": 0.5},
+    ])
+    with engine.begin() as conn:
+        assert loader.replace_slide_membership(conn, proportions) is None
+    with engine.connect() as conn:
+        got = set(conn.execute(text(
+            "SELECT slide_id, hpc_id FROM slide_hpc_membership")).fetchall())
+    assert got == {("SLIDE-A", 1)}, "the pre-existing rows must be left alone"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

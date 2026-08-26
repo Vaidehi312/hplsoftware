@@ -122,7 +122,7 @@ Which tables a run actually fills, and which nothing fills — audited 2026-08-2
 
 | filled by a run | never filled by anything |
 |---|---|
-| `tile_coordinates`, `tile_registry`, `wsi_registry`, `wsi_metadata`, `dataset_config` (Stage 5) · `hpl_profile_*` (Stage 6) · `slurm_dataset_run*` (the server) | `tile_hpc_heatmap` — **read live** at server startup, nothing writes it · `h_latent_vectors` (4.4 GB) · `slide_hpc_membership` · `tile_hpc_heatmap_old` |
+| `tile_coordinates`, `tile_registry`, `wsi_registry`, `wsi_metadata`, `dataset_config` (Stage 5) · `hpl_profile_*`, `slide_hpc_membership` (Stage 6) · `slurm_dataset_run*` (the server) | `tile_hpc_heatmap` — **read live** at server startup, nothing writes it · `h_latent_vectors` (4.4 GB) · `tile_hpc_heatmap_old` |
 
 `tile_hpc_heatmap` is the one gap with a live reader still open. `_load_heatmap_probs()`
 (`tile_server_v2_.py:1332`) reads the whole 149 MB table into memory at startup and merges its 71
@@ -130,8 +130,16 @@ Which tables a run actually fills, and which nothing fills — audited 2026-08-2
 the k-NN classifier does not produce a 71-class distribution to write — it produces a top-1 label and
 a vote margin. Filling it is a modelling decision, not plumbing.
 
-`h_latent_vectors` and `slide_hpc_membership` have no live reader at all: nothing in `backend/` or in
-`app_v28.py` names them. Leave them alone rather than "completing" them.
+**A grep will not find every reader.** `app/hpc_chat_handlers_v23.py:334` enumerates the whole
+database with `insp.get_table_names()`, keeps every table carrying an `hpc_id` or `dominant_hpc`
+column — skipping only `hpc_dictionary` and `h_latent_vectors` — and renders up to five matching
+rows straight to the user. So any such table is answered out of the chatbot without ever being
+named. That is how `slide_hpc_membership` looked unreferenced while serving stale rows for cohorts
+nobody was asking about; Stage 6 now refreshes it alongside the aggregates. Before concluding a
+table is dead, check whether it has an `hpc_id` column.
+
+`h_latent_vectors` is the one table with genuinely no live reader — it is in that skip list by name,
+and nothing else touches it. Leave it alone rather than "completing" it.
 
 ## Invariants that cost time to rediscover
 

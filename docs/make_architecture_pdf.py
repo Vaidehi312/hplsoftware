@@ -345,6 +345,7 @@ class KbMap(Diagram):
                 ("dataset_config", "Stage 5"),
                 ("hpl_profile_summary", "Stage 6"),
                 ("hpl_profile_proportion", "Stage 6"),
+                ("slide_hpc_membership", "Stage 6"),
                 ("slurm_dataset_runs", "the server"),
                 ("slurm_dataset_run_jobs", "the server"),
             ]),
@@ -357,7 +358,6 @@ class KbMap(Diagram):
             ("NOTHING FILLS THESE", WARN, [
                 ("tile_hpc_heatmap", "READ LIVE - 149 MB"),
                 ("h_latent_vectors", "no reader - 4.4 GB"),
-                ("slide_hpc_membership", "no reader"),
                 ("tile_hpc_heatmap_old", "legacy - 141 MB"),
                 ("slide_metadata (view)", "no reader"),
             ]),
@@ -626,6 +626,18 @@ def story():
           "<font face='Courier'>24_10</font>. Both sides go through "
           "<font face='Courier'>backend/slide_naming.py</font> so a key built from one "
           "can match a row registered from the other."),
+        H2("A grep will not find every reader"),
+        P("<font face='Courier'>app/hpc_chat_handlers_v23.py:334</font> does not query tables by "
+          "name. It enumerates the whole database with "
+          "<font face='Courier'>insp.get_table_names()</font>, keeps every table carrying an "
+          "<font face='Courier'>hpc_id</font> or <font face='Courier'>dominant_hpc</font> column — "
+          "skipping only <font face='Courier'>hpc_dictionary</font> and "
+          "<font face='Courier'>h_latent_vectors</font> — and renders up to five matching rows "
+          "straight to the user. So such a table is answered out of the chatbot without ever "
+          "appearing in a query, and a grep for its name finds nothing. That is how "
+          "<font face='Courier'>slide_hpc_membership</font> looked unreferenced while serving "
+          "19,493 stale rows from an older cohort. <b>Before concluding a table is dead, check "
+          "whether it has an <font face='Courier'>hpc_id</font> column.</b>"),
         H2("Aggregates are what the UI actually reads"),
         P("<font face='Courier'>hpl_profile_proportion</font> and "
           "<font face='Courier'>hpl_profile_summary</font> are derived from the same "
@@ -656,7 +668,9 @@ def story():
     ]
 
     # ---- classifier ------------------------------------------------------
-    s += [PageBreak(), H1("The classifier"), ClassifierFlow(CONTENT_W)]
+    # Flows rather than breaking: forcing this onto a new page left the
+    # Knowledge Bank page four-fifths empty.
+    s += [Spacer(1, 10), H1("The classifier"), ClassifierFlow(CONTENT_W)]
 
     s += [
         Spacer(1, 6),

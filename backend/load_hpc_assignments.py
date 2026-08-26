@@ -367,10 +367,83 @@ def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> 
 
     _delete("hpl_profile_proportion")
     _delete("hpl_profile_summary")
-    return {
+    written = {
         "hpl_profile_summary": _insert("hpl_profile_summary", summary),
         "hpl_profile_proportion": _insert("hpl_profile_proportion", proportions),
     }
+    membership = replace_slide_membership(conn, proportions)
+    if membership is not None:
+        written["slide_hpc_membership"] = membership
+    return written
+
+
+def replace_slide_membership(conn, proportions: pd.DataFrame):
+    """Refresh slide_hpc_membership for the slides being loaded.
+
+    Which HPCs appear on which slide — derived from the same assignment as the
+    proportions, and refreshed with them, because it is read alongside them.
+    The reader is not obvious: app/hpc_chat_handlers_v23.py:334 enumerates
+    every table in the database with `insp.get_table_names()`, keeps any that
+    has an hpc_id or dominant_hpc column, skipping only hpc_dictionary and
+    h_latent_vectors, and renders up to five matching rows straight to the
+    user. So this table is answered out of the chatbot without ever being named
+    in a query — which is why a grep for it finds nothing and why it had been
+    left stale, showing 19,493 rows from cohorts nobody was asking about.
+
+    Derived from `proportions` rather than from the raw assignment so that
+    min_margin applies here too. A cluster excluded from a slide's proportions
+    but still listed as present would let the chatbot report a slide as
+    containing an HPC the aggregate table has no row for, and the two are shown
+    side by side.
+
+    Returns None when the table is absent — it has no CREATE TABLE in git older
+    than migrate_kb_base_tables.sql, so a database predating that has no such
+    table and this must not fail the load.
+
+    Scoped by slide_id and not by dataset_id, because the table has no
+    dataset_id column: two cohorts holding the same slide id share these rows.
+    Recorded as a property of the schema rather than worked around here.
+    """
+    if not sqlalchemy_inspect(conn).has_table("slide_hpc_membership"):
+        print("  slide_hpc_membership: table absent; not writing it", file=sys.stderr)
+        return None
+
+    pairs = (proportions[["slides", "hpc_id"]]
+             .dropna()
+             .drop_duplicates())
+    slides = sorted({str(s).strip().upper() for s in pairs["slides"]})
+    if not slides:
+        return 0
+
+    # compute_profiles() carries hpc_id as a string, because the cluster column
+    # is named for the reference's groupby and its values arrive as whatever the
+    # CSV held — "3" from an int column, "3.0" from a float one. This table's
+    # column is integer, so int("3.0") would raise and take the tile_registry
+    # update down with it.
+    records = []
+    for slide, hpc in zip(pairs["slides"], pairs["hpc_id"]):
+        try:
+            cluster = int(float(str(hpc).strip()))
+        except (TypeError, ValueError):
+            # All or nothing: a membership missing the clusters that happen not
+            # to be numeric is a table that looks complete and under-reports,
+            # which is worse than one that was not refreshed and says so.
+            print(f"  slide_hpc_membership: cluster id {hpc!r} is not an integer; "
+                  f"not writing this table", file=sys.stderr)
+            return None
+        records.append({"slide_id": str(slide).strip().upper(), "hpc_id": cluster})
+
+    conn.execute(
+        text("DELETE FROM slide_hpc_membership WHERE UPPER(TRIM(slide_id)) IN :slides")
+        .bindparams(bindparam("slides", expanding=True)),
+        {"slides": slides},
+    )
+    conn.execute(
+        text("INSERT INTO slide_hpc_membership (slide_id, hpc_id) "
+             "VALUES (:slide_id, :hpc_id)"),
+        records,
+    )
+    return len(records)
 
 
 def build_parser() -> argparse.ArgumentParser:

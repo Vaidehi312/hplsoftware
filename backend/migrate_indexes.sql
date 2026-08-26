@@ -1,12 +1,23 @@
 -- ============================================================
 -- PostgreSQL Index Migration for HPC Tile Server
 -- Run once on the HPCC PostgreSQL instance to speed up queries.
+--
+-- The normalising UPDATEs below are guarded with `<> UPPER(TRIM(...))` rather
+-- than only `IS NOT NULL`. Without that guard each one rewrites every row of
+-- its table on every run, even when every value is already normalised — and
+-- migrate_all.sql exists precisely so this file gets re-run. On the live
+-- database that is ~360 MB of tile_registry and tile_coordinates rewritten to
+-- change nothing, doubling both tables until the next VACUUM. With the guard a
+-- re-run touches only rows that actually differ, which after the first run is
+-- none.
 -- ============================================================
 
 -- 1. tile_coordinates — the most queried table
 --    Normalise slides/slide_tile to uppercase once, then index plain columns.
-UPDATE tile_coordinates SET slides = UPPER(TRIM(slides))         WHERE slides IS NOT NULL;
-UPDATE tile_coordinates SET slide_tile = UPPER(TRIM(slide_tile)) WHERE slide_tile IS NOT NULL;
+UPDATE tile_coordinates SET slides = UPPER(TRIM(slides))
+    WHERE slides IS NOT NULL AND slides <> UPPER(TRIM(slides));
+UPDATE tile_coordinates SET slide_tile = UPPER(TRIM(slide_tile))
+    WHERE slide_tile IS NOT NULL AND slide_tile <> UPPER(TRIM(slide_tile));
 
 CREATE INDEX IF NOT EXISTS idx_tc_slides      ON tile_coordinates(slides);
 CREATE INDEX IF NOT EXISTS idx_tc_slide_tile  ON tile_coordinates(slide_tile);
@@ -25,25 +36,31 @@ BEGIN
     END IF;
 END$$;
 
-UPDATE tile_registry SET slides     = UPPER(TRIM(slides))     WHERE slides IS NOT NULL;
-UPDATE tile_registry SET slide_tile = UPPER(TRIM(slide_tile)) WHERE slide_tile IS NOT NULL;
+UPDATE tile_registry SET slides = UPPER(TRIM(slides))
+    WHERE slides IS NOT NULL AND slides <> UPPER(TRIM(slides));
+UPDATE tile_registry SET slide_tile = UPPER(TRIM(slide_tile))
+    WHERE slide_tile IS NOT NULL AND slide_tile <> UPPER(TRIM(slide_tile));
 
 CREATE INDEX IF NOT EXISTS idx_tr_slide_tile ON tile_registry(slide_tile);
 CREATE INDEX IF NOT EXISTS idx_tr_slides     ON tile_registry(slides);
 CREATE INDEX IF NOT EXISTS idx_tr_hpc_id     ON tile_registry(hpc_id);
 
 -- 3. wsi_registry — looked up by slide_id on every request
-UPDATE wsi_registry SET slide_id = UPPER(TRIM(slide_id)) WHERE slide_id IS NOT NULL;
+UPDATE wsi_registry SET slide_id = UPPER(TRIM(slide_id))
+    WHERE slide_id IS NOT NULL AND slide_id <> UPPER(TRIM(slide_id));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wsi_slide_id ON wsi_registry(slide_id);
 
 -- 4. hpl_profile_proportion — queried per slide
-UPDATE hpl_profile_proportion SET slides = UPPER(TRIM(slides)) WHERE slides IS NOT NULL;
+UPDATE hpl_profile_proportion SET slides = UPPER(TRIM(slides))
+    WHERE slides IS NOT NULL AND slides <> UPPER(TRIM(slides));
 CREATE INDEX IF NOT EXISTS idx_hpp_slides ON hpl_profile_proportion(slides);
 CREATE INDEX IF NOT EXISTS idx_hpp_hpc_id ON hpl_profile_proportion(hpc_id);
 
 -- 5. hpl_profile_summary — queried per slide and sample
-UPDATE hpl_profile_summary SET slides  = UPPER(TRIM(slides))  WHERE slides IS NOT NULL;
-UPDATE hpl_profile_summary SET samples = UPPER(TRIM(samples)) WHERE samples IS NOT NULL;
+UPDATE hpl_profile_summary SET slides = UPPER(TRIM(slides))
+    WHERE slides IS NOT NULL AND slides <> UPPER(TRIM(slides));
+UPDATE hpl_profile_summary SET samples = UPPER(TRIM(samples))
+    WHERE samples IS NOT NULL AND samples <> UPPER(TRIM(samples));
 CREATE INDEX IF NOT EXISTS idx_hps_slides  ON hpl_profile_summary(slides);
 CREATE INDEX IF NOT EXISTS idx_hps_samples ON hpl_profile_summary(samples);
 

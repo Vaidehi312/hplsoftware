@@ -681,6 +681,62 @@ def test_an_unregistered_slide_is_refused_by_name(tmp_path):
         raise AssertionError("a slide with no dataset_id must be refused by name")
 
 
+def test_another_cohorts_aggregates_are_never_deleted(tmp_path):
+    """The deletes in replace_profiles are scoped by slide NAME, not by cohort.
+    A slide name is not unique across cohorts, so without this guard loading a
+    new dataset would silently remove the rows an older one owns."""
+    engine = _make_kb(tmp_path, ["SLIDE-A_1_1.JPEG"])
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN dataset_id TEXT"))
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN slides TEXT"))
+        conn.execute(text("UPDATE tile_registry SET slides='SLIDE-A', dataset_id='RADIOGENOMICS'"))
+    _add_profile_tables_with_dataset_id(engine)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO hpl_profile_summary (samples,slides,dataset_id,total_tiles) "
+                          "VALUES ('OLD','SLIDE-A','TCGA_LUAD_5X',999)"))
+
+    summary = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A", "cancer_type": None,
+                             "total_tiles": 1, "dominant_hpc": "3"}])
+    proportions = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A",
+                                 "hpc_id": "3", "proportion": 1.0}])
+    try:
+        with engine.begin() as conn:
+            loader.replace_profiles(conn, proportions, summary)
+    except SystemExit as e:
+        assert "different cohort" in str(e), str(e)
+    else:
+        raise AssertionError("loading over another cohort's slide must be refused")
+
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT total_tiles FROM hpl_profile_summary WHERE dataset_id='TCGA_LUAD_5X'"
+        )).scalar() == 999, "the other cohort's row was modified"
+
+
+def test_the_cohort_guard_does_not_block_a_reload_of_the_same_cohort(tmp_path):
+    """The companion. Re-loading a cohort over its own rows is the normal case
+    and must still work, or the guard is just a lockout."""
+    engine = _make_kb(tmp_path, ["SLIDE-A_1_1.JPEG"])
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN dataset_id TEXT"))
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN slides TEXT"))
+        conn.execute(text("UPDATE tile_registry SET slides='SLIDE-A', dataset_id='RADIOGENOMICS'"))
+    _add_profile_tables_with_dataset_id(engine)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO hpl_profile_summary (samples,slides,dataset_id,total_tiles) "
+                          "VALUES ('S1','SLIDE-A','RADIOGENOMICS',1)"))
+
+    summary = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A", "cancer_type": None,
+                             "total_tiles": 7, "dominant_hpc": "3"}])
+    proportions = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A",
+                                 "hpc_id": "3", "proportion": 1.0}])
+    with engine.begin() as conn:
+        loader.replace_profiles(conn, proportions, summary)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT total_tiles FROM hpl_profile_summary")).scalar() == 7
+        assert conn.execute(text("SELECT count(*) FROM hpl_profile_summary")).scalar() == 1
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

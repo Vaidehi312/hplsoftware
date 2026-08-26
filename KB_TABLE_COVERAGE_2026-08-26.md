@@ -30,7 +30,7 @@ client method and no UI step, so "automated" was never true of it either.
 **What changed in this session:** registration now covers all five tables in one transaction,
 runs from the UI as pipeline step 5 (both frontends), and the KB load is step 6 and gated on it.
 Stage 6 also refreshes `slide_hpc_membership`, which turned out to have a live reader a grep cannot
-see (§4.1). The eight tables that had no `CREATE TABLE` anywhere in git now have one. 55 new tests, 393 passing, and the whole path verified
+see (§4.1). The eight tables that had no `CREATE TABLE` anywhere in git now have one. 57 new tests, 395 passing, and the whole path verified
 against a real PostgreSQL (§8.1).
 
 **What is still open, and is a modelling problem rather than plumbing:** `tile_hpc_heatmap` — 149 MB,

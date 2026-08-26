@@ -1053,7 +1053,7 @@ existing slide. Recorded as the next change, not made as part of this one.
 
 ### §25.6 State
 
-Tests **338 → 393**. Four suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
+Tests **338 → 395**. Four suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
 (16, new), `test_register_dataset.py` (10 → 26), `test_kb_load.py` (18 → 25). Each new check has a companion that proves it can
 come out bad, per this project's own rule.
 

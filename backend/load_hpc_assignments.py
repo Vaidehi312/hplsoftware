@@ -382,6 +382,41 @@ def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> 
             frame["dataset_id"] = (frame["slides"].astype(str).str.strip().str.upper()
                                    .map(dataset_by_slide))
 
+    # Refuse to delete another cohort's aggregates.
+    #
+    # These deletes are scoped by slide NAME, not by cohort, because that is
+    # what the rewrite has to match. But a slide name is not unique across
+    # cohorts, so on a shared database this could silently remove the rows a
+    # different dataset_id owns — turning "load a new cohort" into "quietly
+    # replace an old one", which is the exact failure this codebase is written
+    # against.
+    #
+    # It cannot simply leave them, either: hpl_profile_summary is UNIQUE on
+    # (samples, slides) with no dataset_id, so two cohorts cannot both hold a
+    # row for the same slide even in principle. Adding would hit the
+    # constraint. So the only honest options are delete-and-replace or refuse,
+    # and refusing is the one that never destroys data nobody asked to touch.
+    if dataset_by_slide:
+        ours = set(dataset_by_slide.values())
+        conflicting = conn.execute(
+            text("SELECT DISTINCT UPPER(TRIM(slides)), dataset_id "
+                 "FROM hpl_profile_summary "
+                 "WHERE UPPER(TRIM(slides)) IN :slides "
+                 "  AND dataset_id IS NOT NULL AND dataset_id NOT IN :ours"
+                 ).bindparams(bindparam("slides", expanding=True),
+                              bindparam("ours", expanding=True)),
+            {**bind, "ours": sorted(ours)},
+        ).fetchall()
+        if conflicting:
+            listed = ", ".join(f"{s} (owned by {d})" for s, d in conflicting[:5])
+            raise SystemExit(
+                f"{len(conflicting)} slide(s) already have aggregates belonging to a "
+                f"different cohort: {listed}. Loading would delete them, and "
+                f"hpl_profile_summary's UNIQUE (samples, slides) has no dataset_id, "
+                f"so both cannot coexist. Resolve which cohort owns these slides "
+                f"before loading — this will not overwrite another dataset's rows."
+            )
+
     def _delete(table: str) -> None:
         conn.execute(
             text(f"DELETE FROM {table} WHERE UPPER(TRIM(slides)) IN :slides").bindparams(

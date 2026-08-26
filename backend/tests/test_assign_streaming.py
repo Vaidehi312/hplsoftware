@@ -1107,7 +1107,12 @@ def test_the_assignment_gets_the_longest_limit(tmp_path):
         hours, minutes, secs = (int(x) for x in rest.split(":"))
         return int(days) * 86400 + hours * 3600 + minutes * 60 + secs
 
-    assert seconds(ASSIGN_TIME_LIMIT) == 2 * 86400
+    # A floor, not an exact value. This number is headroom over a measured
+    # extrapolation and moves with the cohort size — it went 2 days -> 4 days
+    # when 14,000 slides put the unsharded estimate near 20 hours. Pinning it
+    # exactly made this test fail for a reason that is not a defect, which is
+    # the opposite of what it is for. The ordering below is the real invariant.
+    assert seconds(ASSIGN_TIME_LIMIT) >= 2 * 86400
     assert seconds(ASSIGN_TIME_LIMIT) > seconds(MEAN_TIME_LIMIT)
     assert seconds(MEAN_TIME_LIMIT) >= seconds(MERGE_TIME_LIMIT)
 

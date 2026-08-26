@@ -672,6 +672,105 @@ def test_file_uuid_is_none_for_a_slide_that_has_no_uuid(tmp_path):
     ) == "0f1c7e5a-9b2d-4c3e-8a1f-2b3c4d5e6f70"
 
 
+# --- subset registration --------------------------------------------------
+#
+# Registering a handful of slides before committing 14,044 of them. The risk is
+# not that it registers too few — it is that it registers too few and looks like
+# it worked, so every refusal below is about narrowing silently.
+
+
+def test_subset_registers_only_the_requested_slides(tmp_path):
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg"), ("S1", "SLIDE-B", "2_2.jpeg"),
+                        ("S1", "SLIDE-C", "3_3.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    for slide, cr in (("SLIDE-A", (1, 1)), ("SLIDE-B", (2, 2)), ("SLIDE-C", (3, 3))):
+        _write_metadata(tile_dir, "Radiogenomics", slide, [cr])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                                 "RADIOGENOMICS", scope="subset",
+                                 slide_names=["SLIDE-B"])
+    assert plan["slides"] == ["SLIDE-B"]
+    assert len(plan["registry"]) == 1
+    assert plan["registry"]["slides"].tolist() == ["SLIDE-B"]
+    assert plan["scope"] == "subset"
+
+
+def test_a_subset_slide_not_in_the_h5_is_refused_by_name(tmp_path):
+    """Registering three of four requested slides would look like success and
+    leave the fourth missing with nothing to say so."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    try:
+        rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                              "RADIOGENOMICS", scope="subset",
+                              slide_names=["SLIDE-A", "NOT-PACKAGED"])
+    except SystemExit as e:
+        assert "NOT-PACKAGED" in str(e), str(e)
+    else:
+        raise AssertionError("a slide absent from the .h5 must be refused by name")
+
+
+def test_an_empty_subset_is_refused(tmp_path):
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    for names in ([], ["   "], None):
+        try:
+            rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                                  "RADIOGENOMICS", scope="subset", slide_names=names)
+        except SystemExit as e:
+            assert "at least one slide" in str(e), str(e)
+        else:
+            raise AssertionError(f"an empty subset ({names!r}) must be refused")
+
+
+def test_an_unknown_scope_is_refused(tmp_path):
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    try:
+        rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                              "RADIOGENOMICS", scope="everything")
+    except SystemExit as e:
+        assert "full" in str(e) and "subset" in str(e), str(e)
+    else:
+        raise AssertionError("an unrecognised scope must be refused, not treated as full")
+
+
+def test_the_default_scope_still_registers_everything(tmp_path):
+    """The companion: subset must be opt-in, or every existing caller silently
+    changes behaviour."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg"), ("S1", "SLIDE-B", "2_2.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-B", [(2, 2)])
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                                 "RADIOGENOMICS")
+    assert plan["scope"] == "full"
+    assert plan["requested_slides"] is None
+    assert sorted(plan["slides"]) == ["SLIDE-A", "SLIDE-B"]
+
+
+def test_subset_matching_is_case_insensitive(tmp_path):
+    """Slide ids are upper-cased everywhere they are looked up, so a subset
+    typed in the casing a human would use has to match."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg"), ("S1", "SLIDE-B", "2_2.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-B", [(2, 2)])
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                                 "RADIOGENOMICS", scope="subset",
+                                 slide_names=["  slide-b  "])
+    assert plan["slides"] == ["SLIDE-B"]
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

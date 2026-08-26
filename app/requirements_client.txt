@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+Pillow
+sqlalchemy
+psycopg2-binary
+requests
+streamlit-image-coordinates
+streamlit-image-zoom
+textblob
+ollama
+rapidfuzz

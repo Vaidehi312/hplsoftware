@@ -1,0 +1,356 @@
+/* Pipeline panel styling. All class names are prefixed pipeline- to avoid
+   collisions with the viewer half (frontend/src/components/viewer/). */
+
+.pipeline-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  font-size: 13px;
+}
+
+.pipeline-section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  padding: 10px 12px;
+}
+
+.pipeline-section-title {
+  font-weight: 600;
+  color: var(--text-h);
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.pipeline-divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+.pipeline-caption {
+  font-size: 12px;
+  color: #9ca3af;
+  margin: 4px 0;
+}
+
+.pipeline-caption-strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.pipeline-alert {
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 12.5px;
+  line-height: 1.4;
+  border: 1px solid transparent;
+}
+
+.pipeline-alert-info {
+  background: rgba(96, 165, 250, 0.12);
+  border-color: rgba(96, 165, 250, 0.35);
+  color: #bfdbfe;
+}
+
+.pipeline-alert-success {
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.35);
+  color: #a7f3d0;
+}
+
+.pipeline-alert-warning {
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.35);
+  color: #fde68a;
+}
+
+.pipeline-alert-error {
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.35);
+  color: #fecaca;
+}
+
+.pipeline-code {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 4px 0;
+  color: var(--text);
+}
+
+.pipeline-expander {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 6px 0;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.pipeline-expander-summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-h);
+  list-style: none;
+}
+
+.pipeline-expander-summary::-webkit-details-marker {
+  display: none;
+}
+
+.pipeline-expander-summary::before {
+  content: "▸ ";
+  color: #9ca3af;
+}
+
+.pipeline-expander[open] > .pipeline-expander-summary::before {
+  content: "▾ ";
+}
+
+.pipeline-expander-body {
+  padding: 4px 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.pipeline-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 8px 0;
+}
+
+.pipeline-field-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.pipeline-field-help {
+  font-size: 11.5px;
+  color: #9ca3af;
+}
+
+.pipeline-field input[type="text"],
+.pipeline-field input[type="number"],
+.pipeline-field input[type="password"],
+.pipeline-field textarea,
+.pipeline-field select,
+.pipeline-panel input[type="text"],
+.pipeline-panel input[type="number"],
+.pipeline-panel textarea,
+.pipeline-panel select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.pipeline-field input[type="range"] {
+  width: 100%;
+}
+
+.pipeline-radio-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.pipeline-radio-option {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.pipeline-btn {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+  margin: 4px 0;
+}
+
+.pipeline-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.pipeline-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pipeline-btn-primary {
+  background: var(--accent);
+  color: #1e1030;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.pipeline-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.pipeline-btn-danger {
+  background: rgba(248, 113, 113, 0.15);
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+}
+
+.pipeline-btn-row {
+  display: flex;
+  gap: 8px;
+}
+
+.pipeline-progress {
+  margin: 6px 0;
+}
+
+.pipeline-progress-track {
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.pipeline-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.pipeline-progress-label {
+  font-size: 11.5px;
+  color: #9ca3af;
+  margin-top: 3px;
+}
+
+.pipeline-metrics-row {
+  display: flex;
+  gap: 14px;
+  margin: 6px 0;
+}
+
+.pipeline-metric {
+  flex: 1;
+  min-width: 0;
+}
+
+.pipeline-metric-label {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.pipeline-metric-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.pipeline-metric-caption {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.pipeline-spinner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.pipeline-spinner-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pipeline-pulse 1s ease-in-out infinite;
+}
+
+@keyframes pipeline-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+.pipeline-step-header {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pipeline-step-icon {
+  font-size: 13px;
+}
+
+.pipeline-step-title {
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.pipeline-step-summary {
+  color: #9ca3af;
+  font-size: 12px;
+}
+
+.pipeline-toast {
+  position: relative;
+  background: rgba(192, 132, 252, 0.15);
+  border: 1px solid rgba(192, 132, 252, 0.4);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #e9d5ff;
+  margin-bottom: 6px;
+}
+
+.pipeline-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 6px 0;
+}
+
+.pipeline-table th,
+.pipeline-table td {
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+  text-align: left;
+}
+
+.pipeline-table th {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-h);
+}
+
+.pipeline-upload-thumb {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin: 6px 0;
+}
+
+.pipeline-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  margin: 6px 0;
+}

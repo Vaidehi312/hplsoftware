@@ -1,0 +1,72 @@
+hpc_id,predominant_pattern,second_pattern_(if_present),stroma_epithelium_ratio,stromal_cellularity***,other_comments,tiles_contain_mostly,second_most_common_feature,other_notable_features_or_comments?,cluster_purity_label,malignant,inflammation,necrosis,cluster_homogeneity
+0,Acinar,Lepidic,Roughly equal,Moderate,,,,,High (> 75%),True,Mild-moderate,None,0.85
+1,,,,,,Collagenosis,Collagenosis,,High (> 75%),False,None-sparse,None,0.85
+2,,,,,,Collagenosis,Airways,Anthracosis,High (> 75%),False,Marked,None,0.85
+3,,,,,,Collagenosis,Vessels (wall or lumen),Basket-weave textures,High (> 75%),False,None-sparse,None,0.85
+4,,,,,,Cartilage,,Mature cellular cartilage,High (> 75%),False,None-sparse,None,0.85
+5,Acinar,Papillary,More stroma,High,Tumour with pigmented macrophages,,,,High (> 75%),True,None-sparse,None,0.85
+6,,,,,,Vessels (wall or lumen),,Elastotic aretery walls,High (> 75%),False,None-sparse,None,0.85
+7,,,,,,Haemorrhage,,Clot,High (> 75%),False,None-sparse,Some,0.85
+8,,,,,,Other (please specify),Other (please specify),1. Seromucinous bronchial gland 2. Fat,High (> 75%),False,None-sparse,None,0.85
+9,,,,,,Other (please specify),,1. Clot. 2. Coagulative necrosis,High (> 75%),False,None-sparse,Universal,0.85
+10,,,,,,Other (please specify),,Inflamed connective tissues and stroma,High (> 75%),False,Marked,None,0.85
+11,Acinar,Lepidic,More epithelium,Moderate,Discohesive non-solid,,,,Moderate (50 - 75%),True,Mild-moderate,None,0.65
+12,,,,,,Non-neoplastic pathological lung (please specify),,Haemorrhagic lung,High (> 75%),False,None-sparse,None,0.85
+13,Solid,Acinar,More epithelium,High,Infiltrative small nests,,,,High (> 75%),True,Mild-moderate,Some,0.85
+14,,,,,,Elastosis,Collagenosis,Anthracosis,High (> 75%),False,None-sparse,None,0.85
+15,,,,,,Collagenosis,Collagenosis,1.Collagen 2.Fat 3. Other crushed connective tissues,Moderate (50 - 75%),False,None-sparse,None,0.65
+16,Acinar,Lepidic,More stroma,Moderate,Diverse heavily inflamed,Non-neoplastic pathological lung (please specify),,Lymphocytic stroma and occ. Low grade adenocarcinoma,Moderate (50 - 75%),False,Marked,None,0.65
+17,Solid,,More epithelium,Moderate,Solid nests,,,,High (> 75%),True,Mild-moderate,None,0.85
+18,,,,,,Elastosis,Vessels (wall or lumen),Anthracotic pigment,High (> 75%),False,None-sparse,None,0.85
+19,,,,,,Non-neoplastic pathological lung (please specify),Collagenosis,Alveoli with respiratory bronchiolitis,High (> 75%),False,Mild-moderate,None,0.85
+20,,,,,,Normal/near-normal lung,,Alveoli,High (> 75%),False,None-sparse,None,0.85
+21,Solid,Acinar,More stroma,Moderate,Solid nests with retraction and inflammation,,,,High (> 75%),True,Mild-moderate,None,0.85
+22,,,,,,Airways,Vessels (wall or lumen),Small airways and lung vessels with haemorrhage,High (> 75%),False,None-sparse,None,0.85
+23,,,,,,Elastosis,Elastosis,"Few tiles with malignancy, couple out of focus and some with no cells",High (> 75%),False,None-sparse,Some,0.85
+24,,,,,,Other (please specify),Haemorrhage,1. Necrosis 2. Haemorrhage,High (> 75%),False,Marked,Universal,0.85
+25,,,,,,Other (please specify),,Although there are malignant cells the predominant features across the majority of tiles is the inflammatory (lymphocyte) populations,High (> 75%),False,Marked,None,0.85
+26,,,,,,Other (please specify),Collagenosis,"1. Hyaline stroma 2. Haemorrhage Diverse tissues, 'speckled'",High (> 75%),False,None-sparse,None,0.85
+27,Acinar,,More stroma,Low,,Collagenosis,,Disorderly plump fibroblastic stroma,High (> 75%),True,Mild-moderate,None,0.85
+28,Solid,Acinar,More epithelium,High,"Solid, hot",,,,High (> 75%),True,Marked,None,0.85
+29,,,,,,Cartilage,Other (please specify),Cartilage with perichondrium,High (> 75%),False,None-sparse,None,0.85
+30,Solid,,More epithelium,High,Complex nests/cords,,,,High (> 75%),True,None-sparse,None,0.85
+31,Acinar,Solid,Roughly equal,Moderate,,,,,High (> 75%),True,None-sparse,None,0.85
+32,,,,,,Collagenosis,,Inflamed collagen,High (> 75%),False,Marked,None,0.85
+33,Acinar,,Roughly equal,Moderate,Necrotic tumour,,,Comedonecrosis,High (> 75%),True,Mild-moderate,Universal,0.85
+34,Cribriform,Solid,More epithelium,Moderate,,,,,High (> 75%),True,Marked,None,0.85
+35,Lepidic,,Roughly equal,Moderate,Fibrotic stroma,,,,High (> 75%),True,Mild-moderate,None,0.85
+36,,,,,,Normal/near-normal lung,,"Mainly normal, some respiratory bronchiolitis and intersitial inflammation",High (> 75%),False,None-sparse,None,0.85
+37,,,,,,Airways,,Large airways,High (> 75%),False,None-sparse,None,0.85
+38,,,,,,Normal/near-normal lung,,Alveolar macrophages,High (> 75%),False,Marked,None,0.85
+39,,,,,,Normal/near-normal lung,,Mildly haemorrhagic lung,High (> 75%),False,None-sparse,None,0.85
+40,Acinar,,More stroma,Low,Acini in collapsed/elastotic stroma,,,,High (> 75%),True,None-sparse,None,0.85
+41,Papillary,Lepidic,Roughly equal,High,Classic papillae,,,,High (> 75%),True,Mild-moderate,None,0.85
+42,,,,,,Collagenosis,Vessels (wall or lumen),Disorderly cellular collagen,High (> 75%),False,None-sparse,None,0.85
+43,,,,,,Collagenosis,Elastosis,Cellular collgen,High (> 75%),False,None-sparse,None,0.85
+44,Acinar,Lepidic,Roughly equal,High,"Pale cuboidal epithelium, hot",,,,High (> 75%),True,Marked,None,0.85
+45,,,,,,Normal/near-normal lung,,Open tatty lung - ? Emphysematous?,High (> 75%),False,None-sparse,None,0.85
+46,Papillary,Micropapillary,More epithelium,Moderate,Also some lepidic and acinar pattern,,,,High (> 75%),True,None-sparse,None,0.85
+47,Solid,Acinar,More epithelium,Moderate,Also micropapillary,,,,High (> 75%),True,None-sparse,None,0.85
+48,Solid,Acinar,More epithelium,Moderate,Also micropapillary,,,,High (> 75%),True,Marked,Some,0.85
+49,,,,,,Vessels (wall or lumen),Non-neoplastic pathological lung (please specify),Anthracosis on background of fibrosis.  Some airways and blood vessels also present,High (> 75%),False,Mild-moderate,None,0.85
+50,Solid,Micropapillary,Roughly equal,High,Tatty inflamed tumour,,,,High (> 75%),True,Mild-moderate,None,0.85
+51,,,,,,Normal/near-normal lung,,Emphysema (presumptive diagnosis given small number of alveolar walls given previous clusters),High (> 75%),False,None-sparse,None,0.85
+52,Lepidic,,More epithelium,High,Mucinous,,,,High (> 75%),True,Mild-moderate,None,0.85
+53,,,,,,Non-neoplastic pathological lung (please specify),,Compressed lung,High (> 75%),False,None-sparse,None,0.85
+54,Papillary,Lepidic,More epithelium,Moderate,Classic papillae,,,,High (> 75%),True,Mild-moderate,None,0.85
+55,,,,,,Elastosis,Collagenosis,burned out' malignancy,High (> 75%),False,None-sparse,None,0.85
+56,,,,,,Collagenosis,Elastosis,Desmoplasia,High (> 75%),False,Mild-moderate,None,0.85
+57,,,,,,Normal/near-normal lung,,Tatty crushed lung,High (> 75%),False,None-sparse,None,0.85
+58,,,,,,Non-neoplastic pathological lung (please specify),,Inflamed fibrotic lung,High (> 75%),False,Marked,None,0.85
+59,,,,,,Collagenosis,Collagenosis,Nearly all tiles have collagenosis.  There is a mix of benign seromucinous glands and acinar pattern adenocarcinoma across some of the tiles.,High (> 75%),False,Mild-moderate,None,0.85
+60,,,,,,Collagenosis,Other (please specify),Combined inflammation and fibrosis across nearly all slides,High (> 75%),False,Marked,None,0.85
+61,Acinar,Acinar,Roughly equal,High,,,,,High (> 75%),True,Marked,None,0.85
+62,,,,,,Normal/near-normal lung,,,High (> 75%),False,None-sparse,None,0.85
+63,,,,,,Non-neoplastic pathological lung (please specify),,Disrupted lung,High (> 75%),False,Mild-moderate,None,0.85
+64,Acinar,Solid,More stroma,High,,,,,High (> 75%),True,Mild-moderate,None,0.85
+65,,,,,,Non-neoplastic pathological lung (please specify),Normal/near-normal lung,Quite a bit of perivascular/intersitial fibrosis,High (> 75%),False,None-sparse,None,0.85
+66,,,,,,Normal/near-normal lung,,Normal parenchyma,High (> 75%),False,None-sparse,None,0.85
+67,Acinar,Lepidic,More epithelium,Moderate,Mixed pattern inflamed tumours,,,,High (> 75%),True,Marked,None,0.85
+68,Acinar,Papillary,More epithelium,High,very minor micropapillary component,,,,High (> 75%),True,Mild-moderate,None,0.85
+69,Acinar,Cribriform,More stroma,Moderate,,,,,High (> 75%),True,Mild-moderate,None,0.85
+70,,,,,,Non-neoplastic pathological lung (please specify),,Alveoli full of proteinaceous gunk/macrophages,Moderate (50 - 75%),False,Marked,None,0.65

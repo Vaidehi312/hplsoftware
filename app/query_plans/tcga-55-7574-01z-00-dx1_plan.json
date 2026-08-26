@@ -1,0 +1,22 @@
+{
+  "intent": "slide_query",
+  "entities": {
+    "tile": [],
+    "slide": [
+      "tcga-55-7574-01z-00-dx1"
+    ],
+    "hpc": [],
+    "sample": []
+  },
+  "flags": {
+    "malignant": null,
+    "non_malignant": null,
+    "survival": null
+  },
+  "operations": [],
+  "ui_actions": {
+    "open_slide_viewer": true,
+    "show_tile_preview": true
+  },
+  "confidence": 0.9
+}

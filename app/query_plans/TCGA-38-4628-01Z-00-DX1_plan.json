@@ -1,0 +1,25 @@
+{
+  "intent": "slide_query",
+  "entities": {
+    "tile": [],
+    "slide": [
+      "TCGA-38-4628-01Z-00-DX1"
+    ],
+    "hpc": [],
+    "sample": []
+  },
+  "flags": {
+    "malignant": true,
+    "non_malignant": true,
+    "survival": true
+  },
+  "operations": [],
+  "ui_actions": {
+    "open_slide_viewer": true,
+    "show_tile_preview": true,
+    "explore_hpc_slides": false
+  },
+  "confidence": 0.9,
+  "planner": "hybrid",
+  "llm_reasoning": "one short sentence"
+}

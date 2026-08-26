@@ -1,0 +1,27 @@
+{
+  "intent": "sample_query",
+  "entities": {
+    "tile": [],
+    "slide": [
+      "TCGA-44-4628-01Z-00-DX1"
+    ],
+    "hpc": [],
+    "sample": []
+  },
+  "flags": {
+    "malignant": null,
+    "non_malignant": null,
+    "survival": null
+  },
+  "operations": [
+    "slide"
+  ],
+  "ui_actions": {
+    "open_slide_viewer": true,
+    "show_tile_preview": true,
+    "explore_hpc_slides": false
+  },
+  "confidence": 1.0,
+  "planner": "hybrid",
+  "llm_reasoning": "The user is requesting information from the slide viewer tool for a specific TCGA sample."
+}

@@ -602,6 +602,85 @@ def test_a_non_numeric_cluster_id_skips_the_whole_table(tmp_path):
     assert got == {("SLIDE-A", 1)}, "the pre-existing rows must be left alone"
 
 
+# --- dataset_id on the aggregates ----------------------------------------
+#
+# Found by running the load against a real PostgreSQL for the first time on
+# 2026-08-26. dataset_id is NOT NULL on both aggregate tables in the live
+# database and compute_profiles() cannot know it — the assignment CSV carries no
+# cohort — so the INSERT raised NotNullViolation, and because load() is one
+# transaction the rollback took the tile_registry update with it.
+#
+# It had never surfaced for two reasons worth keeping: no cohort had ever got
+# past the 95% match gate to reach that line, and every fixture above declares
+# dataset_id nullable, which is exactly the way a test fixture can be more
+# forgiving than production and hide a certainty.
+
+
+def _add_profile_tables_with_dataset_id(engine):
+    """The aggregate tables as the live database actually has them: dataset_id
+    present and NOT NULL."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, cancer_type TEXT,
+                total_tiles INTEGER, dominant_hpc TEXT,
+                dataset_id TEXT NOT NULL)"""))
+        conn.execute(text("""
+            CREATE TABLE hpl_profile_proportion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                samples TEXT, slides TEXT, hpc_id TEXT, proportion REAL,
+                dataset_id TEXT NOT NULL)"""))
+
+
+def test_aggregates_take_their_dataset_id_from_the_registry(tmp_path):
+    engine = _make_kb(tmp_path, ["SLIDE-A_1_1.JPEG"])
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN dataset_id TEXT"))
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN slides TEXT"))
+        conn.execute(text("UPDATE tile_registry SET slides='SLIDE-A', "
+                          "dataset_id='RADIOGENOMICS'"))
+    _add_profile_tables_with_dataset_id(engine)
+
+    summary = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A",
+                             "cancer_type": "LUAD", "total_tiles": 1,
+                             "dominant_hpc": "3"}])
+    proportions = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A",
+                                 "hpc_id": "3", "proportion": 1.0}])
+    with engine.begin() as conn:
+        loader.replace_profiles(conn, proportions, summary)
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT dataset_id FROM hpl_profile_summary")).scalar() == "RADIOGENOMICS"
+        assert conn.execute(text(
+            "SELECT dataset_id FROM hpl_profile_proportion")).scalar() == "RADIOGENOMICS"
+
+
+def test_an_unregistered_slide_is_refused_by_name(tmp_path):
+    """The companion. Without a dataset_id the aggregates cannot be scoped, and
+    the message has to name the missing step rather than let Postgres raise a
+    not-null violation from inside a rollback."""
+    engine = _make_kb(tmp_path, ["SLIDE-A_1_1.JPEG"])
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN dataset_id TEXT"))
+        conn.execute(text("ALTER TABLE tile_registry ADD COLUMN slides TEXT"))
+        conn.execute(text("UPDATE tile_registry SET slides='SLIDE-A'"))  # no dataset_id
+    _add_profile_tables_with_dataset_id(engine)
+
+    summary = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A",
+                             "cancer_type": None, "total_tiles": 1,
+                             "dominant_hpc": "3"}])
+    proportions = pd.DataFrame([{"samples": "S1", "slides": "SLIDE-A",
+                                 "hpc_id": "3", "proportion": 1.0}])
+    try:
+        with engine.begin() as conn:
+            loader.replace_profiles(conn, proportions, summary)
+    except SystemExit as e:
+        assert "register_dataset.py" in str(e), str(e)
+    else:
+        raise AssertionError("a slide with no dataset_id must be refused by name")
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

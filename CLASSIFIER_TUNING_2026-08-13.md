@@ -1053,13 +1053,27 @@ existing slide. Recorded as the next change, not made as part of this one.
 
 ### §25.6 State
 
-Tests **338 → 391**. Four suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
+Tests **338 → 393**. Four suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
 (16, new), `test_register_dataset.py` (10 → 26), `test_kb_load.py` (18 → 25). Each new check has a companion that proves it can
 come out bad, per this project's own rule.
 
-**Not run against a real PostgreSQL** — there is none on the machine this was written on, so the
-DDL is transcribed and reviewed, not executed, and the endpoints are exercised against SQLite. The
-first real cohort should be previewed before it is committed.
+**Run against a real PostgreSQL 16.2** (`pgserver`, a pip-installable Postgres, in a scratchpad —
+no system install). `migrate_all.sql` on an empty database, then registration and the load through
+the real modules. It found two bugs in an hour that 391 SQLite tests had not:
+
+* `migrate_all.sql` still could not build a fresh schema. `tile_registry`, `hpl_profile_summary` and
+  `hpl_profile_proportion` have a `CREATE TABLE` only in `schema.sql`, which the chain never runs,
+  and `CREATE INDEX IF NOT EXISTS` still raises when the *table* is absent. Now 13 of 17 tables from
+  empty, stopping only at the four reference tables whose `\d` was never captured.
+* **`compute_profiles()` never set `dataset_id`.** It is `NOT NULL` on both aggregate tables, so the
+  insert raised `NotNullViolation`, and because `load()` is one transaction the rollback took the
+  `tile_registry` update with it. Latent since the column was added: no cohort had ever passed the
+  95% match gate to reach that line, and **every SQLite fixture declares `dataset_id` nullable** —
+  a fixture more forgiving than production, hiding a certainty rather than a risk. The cohort is now
+  resolved from `tile_registry`, and the regression test uses a `NOT NULL` fixture.
+
+That second one is the sharpest argument in this whole session for the project's own rule: a test
+that cannot fail the way production fails is not covering production. Tests **338 → 393**.
 
 **Deployment.** The API server runs on the HPC login node — it shells out to `sbatch` and opens
 `.svs` files from scratch — so `backend/` has to be copied there and the server restarted; running

@@ -264,6 +264,88 @@ END$$;
 
 
 -- ------------------------------------------------------------
+-- 7b. The three tables only schema.sql ever created.
+--
+-- Found by executing this file against an empty database, which nothing had
+-- done before: migrate_all.sql got as far as the dataset_id section and then
+-- failed on `relation "tile_registry" does not exist`. tile_registry and the
+-- two hpl_profile_* tables have a CREATE TABLE only in schema.sql, and
+-- migrate_all.sql does not run schema.sql — so "builds the whole schema" was
+-- still false after this file was added, just further along.
+--
+-- Transcribed from the same live capture as everything else, which is what
+-- makes this safe to prefer over schema.sql's versions: those declare
+-- tile_registry with an id primary key and hpc_id as varchar(100).
+--
+-- The confidence columns (hpc_vote_margin, hpc_neighbor_distance,
+-- hpc_assigned_at, hpc_reference) are deliberately NOT here —
+-- migrate_tile_registry_confidence.sql owns them and runs after this, so
+-- repeating them would create two places they are described.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tile_registry (
+    samples        character varying,
+    slides         character varying NOT NULL,
+    tiles          character varying NOT NULL,
+    slide_tile     character varying NOT NULL,
+    hpc_id         integer,
+    image_index    integer,
+    h5_source_path character varying,
+    dataset_id     text NOT NULL,
+    CONSTRAINT tile_registry_pkey PRIMARY KEY (slide_tile)
+);
+
+-- Parent before child: hpl_profile_proportion carries a foreign key into this.
+CREATE TABLE IF NOT EXISTS hpl_profile_summary (
+    id           serial,
+    samples      character varying(160) NOT NULL,
+    slides       character varying(150),
+    cancer_type  text,
+    total_tiles  integer,
+    dominant_hpc integer,
+    dataset_id   text NOT NULL,
+    CONSTRAINT hpl_profile_summary_pkey PRIMARY KEY (id),
+    CONSTRAINT hpl_profile_summary_unique_sample_slide UNIQUE (samples, slides)
+);
+
+CREATE TABLE IF NOT EXISTS hpl_profile_proportion (
+    id         serial,
+    samples    character varying(130),
+    hpc_id     integer,
+    proportion double precision,
+    slides     character varying(170),
+    dataset_id text NOT NULL,
+    CONSTRAINT hpl_profile_proportion_pkey PRIMARY KEY (id),
+    CONSTRAINT hpl_profile_proportion_sample_slide_fkey
+        FOREIGN KEY (samples, slides)
+        REFERENCES hpl_profile_summary (samples, slides) ON DELETE CASCADE
+);
+
+-- The hpc_id foreign keys need hpc_dictionary, which is still one of the four
+-- reference tables with no trustworthy DDL in git (see this file's header).
+-- Added only if it is already there, so a database that has it keeps the
+-- constraint and a fresh one is merely missing it rather than failing.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema() AND table_name = 'hpc_dictionary') THEN
+        BEGIN
+            ALTER TABLE tile_registry
+                ADD CONSTRAINT fk_tile_registry_hpc
+                FOREIGN KEY (hpc_id) REFERENCES hpc_dictionary(hpc_id);
+        EXCEPTION WHEN duplicate_object OR datatype_mismatch THEN NULL;
+        END;
+        BEGIN
+            ALTER TABLE hpl_profile_proportion
+                ADD CONSTRAINT hpl_profile_proportion_hpc_id_fkey
+                FOREIGN KEY (hpc_id) REFERENCES hpc_dictionary(hpc_id);
+        EXCEPTION WHEN duplicate_object OR datatype_mismatch THEN NULL;
+        END;
+    ELSE
+        RAISE NOTICE 'hpc_dictionary absent; hpc_id foreign keys not added.';
+    END IF;
+END$$;
+
+-- ------------------------------------------------------------
 -- 8. dataset_id, the column that scopes every cohort — and that no migration
 --    in this repository has ever created.
 --
@@ -311,15 +393,20 @@ BEGIN
     END LOOP;
 END$$;
 
-CREATE INDEX IF NOT EXISTS idx_tile_registry_dataset
-    ON tile_registry(dataset_id);
-CREATE INDEX IF NOT EXISTS idx_wsi_registry_dataset
-    ON wsi_registry(dataset_id);
-CREATE INDEX IF NOT EXISTS idx_wsi_metadata_dataset
-    ON wsi_metadata(dataset_id);
-CREATE INDEX IF NOT EXISTS idx_hpl_profile_proportion_dataset
-    ON hpl_profile_proportion(dataset_id);
-CREATE INDEX IF NOT EXISTS idx_hpl_profile_summary_dataset
-    ON hpl_profile_summary(dataset_id);
+-- Guarded by table, not just by index name: CREATE INDEX IF NOT EXISTS still
+-- raises when the TABLE is missing, which is exactly how the first real run of
+-- this file failed.
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['tile_registry', 'wsi_registry', 'wsi_metadata',
+                             'hpl_profile_proportion', 'hpl_profile_summary'] LOOP
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = current_schema() AND table_name = t) THEN
+            EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (dataset_id)',
+                           'idx_' || t || '_dataset', t);
+        END IF;
+    END LOOP;
+END$$;
 
 \echo '== base tables done =='

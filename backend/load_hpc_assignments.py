@@ -344,6 +344,44 @@ def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> 
     slides = sorted({s.strip().upper() for s in summary["slides"].astype(str)})
     bind = {"slides": slides}
 
+    # dataset_id is NOT NULL on both aggregate tables in the live database, and
+    # compute_profiles() cannot know it — the assignment CSV does not carry a
+    # cohort. Resolved here from tile_registry, which registration filled, so
+    # the aggregates are scoped to exactly the cohort their tiles belong to
+    # rather than to whatever the caller believed.
+    #
+    # This was a latent break, not a new requirement: before it, the INSERT
+    # below raised NotNullViolation on any real Postgres, and because load() is
+    # one transaction the rollback took the tile_registry update with it. It had
+    # never surfaced because no cohort had ever got past the 95% match gate to
+    # reach this line, and the SQLite test fixtures declare dataset_id nullable.
+    dataset_by_slide = {}
+    if "dataset_id" in _existing_columns(conn, "hpl_profile_summary"):
+        rows = conn.execute(
+            text("SELECT UPPER(TRIM(slides)) AS s, dataset_id FROM tile_registry "
+                 "WHERE UPPER(TRIM(slides)) IN :slides AND dataset_id IS NOT NULL "
+                 "GROUP BY 1, 2").bindparams(bindparam("slides", expanding=True)),
+            bind,
+        ).fetchall()
+        for slide, dataset_id in rows:
+            # A slide already claimed by two cohorts is refused at registration,
+            # so this keeps the first and does not invent a resolution.
+            dataset_by_slide.setdefault(slide, dataset_id)
+
+        missing = [s for s in slides if s not in dataset_by_slide]
+        if missing:
+            raise SystemExit(
+                f"{len(missing)} slide(s) have no dataset_id in tile_registry "
+                f"(e.g. {missing[:3]}). The aggregates cannot be scoped to a "
+                f"cohort without one. Register the dataset first — "
+                f"register_dataset.py, or the 'Register in the Knowledge Bank' "
+                f"step in the UI."
+            )
+
+        for frame in (summary, proportions):
+            frame["dataset_id"] = (frame["slides"].astype(str).str.strip().str.upper()
+                                   .map(dataset_by_slide))
+
     def _delete(table: str) -> None:
         conn.execute(
             text(f"DELETE FROM {table} WHERE UPPER(TRIM(slides)) IN :slides").bindparams(

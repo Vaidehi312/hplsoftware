@@ -47,11 +47,27 @@ UPDATE hpl_profile_summary SET samples = UPPER(TRIM(samples)) WHERE samples IS N
 CREATE INDEX IF NOT EXISTS idx_hps_slides  ON hpl_profile_summary(slides);
 CREATE INDEX IF NOT EXISTS idx_hps_samples ON hpl_profile_summary(samples);
 
--- 6. hpc_dictionary — already has UNIQUE on hpc_id, but add for safety
-CREATE INDEX IF NOT EXISTS idx_hd_hpc_id ON hpc_dictionary(hpc_id);
-
--- 7. hpc_survival_analysis — queried by hpc_id
-CREATE INDEX IF NOT EXISTS idx_hsa_hpc_id ON hpc_survival_analysis(hpc_id);
+-- 6/7. hpc_dictionary and hpc_survival_analysis.
+-- Guarded by table rather than stated flat, because these are two of the four
+-- reference tables with no CREATE TABLE anywhere in git (see
+-- migrate_kb_base_tables.sql's header). CREATE INDEX IF NOT EXISTS still raises
+-- when the TABLE is missing, so on an empty database these two lines were the
+-- last thing stopping migrate_all.sql from running to completion — found by
+-- executing it, which nothing had done before 2026-08-26.
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['hpc_dictionary', 'hpc_survival_analysis'] LOOP
+        IF EXISTS (SELECT 1 FROM information_schema.tables
+                   WHERE table_schema = current_schema() AND table_name = t) THEN
+            EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (hpc_id)',
+                           'idx_' || CASE t WHEN 'hpc_dictionary' THEN 'hd' ELSE 'hsa' END
+                           || '_hpc_id', t);
+        ELSE
+            RAISE NOTICE '% absent; its index was not created.', t;
+        END IF;
+    END LOOP;
+END$$;
 
 -- Done. Run `ANALYZE;` after to refresh planner statistics.
 ANALYZE;

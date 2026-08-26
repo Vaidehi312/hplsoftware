@@ -33,6 +33,16 @@
 
 \set ON_ERROR_STOP on
 
+-- First, because everything below indexes, alters or normalises these. Eight of
+-- the live database's seventeen tables had no CREATE TABLE anywhere in this
+-- repository, so this file's claim above — that it builds the whole schema —
+-- was false: a fresh database stopped at migrate_indexes.sql's
+-- `UPDATE tile_coordinates`, blaming an index migration for a missing table.
+-- Still missing after this: the four hpc_* cluster reference tables and the
+-- slide_metadata view. See the header of migrate_kb_base_tables.sql.
+\echo '== base tables that nothing else creates =='
+\ir migrate_kb_base_tables.sql
+
 \echo '== slurm_dataset_runs: the table, then its identity change =='
 \ir migrate_dataset_runs.sql
 -- async replaces the primary key (job_id -> submission_id), so nothing that

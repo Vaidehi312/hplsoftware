@@ -1,0 +1,273 @@
+Live schema of the Knowledge Bank, captured 2026-08-26.
+
+    psql -h /nfs/home/users/vpandya/databases/postgres_hpl_kb/socket -d hpl_kb
+    hpl_kb=# \dt+
+    hpl_kb=# \d <each table>
+
+Server: PostgreSQL 18.0. 17 tables, 1 view, 45 indexes.
+
+Why this file exists. Until this capture, no complete record of this database
+existed anywhere outside the server. schema.sql is a pg_dump from 2025-10-23
+covering 7 tables, at least one of them wrongly (see its header). The migrations
+in backend/ create 2 more and otherwise only ADD COLUMN to tables they assume
+exist. Eight tables and the dataset_id column that scopes every cohort appeared
+in no SQL in this repository at all.
+
+backend/migrate_kb_base_tables.sql was transcribed from what is below, and
+backend/tests/test_schema_coverage.py checks the transcription has not drifted.
+
+Not captured here, and therefore still not reproducible from git:
+`\d hpc_dictionary`, `\d hpc_malignant_details`, `\d hpc_non_malignant_details`,
+`\d hpc_survival_analysis`, and `\d+ slide_metadata` (the view's definition).
+Re-run those and append them below.
+
+================================================================================
+\dt+
+================================================================================
+ Schema |           Name            | Type  |  Owner  | Persistence | Access method |    Size
+--------+---------------------------+-------+---------+-------------+---------------+------------
+ public | dataset_config            | table | vpandya | permanent   | heap          | 16 kB
+ public | h_latent_vectors          | table | vpandya | permanent   | heap          | 4430 MB
+ public | hpc_dictionary            | table | vpandya | permanent   | heap          | 48 kB
+ public | hpc_malignant_details     | table | vpandya | permanent   | heap          | 16 kB
+ public | hpc_non_malignant_details | table | vpandya | permanent   | heap          | 16 kB
+ public | hpc_survival_analysis     | table | vpandya | permanent   | heap          | 8192 bytes
+ public | hpl_profile_proportion    | table | vpandya | permanent   | heap          | 3896 kB
+ public | hpl_profile_summary       | table | vpandya | permanent   | heap          | 192 kB
+ public | slide_hpc_membership      | table | vpandya | permanent   | heap          | 1192 kB
+ public | slurm_dataset_run_jobs    | table | vpandya | permanent   | heap          | 48 kB
+ public | slurm_dataset_runs        | table | vpandya | permanent   | heap          | 72 kB
+ public | tile_coordinates          | table | vpandya | permanent   | heap          | 152 MB
+ public | tile_hpc_heatmap          | table | vpandya | permanent   | heap          | 149 MB
+ public | tile_hpc_heatmap_old      | table | vpandya | permanent   | heap          | 141 MB
+ public | tile_registry             | table | vpandya | permanent   | heap          | 211 MB
+ public | wsi_metadata              | table | vpandya | permanent   | heap          | 1240 kB
+ public | wsi_registry              | table | vpandya | permanent   | heap          | 1112 kB
+(17 rows)
+
+\dv+
+ public | slide_metadata | view | vpandya | permanent | 0 bytes
+(1 row)
+
+================================================================================
+\d dataset_config
+================================================================================
+     Column      |       Type       | Nullable
+-----------------+------------------+----------
+ dataset_id      | text             | not null
+ target_mpp      | double precision | not null
+ tile_size_5x_px | integer          | not null
+Indexes:
+    "dataset_config_pkey" PRIMARY KEY, btree (dataset_id)
+
+================================================================================
+\d h_latent_vectors
+================================================================================
+  Column   |          Type          | Nullable |                   Default
+-----------+------------------------+----------+----------------------------------------------
+ id        | integer                | not null | nextval('h_latent_vectors_id_seq'::regclass)
+ sample_id | character varying(80)  |          |
+ slide_id  | character varying(120) |          |
+ tile_name | character varying(120) |          |
+ hpc_id    | integer                |          |
+ embedding | vector(1024)           |          |
+Indexes:
+    "h_latent_vectors_pkey" PRIMARY KEY, btree (id)
+Foreign-key constraints:
+    "h_latent_vectors_hpc_id_fkey" FOREIGN KEY (hpc_id) REFERENCES hpc_dictionary(hpc_id)
+
+Note: embedding is vector(1024) although the HPL encoder emits 128-D latents.
+The width is recorded as found, not reconciled.
+
+================================================================================
+\d hpl_profile_proportion
+================================================================================
+   Column   |          Type          | Nullable |                      Default
+------------+------------------------+----------+----------------------------------------------------
+ id         | integer                | not null | nextval('hpl_profile_proportion_id_seq'::regclass)
+ samples    | character varying(130) |          |
+ hpc_id     | integer                |          |
+ proportion | double precision       |          |
+ slides     | character varying(170) |          |
+ dataset_id | text                   | not null |
+Indexes:
+    "hpl_profile_proportion_pkey" PRIMARY KEY, btree (id)
+    "idx_hpl_profile_proportion_dataset" btree (dataset_id)
+    "idx_hpp_hpc_id" btree (hpc_id)
+    "idx_hpp_slides" btree (slides)
+Foreign-key constraints:
+    "hpl_profile_proportion_hpc_id_fkey" FOREIGN KEY (hpc_id) REFERENCES hpc_dictionary(hpc_id)
+    "hpl_profile_proportion_sample_slide_fkey" FOREIGN KEY (samples, slides)
+        REFERENCES hpl_profile_summary(samples, slides) ON DELETE CASCADE
+
+================================================================================
+\d hpl_profile_summary
+================================================================================
+    Column    |          Type          | Nullable |                     Default
+--------------+------------------------+----------+-------------------------------------------------
+ id           | integer                | not null | nextval('hpl_profile_summary_id_seq'::regclass)
+ samples      | character varying(160) | not null |
+ slides       | character varying(150) |          |
+ cancer_type  | text                   |          |
+ total_tiles  | integer                |          |
+ dominant_hpc | integer                |          |
+ dataset_id   | text                   | not null |
+Indexes:
+    "hpl_profile_summary_pkey" PRIMARY KEY, btree (id)
+    "hpl_profile_summary_unique_sample_slide" UNIQUE CONSTRAINT, btree (samples, slides)
+    "idx_hpl_profile_summary_dataset" btree (dataset_id)
+    "idx_hps_samples" btree (samples)
+    "idx_hps_slides" btree (slides)
+Referenced by:
+    TABLE "hpl_profile_proportion" CONSTRAINT "hpl_profile_proportion_sample_slide_fkey"
+        FOREIGN KEY (samples, slides) REFERENCES hpl_profile_summary(samples, slides) ON DELETE CASCADE
+
+Note two mismatches visible here, both recorded as found:
+  * the UNIQUE constraint is on (samples, slides) and does NOT include
+    dataset_id, so two cohorts holding the same slide id cannot both have a
+    summary row;
+  * hpl_profile_summary.slides is varchar(150) while the proportion table's
+    slides — the referencing side of the foreign key — is varchar(170).
+
+================================================================================
+\d slide_hpc_membership
+================================================================================
+  Column  |  Type   | Nullable
+----------+---------+----------
+ slide_id | text    | not null
+ hpc_id   | integer | not null
+Indexes:
+    "slide_hpc_membership_pkey" PRIMARY KEY, btree (slide_id, hpc_id)
+    "idx_shm_hpc" btree (hpc_id)
+    "idx_shm_slide" btree (slide_id)
+
+Note: no dataset_id, and no foreign key to hpc_dictionary.
+
+================================================================================
+\d tile_coordinates
+================================================================================
+   Column   |  Type   | Nullable
+------------+---------+----------
+ slides     | text    |
+ tiles      | text    |
+ slide_tile | text    | not null
+ col        | integer |
+ row        | integer |
+ x_5x       | integer |
+ y_5x       | integer |
+ x_native   | integer |
+ y_native   | integer |
+ h5_index   | integer |
+ dataset_id | text    |
+Indexes:
+    "tile_coordinates_pkey" PRIMARY KEY, btree (slide_tile)
+    "idx_tc_slide_tile" btree (slide_tile)
+    "idx_tc_slides" btree (slides)
+    "idx_tc_x_y_native" btree (x_native, y_native)
+
+================================================================================
+\d tile_hpc_heatmap
+================================================================================
+    Column     |  Type   | Nullable
+---------------+---------+----------
+ slides        | text    |
+ slide_tile    | text    | not null
+ x_native      | integer |
+ y_native      | integer |
+ slide_id      | text    |
+ hpc_top1      | text    |
+ hpc_top1_prob | real    |
+ p_hpc_0       | real    |
+ ...           | real    |          (p_hpc_0 through p_hpc_70 — 71 columns)
+ p_hpc_70      | real    |
+Indexes:
+    "hpc_heatmap_pkey" PRIMARY KEY, btree (slide_tile)
+
+================================================================================
+\d tile_hpc_heatmap_old
+================================================================================
+Same columns as tile_hpc_heatmap.
+Indexes:
+    "tile_hpc_heatmap_pkey" PRIMARY KEY, btree (slide_tile)
+
+The two primary-key constraint names are transposed relative to their tables:
+tile_hpc_heatmap's is hpc_heatmap_pkey, tile_hpc_heatmap_old's is
+tile_hpc_heatmap_pkey. That is what renaming the live table under a running
+system leaves behind. Recorded as found.
+
+================================================================================
+\d tile_registry
+================================================================================
+        Column         |           Type           | Nullable
+-----------------------+--------------------------+----------
+ samples               | character varying        |
+ slides                | character varying        | not null
+ tiles                 | character varying        | not null
+ slide_tile            | character varying        | not null
+ hpc_id                | integer                  |
+ image_index           | integer                  |
+ h5_source_path        | character varying        |
+ dataset_id            | text                     | not null
+ hpc_vote_margin       | real                     |
+ hpc_neighbor_distance | real                     |
+ hpc_assigned_at       | timestamp with time zone |
+ hpc_reference         | text                     |
+Indexes:
+    "tile_registry_pkey" PRIMARY KEY, btree (slide_tile)
+    "idx_tile_registry_dataset" btree (dataset_id)
+    "idx_tr_hpc_id" btree (hpc_id)
+    "idx_tr_slide_tile" btree (slide_tile)
+    "idx_tr_slides" btree (slides)
+    "tile_registry_low_confidence_idx" btree (hpc_vote_margin)
+        WHERE hpc_vote_margin IS NOT NULL AND hpc_vote_margin < 0.1::double precision
+Foreign-key constraints:
+    "fk_tile_registry_hpc" FOREIGN KEY (hpc_id) REFERENCES hpc_dictionary(hpc_id)
+
+There is no id column. schema.sql declares one, plus hpc_id as varchar(100).
+Both are wrong against this.
+
+================================================================================
+\d wsi_metadata
+================================================================================
+         Column         |            Type             | Nullable
+------------------------+-----------------------------+----------
+ slide_id               | text                        | not null
+ sample_id              | text                        |
+ level_count            | integer                     |
+ level_dimensions_json  | jsonb                       |
+ level_downsamples_json | jsonb                       |
+ mpp_x                  | real                        |
+ mpp_y                  | real                        |
+ objective_power        | real                        |
+ vendor                 | text                        |
+ scanner_model          | text                        |
+ scanner_date           | timestamp without time zone |
+ tile_width             | integer                     |
+ tile_height            | integer                     |
+ quickhash              | text                        |
+ dataset_id             | text                        | not null
+Indexes:
+    "wsi_metadata_pkey" PRIMARY KEY, btree (slide_id)
+    "idx_wsi_metadata_dataset" btree (dataset_id)
+
+================================================================================
+\d wsi_registry
+================================================================================
+        Column         |            Type             | Nullable
+-----------------------+-----------------------------+----------
+ slide_id              | text                        | not null
+ sample_id             | text                        |
+ file_uuid             | text                        |
+ filename              | text                        |
+ hpc_path              | text                        | not null
+ file_size_bytes       | bigint                      |
+ mtime_utc             | timestamp without time zone |
+ added_at              | timestamp without time zone |
+ dataset_id            | text                        | not null
+ processing_status     | character varying(20)       |
+ processing_error      | text                        |
+ processing_updated_at | timestamp with time zone    |
+Indexes:
+    "wsi_registry_pkey" PRIMARY KEY, btree (slide_id)
+    "idx_wsi_registry_dataset" btree (dataset_id)
+    "idx_wsi_slide_id" UNIQUE, btree (slide_id)

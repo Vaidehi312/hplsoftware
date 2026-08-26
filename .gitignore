@@ -42,3 +42,43 @@ loaded_data/
 # --save-profile, and is pinned to one reference plus one vote configuration —
 # so it belongs beside the reference, not in git.
 *_profile_*.json
+
+# --- Data, 2026-08-26 --------------------------------------------------------
+# ~600 MB of CSV exports, dumps and derived artifacts sit untracked in this
+# working tree. They are one `git add -A` from permanent history, and several
+# carry patient-adjacent content. Named here so that stays impossible rather
+# than merely unlikely.
+
+# Node's dependency tree — 64 MB, thousands of files, rebuilt by `npm install`.
+node_modules/
+frontend/dist/
+
+# Database dumps. hpl_kb_dump.pgsql is a real dump of the Knowledge Bank.
+*.pgsql
+*.dump
+
+# The CSV exports the KB was originally hand-loaded from (353 MB), plus the
+# per-tile embedding exports. Derived from the pipeline; regenerable; far past
+# what belongs in git.
+csv_files/
+tile_reg.csv
+tile_reg_dup.csv
+tile_coords_with_h5_index.csv
+wsi_metadata.csv
+wsi_registry.csv
+TCGA_LUAD_5x_he_train_filtered_leiden_2p5__fold2.csv
+TCGA_55_7574_final_tile_coordinates*.csv
+
+# GDC clinical download — patient-level clinical data. Never in git.
+clinical.project-*/
+
+# Trained model weights and the heatmap working directory. The .keras
+# checkpoint behind tile_hpc_heatmap lives here; it is a binary artifact with
+# no provenance recorded anywhere, which is its own problem, but not one git
+# should absorb.
+Heatmap/
+*.keras
+heatmap_table
+
+# Word/Office lock files Finder leaves behind.
+~$*

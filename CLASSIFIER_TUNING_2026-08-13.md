@@ -85,6 +85,14 @@ A tile under 0.10 margin is close to a coin flip; over 0.75 it was never wrong i
 sample. 0.25 is the natural cut if one is wanted.
 
 ### 8. Knowledge Bank onboarding gap — **documented, not fixed**
+
+> **Superseded 2026-08-26 — see [§25](#25-the-knowledge-bank-onboarding-gap-closed).** Two of the
+> three claims below stopped being true on 2026-08-19, when `backend/register_dataset.py` was
+> committed (`4793278`); this section was never updated and so kept describing an open gap that was
+> half closed. The blocking item in Outstanding — *"Real column-level schema ... blocks writing any
+> real `INSERT`"* — was cleared on 2026-08-26 when `\d` was finally captured. `h_latent_vectors`
+> is still unwritten, and now known to have no live reader either.
+
 Attempting to load a "Radiogenomics" test-mode assignment into the KB refused at **0% match rate**. Root cause, confirmed by reading the actual code paths (not guessed): **nothing in this repository ever `INSERT`s into `tile_coordinates`, `tile_registry`, or the embeddings table (`h_latent_vectors`, confirmed against the real `\dt` output — 26 relations, matching `CLAUDE.md`'s count exactly).** Every row in those tables today came from hand-run notebooks (`Filling_out_kb.ipynb`, `KB_int.ipynb`) — export to CSV, manually deduplicate (100 duplicate `slide_tile` keys found by hand in a 360,667-row file), `psql` import. Stage 5's `load()` only ever `UPDATE`s `tile_registry.hpc_id`; it was never meant to create the row.
 
 What *is* automated and fully sufficient today: `hpl_profile_proportion`/`hpl_profile_summary` (Stage 5 always inserts/refreshes these — no identity data needed, they're derived entirely from the assignment CSV).
@@ -861,3 +869,195 @@ novelty.
 tiles below margin 0.1 against 3.7% for the reference — but under the legacy
 unweighted vote, so not like-for-like. Re-run under the tuned preset before
 reading anything into it.
+
+---
+
+# 2026-08-26 — the Knowledge Bank onboarding gap, closed
+
+## §25 The Knowledge Bank onboarding gap, closed
+
+The trigger was one command: `\d` against the live `hpl_kb`, run on the login node and pasted in.
+That was the item [§8](#8-knowledge-bank-onboarding-gap--documented-not-fixed)'s Outstanding table
+had been blocked on since 2026-08-13 — *"only table names confirmed (`\dt`), not column definitions
+(`\d`) — blocks writing any real `INSERT`"*. With the real columns in hand the question stopped
+being "what shape are these tables" and became "which of them does a run actually fill".
+
+Every one of the 17 tables and the one view was audited against the live code, and each gap claim
+was then attacked from three directions — find a writer the audit missed, break the reachability
+claim, show the gap does not matter. The full table-by-table record is in
+`KB_TABLE_COVERAGE_2026-08-26.md`; this section is what was done and why.
+
+### §25.1 This log was wrong, and that mattered
+
+§8 said *"nothing in this repository ever `INSERT`s into `tile_coordinates`, `tile_registry`, or
+the embeddings table"*. Six days later `backend/register_dataset.py` was committed (`4793278`,
+2026-08-19) doing exactly that for the first two, and **nothing in this document records it** — no
+section, no mention in §17 or §24's Outstanding tables. So the gap read as open when it was half
+closed, and the half that was closed was closed in a way nobody could reach from the UI.
+
+That is the second time this project has been bitten by a document rather than by code (§14: five
+tools defaulted to a reference this log had described as TCGA when it was LATTICeA). §8 now carries
+a superseded marker pointing here.
+
+The costlier wrong line was in `CLAUDE.md`:
+
+```
+1 Tiling   submit_mask_tile_slurm.py   → tiles on disk + tile_coordinates
+```
+
+Stage 1 writes a per-slide `_tile_metadata.csv` to disk. It has no database connection at all.
+Nothing puts those rows into Postgres until registration. **This one line is the best explanation
+for why the gap survived as long as it did** — everyone believed the coordinates table filled
+itself, so nobody asked what filled it. Corrected, with the correction named rather than quietly
+applied.
+
+### §25.2 The gap that would actually have bitten first was not the one being tracked
+
+§8 was about `tile_coordinates` and `tile_registry`. The audit found a worse one:
+
+**No bulk dataset run has ever registered a slide.** The only `INSERT INTO wsi_registry` in the
+codebase was `_register_uploaded_slide()` (`tile_server_v2_.py:323`), reachable only from
+`POST /upload-slide` — the interactive drag-and-drop path, which hard-codes
+`dataset_id='UPLOADED'`. Stages 1–5 never touch it.
+
+This is the codebase's signature failure mode one layer up, and worth stating in full because it is
+the exact shape the rest of this pipeline is defended against. Suppose registration had been built
+as originally planned — tile tables only. Every stage succeeds. `tile_registry` and
+`tile_coordinates` fill correctly. Stage 6 loads. `hpl_profile_*` refresh. Every row count agrees
+with its source. And every slide in the new cohort 404s in the viewer, because `_open_slide()`
+resolves paths from `_wsi_map`, which `_load_wsi_map()` builds from `wsi_registry` alone. Nothing
+in the pipeline is in a position to notice.
+
+So slide registration went into `register_dataset.py` and into **the same transaction** as the tile
+tables, rather than into a second script. A separate command is a command someone forgets, and the
+state forgetting it leaves behind is precisely the invisible-cohort state above. The script's own
+docstring already made this argument about `tile_registry` versus `tile_coordinates`; it extends
+without modification.
+
+### §25.3 What was built
+
+**Registration now covers five tables, and runs from the UI.**
+
+`register_dataset.py` gained `--raw-dir` (`wsi_registry`), `--slide-metadata` (`wsi_metadata`, via
+OpenSlide) and `--target-mpp`/`--tile-size-5x` (`dataset_config`). All five tables are written in
+one transaction, scoped by `dataset_id`, dry-run by default.
+
+It is reachable now: `POST /dataset-jobs/{id}/register-preview` and `/register` derive every path
+from the run record — `h5_output_path`, `tile_dir`, `dataset_name`, `raw_dir`, `tiling_params` —
+rather than asking the UI to retype paths the server already knows and could be typed wrong. Both
+endpoints call `register_dataset.py`'s own functions rather than reimplementing them, for the
+reason `/kb-load` already gives: the one script that mutates the shared KB should have exactly one
+implementation of what makes a write safe, not a strict one for the terminal and a looser one for
+the UI.
+
+The UI is **step 5, "Register in the Knowledge Bank"**, preview-then-commit; the KB load is now
+step 6 and is gated on it. Gating registration on Stage 2 rather than Stage 4 was deliberate: it
+reads tile identity out of the packaged `.h5` and needs no cluster labels, so it can finish while
+the GPU work is still queued. Making it wait for Stage 4 would have kept step 6 blocked behind
+something that could have been done hours earlier.
+
+**Guards added, each of which refuses rather than guesses:**
+
+- A slide id matching **more than one file** under `--raw-dir` is refused, not resolved. Being
+  wrong about which physical slide a cohort's tiles came from is not a tie to break silently.
+- `slide_id` is upper-cased on write, because `_load_wsi_map()` and `_open_slide()` both upper-case
+  before looking up and `migrate_indexes.sql` normalises the column in place. A row written in the
+  `.h5`'s own casing exists and is never found.
+- A `slide_id` already belonging to a **different `dataset_id`** is refused outright. Sharper than
+  the existing tile-level collision check: `slide_id` is `wsi_registry`'s whole primary key, so
+  overwriting one repoints the viewer at another cohort's file while every tile row still says
+  otherwise.
+- A slide carrying **two `sample_id`s** in the `.h5` is reported — half its tiles would otherwise be
+  attributed to the wrong patient.
+- Committing against a database that lacks the base tables refuses **by name**, with the migration
+  to run, rather than raising an `OperationalError` about a table nobody knew was missing.
+- `dataset_config` is written only when both its numbers are given. Its columns are `NOT NULL`, and
+  a row asserting the wrong tiling geometry is worse than no row, because everything downstream
+  would trust it.
+
+**One real bug was found by a test rather than by review.** Building a DataFrame promotes datetimes
+to `pandas.Timestamp` and any column with a gap to `float64`. sqlite refused the Timestamp
+outright, which is how it surfaced — but the more interesting half is that **psycopg2 would have
+accepted both**: `Timestamp` subclasses `datetime`, and `float('nan')` coerces into a numeric
+column as NaN. So a slide whose mpp is unknown would have read back as a number. `_native()` now
+normalises at the insert boundary, with a test that asserts the absent value comes back as `NULL`.
+
+### §25.4 The schema was not in git, and `migrate_all.sql` could not do what it claimed
+
+Found while transcribing the `\d` output. Across the entire repository, only **9 of the 17 live
+tables** had a `CREATE TABLE` — seven in `schema.sql`, two in migrations. And `dataset_id`, the
+column every cohort guard is scoped by and which is `NOT NULL` on five tables, appears in no
+`CREATE TABLE` and no `ALTER TABLE` anywhere in git. It was added to the live database by hand.
+
+`migrate_all.sql` (committed two days ago, `10268bb`) says *"running it against a fresh one builds
+the whole schema"*. It stopped at `migrate_indexes.sql:8` — `UPDATE tile_coordinates ...` — under
+`ON_ERROR_STOP`, so the failure named an index migration rather than a missing table.
+
+Worse, `schema.sql` looks authoritative and is not. It is a `pg_dump` from 2025-10-23 that declares
+`tile_registry` with an `id` primary key, `hpc_id` as `varchar(100)`, and no `slide_tile`,
+`dataset_id` or confidence columns. Since the live `hpc_id` is an integer with a foreign key into
+`hpc_dictionary(hpc_id)`, `hpc_dictionary` must have drifted too, by an amount nobody has measured.
+
+`backend/migrate_kb_base_tables.sql` now creates the missing eight and adds `dataset_id` where it
+is absent, tightening to `NOT NULL` only where the table is already free of nulls — back-filling a
+cohort id is a judgement about which cohort those rows belong to, not something a migration can
+decide. It runs first in `migrate_all.sql`. `backend/kb_live_schema_2026-08-26.txt` keeps the
+capture it was transcribed from, so the DDL has provenance someone can check.
+
+`backend/tests/test_schema_coverage.py` fails if a live table ever again has no DDL, and its
+`KNOWN_UNCOVERED` set names the four cluster reference tables whose `\d` has still never been
+captured — an admission in code rather than a silence.
+
+### §25.5 What was deliberately not done
+
+**`tile_hpc_heatmap` is left empty for new cohorts.** 149 MB, 71 `p_hpc_*` columns, read wholesale
+into a process global at server startup (`_load_heatmap_probs`, `tile_server_v2_.py:1332`) and
+merged into every `/slide/{id}/tiles_meta` response. Nothing in this repository has ever written
+it; it came from an off-repo Keras notebook path.
+
+It was not automated because **the classifier does not produce the quantity those columns hold.**
+`vote()` returns a top-1 label and a `vote_margin`, not a distribution over 71 clusters. Writing
+normalised k-NN vote fractions into the same columns would put two incompatible definitions in one
+table with nothing to distinguish them — which is this codebase's failure mode written out as a
+schema. Three options are set out in `KB_TABLE_COVERAGE_2026-08-26.md` §3.4; choosing between them
+is a modelling decision, not plumbing.
+
+**`h_latent_vectors` and `slide_hpc_membership` are left alone.** Both are stale, and both have
+**no live reader** — the only references are in `app_v3`…`app_v21`, superseded by `app_v28`.
+Filling a table nothing reads is worse than saying nothing, so this says nothing beyond recording
+why.
+
+**The hard-coded scan geometry is left in place.** `tile_server_v2_.py:216-218` computes
+`TILE_SIZE_NATIVE` from `SCALE = 1.8 / 0.252` — every slide in every cohort assumed to be scanned
+at 0.252 mpp. `dataset_config` and `wsi_metadata` now record the real per-cohort numbers, which is
+the prerequisite; using them means rewriting the viewer's coordinate maths against cohorts whose
+real geometry has never been checked, and getting that wrong mis-places every tile on every
+existing slide. Recorded as the next change, not made as part of this one.
+
+### §25.6 State
+
+Tests **338 → 384**. Three suites: `test_schema_coverage.py` (14, new), `test_pipeline_steps.py`
+(16, new), `test_register_dataset.py` (10 → 26). Each new check has a companion that proves it can
+come out bad, per this project's own rule.
+
+**Not run against a real PostgreSQL** — there is none on the machine this was written on, so the
+DDL is transcribed and reviewed, not executed, and the endpoints are exercised against SQLite. The
+first real cohort should be previewed before it is committed.
+
+**Deployment.** The API server runs on the HPC login node — it shells out to `sbatch` and opens
+`.svs` files from scratch — so `backend/` has to be copied there and the server restarted; running
+it on the laptop does not pick these changes up. `app/` runs on the laptop against a tunnel to port
+8000. `docs/HPL_Pipeline_Architecture.pdf` (generated by `docs/make_architecture_pdf.py`) sets out
+the whole topology, the six stages, the KB map and the guard inventory.
+
+### §25.7 Still open
+
+| item | note |
+|---|---|
+| `\d` for the four `hpc_*` reference tables and `\d+ slide_metadata` | Never captured. Until they are, a fresh checkout cannot build a complete schema. Five commands. |
+| `tile_hpc_heatmap` | §25.5. A decision, not a task. |
+| `--allow-unknown-clusters` cannot work | Opting out of the guard makes the proportion `INSERT` violate the `hpc_id` FK, and `load()` is one transaction so the rollback takes `tile_registry` with it. The checkbox is exposed in the UI. |
+| `hpl_profile_summary` unique on `(samples, slides)` without `dataset_id` | Two cohorts holding the same slide id cannot both have a summary row. |
+| `hpl_profile_proportion.slides varchar(170)` vs `hpl_profile_summary.slides varchar(150)` | The referencing side of the foreign key is wider than the referenced side. |
+| Stage 6 has no attempt history | `slurm_dataset_run_jobs`'s unit is a submitted Slurm job and Stage 6 submits none. Stage 5 now matches, deliberately. |
+| The chatbot defaults to "non-malignant" | `hpc_chat_handlers_v23.py:120-134` — a missing `hpc_dictionary` row falls through to a confident clinical claim rather than a blank panel. |

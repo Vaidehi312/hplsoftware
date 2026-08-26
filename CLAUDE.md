@@ -34,32 +34,48 @@ are history. Confirm with `ls -lt` before editing.
 
 ## Architecture
 
-Five stages, surfaced as numbered steps in the UI sidebar. Stage state lives in Postgres
+Six stages, surfaced as numbered steps in the UI sidebar. Stage state lives in Postgres
 (`slurm_dataset_runs`), and the UI gates each stage on the previous one having produced a *valid*
 output, not merely having run.
 
 ```
-1 Tiling            submit_mask_tile_slurm.py     → tiles on disk + tile_coordinates
+1 Tiling            submit_mask_tile_slurm.py     → tiles + per-slide _tile_metadata.csv ON DISK
 2 Packaging         make_hpl_hdf5.py              → one gzip HDF5 per dataset
 3 Feature extract   submit_feature_extraction.py  → projections .h5 (GPU, Singularity)
 4 Classification    submit_cluster_assignment.py  → assignments CSV (CPU, faiss k-NN)
-5 KB load           load_hpc_assignments.py       → tile_registry + per-slide aggregates
+5 Registration      register_dataset.py           → wsi_registry, wsi_metadata, dataset_config,
+                                                    tile_coordinates, tile_registry (no hpc_id yet)
+6 KB load           load_hpc_assignments.py       → tile_registry.hpc_id + per-slide aggregates
 ```
+
+**Stage 1 does not write `tile_coordinates`.** It writes a per-slide `_tile_metadata.csv` to disk;
+nothing puts those rows in Postgres until Stage 5. This file said otherwise until 2026-08-26 and the
+mistake is worth naming, because it is what made the gap below invisible for so long.
 
 Those name where each stage's *logic* lives; how it reaches Slurm is not uniform. Stages 3 and 4 have
 dedicated `submit_*.py` modules that build and run their own `sbatch`. Stage 1 also has a shell
 wrapper, `submit_dataset_tiling.sh`, which expects a `mask_and_tile_array.sbatch` alongside it that is
 not in this repo — it lives on the cluster. Stage 2's submission is
 driven by the server's `/package` endpoint, and `make_hpl_hdf5.package_slides_to_h5` is additionally
-imported and called in-process on the single-slide upload path. Stage 5 submits no Slurm job at all —
-`load_hpc_assignments.py`'s functions run in-process inside `tile_server_v2_.py`
-(`/kb-load-preview`, `/kb-load`), so `slurm_dataset_runs.kb_load_done` is the only state tracked for it
-(`migrate_dataset_runs_kb_load.sql`), with no job_id/slurm_state pair.
+imported and called in-process on the single-slide upload path. Stages 5 and 6 submit no Slurm job at
+all — `register_dataset.py`'s and `load_hpc_assignments.py`'s functions run in-process inside
+`tile_server_v2_.py` (`/register-preview`, `/register`, `/kb-load-preview`, `/kb-load`), so
+`registration_done` and `kb_load_done` are the only state tracked for them
+(`migrate_dataset_runs_registration.sql`, `migrate_dataset_runs_kb_load.sql`), with no
+job_id/slurm_state pair.
 
-Adding a stage means touching four places: the submitter (or, for a non-Slurm stage like 5, the
+**Stage 5 exists because Stage 6 only ever `UPDATE`s.** `load_hpc_assignments.load()` sets
+`tile_registry.hpc_id` on rows that must already be there, so for a cohort that has never touched the
+KB its match rate is 0% by construction and it refuses — a number that reads like a slide-naming bug
+and is in fact a missing step. Registration is gated on Stage 2, not Stage 4: it reads tile identity
+out of the packaged `.h5` and the raw slides and needs no cluster labels.
+
+Adding a stage means touching four places: the submitter (or, for a non-Slurm stage like 5 or 6, the
 in-process functions it calls), endpoints in `tile_server_v2_.py`, methods in `app/api_client.py`, and a
-step entry + render function in `app/app_v28.py`. Stage 4 is the cleanest Slurm-backed model to copy —
-see `_pipeline_steps` and `_render_assignment_step`. Stage 5 (`_render_kb_load_step`) is the model for a
+step entry + render function in `app/app_v28.py`. `backend/tests/test_pipeline_steps.py` checks the
+last two agree — a step key with no renderer is a `KeyError` on a screen nobody opens until a run
+reaches that stage. Stage 4 is the cleanest Slurm-backed model to copy —
+see `_pipeline_steps` and `_render_assignment_step`. Stage 6 (`_render_kb_load_step`) is the model for a
 stage that writes straight to the KB: it never auto-commits — a `/kb-load-preview` dry run has to be
 pulled up in the UI first, and `/kb-load` enforces the exact same guards (95% match rate, unknown
 cluster IDs) the CLI's `--commit` does, because it calls the same functions rather than reimplementing
@@ -75,7 +91,7 @@ holding Kai's frozen encoder. Our changes to it are ordinary commits **and** are
 
 ### The container
 
-Stages 3–5 run inside an NGC TensorFlow 1.15 image (`tensorflow-23.03-tf1-py3.sif`, CUDA 12, Python
+Stages 3 and 4 run inside an NGC TensorFlow 1.15 image (`tensorflow-23.03-tf1-py3.sif`, CUDA 12, Python
 3.8) because the host conda env cannot drive a Hopper GPU. The image lacks packages the code needs
 (`scikit-image`, `faiss-cpu`), and `$HOME` is not writable inside it, so they live in a bound
 directory on scratch (`HPL_CONTAINER_EXTRAS`) placed on `PYTHONPATH`. **The package list lives in
@@ -84,7 +100,14 @@ together** — a stale copy silently installs the wrong set.
 
 ### The Knowledge Bank
 
-Postgres `hpl_kb`, 26 relations. Three things matter for classification results:
+Postgres `hpl_kb`, 26 relations — 17 tables, 1 view, 8 sequences. Column-level definitions are in
+`backend/kb_live_schema_2026-08-26.txt`, transcribed from `\d` against the live database; that capture
+is the only complete record of this schema, and `backend/migrate_kb_base_tables.sql` was written from
+it. **`schema.sql` in the repo root is a stale 2025-10-23 `pg_dump`** that declares
+`tile_registry.hpc_id` as `varchar(100)` with an `id` primary key and no `slide_tile`, `dataset_id`, or
+confidence columns. Do not build a database from it.
+
+Three things matter for classification results:
 
 - `tile_registry` — per-tile `hpc_id` plus confidence columns. Joined via
   `slide_tile`, which is `"<slides>_<tiles>"` upper-cased (`TCGA-55-7574-01Z-00-DX1_18_15.JPEG`).
@@ -93,6 +116,22 @@ Postgres `hpl_kb`, 26 relations. Three things matter for classification results:
   without refreshing these leaves the UI internally inconsistent with nothing to signal it.
 - `hpc_dictionary` and the `hpc_*_details` tables describe the 71 clusters themselves. Reference data;
   never derived from an assignment.
+
+Which tables a run actually fills, and which nothing fills — audited 2026-08-26, full evidence in
+`KB_TABLE_COVERAGE_2026-08-26.md`:
+
+| filled by a run | never filled by anything |
+|---|---|
+| `tile_coordinates`, `tile_registry`, `wsi_registry`, `wsi_metadata`, `dataset_config` (Stage 5) · `hpl_profile_*` (Stage 6) · `slurm_dataset_run*` (the server) | `tile_hpc_heatmap` — **read live** at server startup, nothing writes it · `h_latent_vectors` (4.4 GB) · `slide_hpc_membership` · `tile_hpc_heatmap_old` |
+
+`tile_hpc_heatmap` is the one gap with a live reader still open. `_load_heatmap_probs()`
+(`tile_server_v2_.py:1332`) reads the whole 149 MB table into memory at startup and merges its 71
+`p_hpc_*` columns into `/slide/{id}/tiles_meta`. Nothing in this repository has ever written it, and
+the k-NN classifier does not produce a 71-class distribution to write — it produces a top-1 label and
+a vote margin. Filling it is a modelling decision, not plumbing.
+
+`h_latent_vectors` and `slide_hpc_membership` have no live reader at all: nothing in `backend/` or in
+`app_v28.py` names them. Leave them alone rather than "completing" them.
 
 ## Invariants that cost time to rediscover
 

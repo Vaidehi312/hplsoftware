@@ -2769,6 +2769,32 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
              "this is the cohort the KB groups by. A second, fuller run of the "
              "same cohort has a different folder and the same key.",
     )
+    registration_scope = st.radio(
+        "Registration scope",
+        ["Full packaged dataset", "Subset"],
+        horizontal=True,
+        key=f"{key_prefix}reg_scope_{submission_id}",
+        help="Register every slide in the packaged .h5, or only selected slides from it.",
+    )
+
+    registration_slide_names = None
+
+    if registration_scope == "Subset":
+        subset_text = st.text_area(
+            "Slides to register (one per line)",
+            key=f"{key_prefix}reg_subset_slides_{submission_id}",
+            placeholder="SLIDE-001\nSLIDE-002.svs\nSLIDE-003",
+            help=(
+                "Enter slide IDs or filenames that already belong to the packaged .h5. "
+                "Only those slides and their tiles will be registered."
+            ),
+        )
+
+        registration_slide_names = [
+            line.strip()
+            for line in subset_text.splitlines()
+            if line.strip()
+        ]
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -2803,14 +2829,25 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
     )
 
     preview_key = f"{key_prefix}reg_preview_{submission_id}"
-    if st.button("Preview registration",
-                 key=f"{key_prefix}reg_preview_btn_{submission_id}"):
+    if st.button(
+        "Preview registration",
+        key=f"{key_prefix}reg_preview_btn_{submission_id}",
+    ):
         if not dataset_id.strip():
             st.error("Enter a dataset_id — every row written is scoped to it.")
+
+        elif registration_scope == "Subset" and not registration_slide_names:
+            st.error(
+                "Enter at least one slide ID or filename for subset registration."
+            )
+
         else:
             try:
                 st.session_state[preview_key] = client.preview_registration(
-                    submission_id, dataset_id=dataset_id.strip(),
+                    submission_id,
+                    dataset_id=dataset_id.strip(),
+                    scope="subset" if registration_scope == "Subset" else "full",
+                    slide_names=registration_slide_names,
                     slide_metadata=slide_metadata,
                     write_dataset_config=write_dataset_config,
                     replace=replace,
@@ -2877,12 +2914,26 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
     blocked = bool(report.get("would_refuse_collision")
                    or report.get("needs_replace")
                    or report.get("missing_tables"))
-    if st.button("Register in the Knowledge Bank",
-                 key=f"{key_prefix}reg_commit_btn_{submission_id}",
-                 type="primary", disabled=blocked):
+    if st.button(
+        "Register subset in the Knowledge Bank"
+        if registration_scope == "Subset"
+        else "Register full dataset in the Knowledge Bank",
+        key=f"{key_prefix}reg_commit_btn_{submission_id}",
+        type="primary",
+        disabled=blocked,
+    ):
+        if registration_scope == "Subset" and not registration_slide_names:
+            st.error(
+                "Enter at least one slide ID or filename for subset registration."
+            )
+            return
+
         try:
             result = client.commit_registration(
-                submission_id, dataset_id=dataset_id.strip(),
+                submission_id,
+                dataset_id=dataset_id.strip(),
+                scope="subset" if registration_scope == "Subset" else "full",
+                slide_names=registration_slide_names,
                 slide_metadata=slide_metadata,
                 write_dataset_config=write_dataset_config,
                 replace=replace,
@@ -4190,7 +4241,7 @@ def show_wsi(slide_id, ui_suffix=""):
         st.write("DEBUG unique HPCs on slide:", len(present_hpcs))
         st.write(sorted(list(present_hpcs))[:100])
         st.write("DEBUG heatmap dropdown HPCs:", len(hpc_ids_heat))
-        
+
 
         if not hpc_ids_heat:
             st.warning("No heatmap cluster options found for this WSI. This slide may not have matching hpc_id values and p_hpc_* probability columns.")
@@ -4249,7 +4300,7 @@ def show_wsi(slide_id, ui_suffix=""):
         df = df.merge(hpc_titles_df, on="hpc_id", how="left")
     else:
         df["hpc_title"] = ""
-        
+
     # ------------------------------------------------------------------
     # 4. Draw overlay
     # ------------------------------------------------------------------
@@ -4330,7 +4381,7 @@ def show_wsi(slide_id, ui_suffix=""):
     nec_f = st.session_state.get("query_necrosis")
     mal_f = st.session_state.get(_k("query_malignant"))
     filtered_df = df.copy()
-    
+
     if st.session_state.get(_k("selected_hpc")) is not None:
         filtered_df = filtered_df[filtered_df["hpc_id"] == st.session_state[_k("selected_hpc")]]
     if infl_f is not None:
@@ -4741,7 +4792,7 @@ def _draw_heatmap(heat_draw, df, col_name, downsample, alpha_max, tile_size_nati
         B = int(255 * (1 - float(t)))
         heat_draw.rectangle([int(x), int(y), int(x) + ts, int(y) + ts],
                             fill=(R, G, B, int(alpha)), outline=(255, 255, 255, 40))
-        
+
 
 def _draw_survival_risk_heatmap(heat_draw, df, downsample, tile_size_native, alpha=140, risk_filter=None):
     if "survival_risk_norm" not in df.columns:
@@ -4800,7 +4851,7 @@ def _draw_grid(draw, grid_df, downsample, highlight_mode, infl_f, nec_f, mal_f, 
 
             if current != mal_f:
                 continue
-                    
+
         if highlight_mode == "Inflammation":
             color = color_for_inflammation(r.get("inflammation"))
         elif highlight_mode == "Necrosis":
@@ -4946,7 +4997,7 @@ def build_osd_overlay_records(df, highlight_mode, infl_f, nec_f, mal_f, tile_siz
             color = color_for_necrosis(r.get("necrosis"))
         elif highlight_mode == "Malignant":
             color = color_for_malignant(r.get("malignant"))
-        
+
         elif highlight_mode == "Adjacency":
             adj = st.session_state.get("adj_tile_sets")
             if adj is None:
@@ -4961,7 +5012,7 @@ def build_osd_overlay_records(df, highlight_mode, infl_f, nec_f, mal_f, tile_siz
                 continue
         else:
             color = color_for_hpc(r.get("hpc_id"))
-            
+
         records.append({
             "x": float(r["x_native"]),
             "y": float(r["y_native"]),

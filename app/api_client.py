@@ -476,10 +476,12 @@ class TileServerClient:
         )
 
     def preview_registration(self, submission_id: str,
-                             dataset_id: str | None = None,
-                             slide_metadata: bool = False,
-                             write_dataset_config: bool = True,
-                             replace: bool = False) -> dict:
+                         dataset_id: str | None = None,
+                         scope: str = "full",
+                         slide_names: list[str] | None = None,
+                         slide_metadata: bool = False,
+                         write_dataset_config: bool = True,
+                         replace: bool = False) -> dict:
         """Dry run of the registration step: what identity rows creating this
         cohort would write, without writing them.
 
@@ -495,18 +497,22 @@ class TileServerClient:
         return self._post_json(
             f"/dataset-jobs/{submission_id}/register-preview",
             {
-                "dataset_id": dataset_id,
-                "slide_metadata": slide_metadata,
-                "write_dataset_config": write_dataset_config,
-                "replace": replace,
+            "dataset_id": dataset_id,
+            "scope": scope,
+            "slide_names": slide_names,
+            "slide_metadata": slide_metadata,
+            "write_dataset_config": write_dataset_config,
+            "replace": replace,
             },
         )
 
     def commit_registration(self, submission_id: str,
-                            dataset_id: str | None = None,
-                            slide_metadata: bool = False,
-                            write_dataset_config: bool = True,
-                            replace: bool = False) -> dict:
+                        dataset_id: str | None = None,
+                        scope: str = "full",
+                        slide_names: list[str] | None = None,
+                        slide_metadata: bool = False,
+                        write_dataset_config: bool = True,
+                        replace: bool = False) -> dict:
         """User-triggered: create this cohort's identity rows in the KB, in one
         transaction, after the same guards register_dataset.py --commit
         enforces on the CLI — a slide or tile already claimed by a different
@@ -519,12 +525,13 @@ class TileServerClient:
         return self._post_json(
             f"/dataset-jobs/{submission_id}/register",
             {
-                "dataset_id": dataset_id,
-                "slide_metadata": slide_metadata,
-                "write_dataset_config": write_dataset_config,
-                "replace": replace,
+            "dataset_id": dataset_id,
+            "slide_metadata": slide_metadata,
+            "write_dataset_config": write_dataset_config,
+            "replace": replace,
             },
         )
+
 
     def start_test_packaging(
         self,

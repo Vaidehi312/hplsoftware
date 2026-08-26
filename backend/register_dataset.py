@@ -352,9 +352,62 @@ def build_registration(h5_path: Path, tile_dir: Path, tile_dataset_name: str,
                        raw_dir: Path | None = None,
                        slide_metadata: bool = False,
                        target_mpp: float | None = None,
-                       tile_size_5x_px: int | None = None) -> dict:
+                       tile_size_5x_px: int | None = None,
+                       scope: str = "full",
+                       slide_names: list[str] | None = None) -> dict:
     """Everything preview()/commit() need, computed without touching the DB."""
     identity = read_h5_identity(h5_path)
+
+    scope = (scope or "full").strip().lower()
+
+    if scope not in {"full", "subset"}:
+        raise SystemExit("scope must be 'full' or 'subset'")
+
+    requested_slides = None
+
+    if scope == "subset":
+        requested_slides = [
+            str(s).strip()
+            for s in (slide_names or [])
+            if str(s).strip()
+        ]
+
+        if not requested_slides:
+            raise SystemExit(
+                "Subset registration requires at least one slide ID or filename."
+            )
+
+        wanted = {s.upper() for s in requested_slides}
+
+        available = {
+            str(s).strip().upper()
+            for s in identity["slides"].dropna().unique()
+        }
+
+        missing_requested = [
+            s for s in requested_slides
+            if s.upper() not in available
+        ]
+
+        if missing_requested:
+            raise SystemExit(
+                "Requested subset contains slide(s) not present in the packaged .h5: "
+                + ", ".join(missing_requested[:20])
+            )
+
+        identity = identity[
+            identity["slides"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .isin(wanted)
+        ].copy()
+
+        if identity.empty:
+            raise SystemExit(
+                "Subset selection matched zero tiles in the packaged .h5."
+            )
+
     slide_ids = sorted(set(identity["slides"]))
     coords, missing_slides = read_tile_coordinates(tile_dir, tile_dataset_name, slide_ids)
 
@@ -412,6 +465,8 @@ def build_registration(h5_path: Path, tile_dir: Path, tile_dataset_name: str,
         "wsi_metadata": wsi_metadata,
         "dataset_config": dataset_config,
         "slides": slide_ids,
+        "scope": scope,
+        "requested_slides": requested_slides,
         "missing_slides": missing_slides,
         "unmatched_tiles": unmatched["slide_tile"].tolist(),
         "slides_without_files": slides_without_files,
@@ -777,6 +832,20 @@ def main() -> None:
     parser.add_argument("--replace", action="store_true",
                         help="Overwrite this dataset_id's existing rows. Refused "
                              "without this flag if any already exist.")
+    parser.add_argument(
+        "--scope",
+        choices=("full", "subset"),
+        default="full",
+        help="Register the full packaged dataset or only selected slides.",
+    )
+
+    parser.add_argument(
+        "--slide-name",
+        action="append",
+        dest="slide_names",
+        help="Slide ID to register when --scope subset is used. "
+             "Repeat for multiple slides.",
+    )
     args = parser.parse_args()
 
     if not args.h5.is_file():
@@ -795,6 +864,11 @@ def main() -> None:
         raise SystemExit("--target-mpp and --tile-size-5x go together: "
                          "dataset_config needs both or neither.")
 
+    if args.scope == "subset" and not args.slide_names:
+        raise SystemExit(
+            "--scope subset requires at least one --slide-name."
+        )
+
     plan = build_registration(
         args.h5, args.tile_dir, args.tile_dataset_name,
         args.h5_source_path or str(args.h5), args.dataset_id,
@@ -802,6 +876,8 @@ def main() -> None:
         slide_metadata=args.slide_metadata,
         target_mpp=args.target_mpp,
         tile_size_5x_px=args.tile_size_5x,
+        scope=args.scope,
+        slide_names=args.slide_names,
     )
     engine = make_engine()
 

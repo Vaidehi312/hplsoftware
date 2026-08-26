@@ -4428,6 +4428,8 @@ class RegistrationRequest(BaseModel):
     # key, and a second, fuller run of the same cohort has a different folder
     # and the same key.
     dataset_id: str | None = None
+    scope: str = "full"
+    slide_names: list[str] | None = None
     # Opens every slide file, so it is opt-in for the same reason as the CLI
     # flag: 14,044 headers is minutes, not seconds.
     slide_metadata: bool = False
@@ -4464,7 +4466,28 @@ def _registration_plan(row, req: "RegistrationRequest"):
         raw_dir = None
 
     dataset_id = (req.dataset_id or dataset_name).strip().upper()
+    scope = (req.scope or "full").strip().lower()
 
+    if scope not in {"full", "subset"}:
+        raise HTTPException(
+            400,
+            "scope must be 'full' or 'subset'",
+        )
+
+    slide_names = None
+
+    if scope == "subset":
+        slide_names = [
+            str(s).strip()
+            for s in (req.slide_names or [])
+            if str(s).strip()
+        ]
+
+        if not slide_names:
+            raise HTTPException(
+                400,
+                "Subset registration requires at least one slide ID or filename.",
+            )
     target_mpp = tile_px = None
     if req.write_dataset_config:
         params = _row_tiling_params(row) or {}
@@ -4477,6 +4500,8 @@ def _registration_plan(row, req: "RegistrationRequest"):
         slide_metadata=req.slide_metadata,
         target_mpp=target_mpp,
         tile_size_5x_px=tile_px,
+        scope=scope,
+        slide_names=slide_names,
     )
     return plan, dataset_id, raw_dir
 

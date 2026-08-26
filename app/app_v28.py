@@ -37,7 +37,50 @@ st.title("🧠 HPC Chatbot")
 # Tile server client (talks to FastAPI on HPCC)
 # ---------------------------------------------------------------------------
 TILE_SERVER_URL = os.getenv("TILE_SERVER_URL", "http://localhost:8000")
-client = TileServerClient(TILE_SERVER_URL)
+
+# ---------------------------------------------------------------------------
+# Knowledge Bank target
+# ---------------------------------------------------------------------------
+# Chosen before anything else is built, because both the API client and the
+# direct SQLAlchemy engine below have to agree on it. If the selector were
+# rendered further down the sidebar, the engine would already have been created
+# against whatever the previous rerun chose, and the viewer would read one
+# database while the chatbot read the other — with nothing on screen to say so.
+KB_PRODUCTION = "production"
+KB_TEST = "test"
+KB_DATABASES = {KB_PRODUCTION: os.getenv("HPL_DB_NAME", "hpl_kb"),
+                KB_TEST: os.getenv("HPL_DB_NAME_TEST", "hpl_kb_test")}
+
+_kb_labels = {KB_PRODUCTION: f"Production — {KB_DATABASES[KB_PRODUCTION]}",
+              KB_TEST: f"Test — {KB_DATABASES[KB_TEST]}"}
+
+kb_target = st.sidebar.radio(
+    "Knowledge Bank",
+    [KB_PRODUCTION, KB_TEST],
+    format_func=lambda t: _kb_labels[t],
+    key="kb_target",
+    help="Everything downstream follows this: registration and the cluster-"
+         "assignment load write here, and the slide viewer, HPC panels and "
+         "chatbot read from here. Pipeline execution and run history always "
+         "stay in production — a run is one run regardless of which Knowledge "
+         "Bank it filled.",
+)
+# Every @st.cache_data reader in this file is keyed on its arguments, and most
+# of them take none — load_hpc_titles(), load_slide_list(), load_valid_hpc_ids()
+# and the rest would happily serve production's rows for the whole 300s ttl
+# after a switch to test. Clearing on change is one line and covers readers
+# added later; adding a kb_target argument to each would have to be remembered
+# eight times and then again for the ninth.
+if st.session_state.get("_kb_target_active") not in (None, kb_target):
+    st.cache_data.clear()
+st.session_state["_kb_target_active"] = kb_target
+
+if kb_target == KB_TEST:
+    st.sidebar.warning(
+        f"Reading and writing **{KB_DATABASES[KB_TEST]}**. Production is untouched."
+    )
+
+client = TileServerClient(TILE_SERVER_URL, kb_target=kb_target)
 
 
 def _post_upload_slide(file_bytes: bytes, file_name: str, file_type: str,
@@ -3397,7 +3440,11 @@ DB_USER = os.getenv("HPL_DB_USER", "vpandya")
 DB_PASS = os.getenv("HPL_DB_PASS", "")
 DB_HOST = "127.0.0.1"
 DB_PORT = "5433"
-DB_NAME = os.getenv("HPL_DB_NAME", "hpl_kb")
+# The chatbot and three viewer helpers query Postgres directly rather than
+# through the API, so the selection above has to reach this engine too —
+# otherwise the pipeline writes to test and every answer still comes from
+# production.
+DB_NAME = KB_DATABASES[kb_target]
 
 # For local Streamlit + SSH tunnel, the app should connect to the local
 # forwarded port, usually 127.0.0.1:5433.

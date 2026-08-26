@@ -67,6 +67,9 @@
 -- Registration creates the identity rows Stage 5's UPDATE needs, so it is
 -- tracked next to Stage 5 even though it runs before it.
 \ir migrate_dataset_runs_registration.sql
+-- Which KB each of those two stages wrote to. Run tracking stays in
+-- production, so without this a run says it registered and not where.
+\ir migrate_dataset_runs_kb_target.sql
 
 \echo '== slide processing status =='
 \ir migrate_processing_status.sql

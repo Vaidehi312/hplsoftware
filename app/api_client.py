@@ -22,11 +22,39 @@ from local_cache import LocalImageCache
 
 
 class TileServerClient:
-    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 30):
+    #: Knowledge Bank the server should read and write. "production" is hpl_kb,
+    #: "test" is hpl_kb_test.
+    PRODUCTION = "production"
+    TEST = "test"
+
+    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 30,
+                 kb_target: str = "production"):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.cache = LocalImageCache()
         self._session = requests.Session()
+        # Held on the client rather than passed to each method. Roughly a dozen
+        # endpoints honour it and app_v28 calls them from far more places than
+        # that; threading an argument through every call site is how one of
+        # them ends up reading production while the rest read test, which is
+        # the failure this whole feature exists to avoid.
+        self.kb_target = kb_target
+
+    def set_kb_target(self, kb_target: str) -> None:
+        """Point this client at a different Knowledge Bank.
+
+        Clears the image cache: it is keyed by slide_id, and a slide_id only
+        means one thing within a single KB. Without this, switching to test
+        would show production's cached tiles for any id present in both.
+        """
+        if kb_target != self.kb_target:
+            self.kb_target = kb_target
+            try:
+                self.cache.clear()
+            except Exception:
+                # A cache that will not clear is a stale-image problem, not a
+                # reason to refuse the switch.
+                pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -34,6 +62,11 @@ class TileServerClient:
 
     def _get(self, path: str, params: dict | None = None, stream: bool = False, timeout: int | None = None):
         url = f"{self.base_url}{path}"
+        # Sent on every GET. Endpoints that do not declare it ignore it — the
+        # pipeline and run-tracking routes are production-only by design — so
+        # this cannot make one of them read the wrong database, and it removes
+        # the need to remember which reads are KB reads.
+        params = {**(params or {}), "kb_target": self.kb_target}
         r = self._session.get(url, params=params, timeout=timeout or self.timeout, stream=stream)
         r.raise_for_status()
         return r
@@ -444,7 +477,8 @@ class TileServerClient:
         path of its own."""
         return self._post_json(
             f"/dataset-jobs/{submission_id}/kb-load-preview",
-            {"min_margin": min_margin, "csv_path": csv_path},
+            {"min_margin": min_margin, "csv_path": csv_path,
+             "kb_target": self.kb_target},
         )
 
     def commit_kb_load(
@@ -472,6 +506,7 @@ class TileServerClient:
                 "skip_profiles": skip_profiles,
                 "csv_path": csv_path,
                 "min_margin": min_margin,
+                "kb_target": self.kb_target,
             },
         )
 
@@ -498,6 +533,7 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/register-preview",
             {
             "dataset_id": dataset_id,
+            "kb_target": self.kb_target,
             "scope": scope,
             "slide_names": slide_names,
             "slide_metadata": slide_metadata,
@@ -526,6 +562,13 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/register",
             {
             "dataset_id": dataset_id,
+            "kb_target": self.kb_target,
+            # scope and slide_names were accepted by this method and then left
+            # out of the body, so a subset previewed as three slides committed
+            # as the whole dataset — silently, because registering more than
+            # you meant to still succeeds.
+            "scope": scope,
+            "slide_names": slide_names,
             "slide_metadata": slide_metadata,
             "write_dataset_config": write_dataset_config,
             "replace": replace,
@@ -669,7 +712,8 @@ class TileServerClient:
     def query(self, query_text: str, slide_id: Optional[str] = None) -> dict:
         r = self._session.post(
             f"{self.base_url}/query",
-            json={"query": query_text, "slide_id": slide_id},
+            json={"query": query_text, "slide_id": slide_id,
+                  "kb_target": self.kb_target},
             timeout=self.timeout,
         )
         r.raise_for_status()

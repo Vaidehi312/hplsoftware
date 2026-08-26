@@ -49,7 +49,8 @@ import h5py
 import numpy as np
 import openslide
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import (BackgroundTasks, Depends, FastAPI, HTTPException, Query,
+                     UploadFile, File, Form)
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -180,6 +181,29 @@ DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "hpl_kb")
 
+# --- Knowledge Bank targets -------------------------------------------------
+#
+# One server process, two Knowledge Banks. "test" exists so a cohort can be
+# registered, loaded, queried and looked at end to end without touching the
+# database the group actually uses — which is the only way to find out that a
+# registration is wrong before it is shared.
+#
+# Deliberately a fixed, named set rather than a database name taken from the
+# request. An endpoint accepting any string would let a typo open a connection
+# to something nobody meant, and would hand a caller the ability to point this
+# server at an arbitrary database on the same host.
+#
+# PRODUCTION IS THE DEFAULT EVERYWHERE. Every parameter added for this defaults
+# to "production", so an old client, a bookmarked URL, or a call that omits the
+# argument behaves exactly as it did before. The failure that matters is test
+# data reaching the real KB; defaulting the other way would make forgetting the
+# parameter the dangerous case instead of the harmless one.
+DB_NAME_TEST = os.getenv("DB_NAME_TEST", "hpl_kb_test")
+
+KB_PRODUCTION = "production"
+KB_TEST = "test"
+KB_TARGETS = {KB_PRODUCTION: DB_NAME, KB_TEST: DB_NAME_TEST}
+
 WSI_ROOT = os.getenv("WSI_ROOT", "/hpc-home/home/users/vpandya/long-term-scratch/tcga_wsi")
 H5_PATH = os.getenv("H5_PATH", "/hpc-home/home/users/vpandya/long-term-scratch/Vaidehi/TCGA/hdf5_TCGA_LUAD_5x_he_train_tiles.h5")
 
@@ -229,13 +253,18 @@ TILE_SIZE_NATIVE = int(TILE_SIZE_5X * SCALE)
 
 # Initialising Globals 
 
-engine = None
 cache: TileCache = None
-_h5_handle = None
-_wsi_handles: dict[str, openslide.OpenSlide] = {}
-_dz_handles: dict[str, DeepZoomGenerator] = {}
-_wsi_map: dict[str, str] = {}  # slide_id → hpc_path on HPCC
-_heatmap_probs: pd.DataFrame | None = None
+_h5_handles: dict[str, "h5py.File"] = {}   # resolved .h5 path → open handle
+# Everything below is keyed by KB target. It was keyed by nothing, because
+# there was one database. A slide_id is only unique *within* a Knowledge Bank:
+# the same id can name a different file in hpl_kb_test than in hpl_kb, so a
+# cache keyed on slide_id alone would serve production's pixels for a test
+# lookup — the quietest possible way to be wrong, since the image renders.
+_engines: dict[str, object] = {}                    # target → Engine
+_wsi_maps: dict[str, dict[str, str]] = {}           # target → {slide_id: hpc_path}
+_wsi_handles: dict[tuple[str, str], openslide.OpenSlide] = {}   # (target, slide_id)
+_dz_handles: dict[tuple[str, str], DeepZoomGenerator] = {}      # (target, slide_id)
+_heatmap_probs: dict[str, "pd.DataFrame | None"] = {}           # target → probs
 _processing_status: dict[str, dict] = {}  # slide_id → {status, stage, error, ...}
 # submission_id → (succeeded, zero_tile, not_attempted) slide-id lists, once
 # computed for the first time after that run's tiling is fully complete. A
@@ -294,31 +323,99 @@ def _slurm_submission_lock():
         conn.close()
 
 
-def _get_engine():
-    global engine
-    if engine is None:
-        engine = create_engine(
-            f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+def _resolve_kb_target(kb_target: str | None) -> str:
+    """The canonical target name, or a 400 naming the ones that exist.
+
+    Fixed set, not a free-form database name: an endpoint that accepted any
+    string would let a typo open a connection to something nobody meant, and
+    would hand a caller the ability to point this server at any database on the
+    same host.
+    """
+    target = (kb_target or KB_PRODUCTION).strip().lower()
+    if target not in KB_TARGETS:
+        raise HTTPException(
+            400, f"Unknown kb_target {kb_target!r}. Expected one of "
+                 f"{sorted(KB_TARGETS)}.")
+    return target
+
+
+def kb_target_param(kb_target: str = Query(
+    KB_PRODUCTION,
+    description="Which Knowledge Bank to read: 'production' (hpl_kb) or "
+                "'test' (hpl_kb_test). Defaults to production.")) -> str:
+    """Declared once as a dependency rather than repeated on every read
+    endpoint, so the set of valid targets and the default cannot drift between
+    the fourteen places that honour it."""
+    return _resolve_kb_target(kb_target)
+
+
+def _get_engine(kb_target: str = KB_PRODUCTION):
+    """One pooled engine per Knowledge Bank, created on first use.
+
+    Lazily, and per target: the test database may not exist on a given
+    deployment, and building an engine for it at import time would turn "we
+    have not made hpl_kb_test yet" into a server that will not start.
+    """
+    target = _resolve_kb_target(kb_target)
+    if target not in _engines:
+        _engines[target] = create_engine(
+            f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/"
+            f"{KB_TARGETS[target]}",
             pool_pre_ping=True,
             pool_size=5,
         )
-    return engine
+    return _engines[target]
 
 
-def _get_h5():
-    global _h5_handle
-    if _h5_handle is None:
-        _h5_handle = h5py.File(H5_PATH, "r", swmr=True)
-    return _h5_handle
+def _get_h5(h5_path: str | None = None):
+    """An open handle to a packaged .h5, keyed by path.
+
+    Was a single global bound to H5_PATH — one TCGA file, for every slide of
+    every cohort. That is why a Radiogenomics tile rendered a TCGA image
+    instead of failing: the index existed in the file, so it returned pixels.
+    Callers now pass the .h5 that actually holds the slide (see
+    _h5_for_slide_tile); omitting it falls back to H5_PATH so the legacy TCGA
+    cohort, whose rows predate any per-dataset path, still resolves.
+    """
+    path = h5_path or H5_PATH
+    if path not in _h5_handles:
+        if not os.path.isfile(path):
+            raise HTTPException(404, f"Packaged .h5 not found on disk: {path}")
+        _h5_handles[path] = h5py.File(path, "r", swmr=True)
+    return _h5_handles[path]
 
 
-def _load_wsi_map():
-    global _wsi_map
-    eng = _get_engine()
+def _load_wsi_map(kb_target: str = KB_PRODUCTION) -> dict[str, str]:
+    """Rebuild one target's slide_id → path map from its own wsi_registry."""
+    target = _resolve_kb_target(kb_target)
+    eng = _get_engine(target)
     df = pd.read_sql("SELECT slide_id, hpc_path FROM wsi_registry", eng)
     df["slide_id"] = df["slide_id"].astype(str).str.strip().str.upper()
-    _wsi_map = dict(zip(df["slide_id"], df["hpc_path"]))
- 
+    _wsi_maps[target] = dict(zip(df["slide_id"], df["hpc_path"]))
+    return _wsi_maps[target]
+
+
+def _get_wsi_map(kb_target: str = KB_PRODUCTION) -> dict[str, str]:
+    """Cached per target, loaded on first use.
+
+    Production's is warmed at startup as before. The test map is not, because
+    the database may not exist — so it is built the first time something asks
+    for it, and a missing database surfaces then, on a request that named it,
+    rather than as a server that will not boot.
+    """
+    target = _resolve_kb_target(kb_target)
+    if target not in _wsi_maps:
+        _load_wsi_map(target)
+    return _wsi_maps[target]
+
+def _cache_key(slide_id: str, kb_target: str) -> str:
+    """The TileCache is keyed by slide_id, which is only unique within one
+    Knowledge Bank. Production keeps its bare slide_id so every JPEG already on
+    disk stays valid; anything else is namespaced, so a test cohort cannot serve
+    a production slide's cached pixels under the same id."""
+    return slide_id if kb_target == KB_PRODUCTION else f"{kb_target}::{slide_id}"
+
+
 UPLOADED_DATASET_ID = "UPLOADED"  # tags ad-hoc uploads apart from the bulk TCGA_LUAD_5x cohort
 
 
@@ -337,9 +434,11 @@ def _register_uploaded_slide(slide_id: str, hpc_path: str):
             {"slide_id": slide_id, "hpc_path": hpc_path, "dataset_id": UPLOADED_DATASET_ID},
         )
 
-    _load_wsi_map()
-    _wsi_handles.pop(slide_id, None)
-    _dz_handles.pop(slide_id, None)
+    # Uploads are a production-only path: _register_uploaded_slide hard-codes
+    # dataset_id='UPLOADED' and there is no upload-into-test flow.
+    _load_wsi_map(KB_PRODUCTION)
+    _wsi_handles.pop((KB_PRODUCTION, slide_id), None)
+    _dz_handles.pop((KB_PRODUCTION, slide_id), None)
 
 
 def _set_processing_status(slide_id: str, status: str, error: str | None = None):
@@ -1333,46 +1432,72 @@ def _job_output_ready(
     return True
 
 
-def _load_heatmap_probs():
-    
-    global _heatmap_probs
+def _load_heatmap_probs(kb_target: str = KB_PRODUCTION):
+    """Read one target's whole tile_hpc_heatmap into memory.
+
+    Still the entire table, which is 149 MB on production — unchanged, and
+    still the reason startup is slow. What changed is that it is cached per
+    target instead of once for the process, because merging production's
+    probabilities into a test cohort's tiles would put plausible numbers on
+    tiles they were never computed for.
+
+    Nothing writes this table (see KB_TABLE_COVERAGE), so on the test database
+    it will be empty or absent — which is why the failure is caught and stored
+    as None rather than raised. A missing heatmap costs the overlay; it must
+    not cost the tile metadata the overlay is merged into.
+    """
+    target = _resolve_kb_target(kb_target)
     try:
-        eng = _get_engine()
+        eng = _get_engine(target)
         df = pd.read_sql("SELECT * FROM tile_hpc_heatmap", eng)
         df.columns = df.columns.astype(str).str.strip()
         if "slide_tile" in df.columns:
             df["slide_tile"] = df["slide_tile"].astype(str).str.strip().str.upper()
         keep = ["slide_tile"] + [c for c in df.columns if c.startswith("p_hpc_")]
-        _heatmap_probs = df[keep].copy()
+        _heatmap_probs[target] = df[keep].copy()
     except Exception as e:
-        print(f"Heatmap load failed: {e}")
-        _heatmap_probs = None
+        print(f"Heatmap load failed for {KB_TARGETS[target]}: {e}")
+        _heatmap_probs[target] = None
+    return _heatmap_probs[target]
+
+
+def _get_heatmap_probs(kb_target: str = KB_PRODUCTION):
+    target = _resolve_kb_target(kb_target)
+    if target not in _heatmap_probs:
+        _load_heatmap_probs(target)
+    return _heatmap_probs[target]
 
 
 
 
 
-def _open_slide(slide_id: str) -> openslide.OpenSlide:
+def _open_slide(slide_id: str, kb_target: str = KB_PRODUCTION) -> openslide.OpenSlide:
+    target = _resolve_kb_target(kb_target)
     slide_id = slide_id.strip().upper()
-    if slide_id in _wsi_handles:
-        return _wsi_handles[slide_id]
-    hpc_path = _wsi_map.get(slide_id)
+    key = (target, slide_id)
+    if key in _wsi_handles:
+        return _wsi_handles[key]
+    hpc_path = _get_wsi_map(target).get(slide_id)
     if not hpc_path:
-        raise HTTPException(404, f"Slide {slide_id} not in wsi_registry")
+        raise HTTPException(
+            404, f"Slide {slide_id} not in wsi_registry "
+                 f"({KB_TARGETS[target]}). Registering it writes that row.")
     if not os.path.isfile(hpc_path):
         raise HTTPException(404, f"SVS file not found on disk: {hpc_path}")
     slide = openslide.OpenSlide(hpc_path)
-    _wsi_handles[slide_id] = slide
+    _wsi_handles[key] = slide
     return slide
 
 
-def _get_deepzoom(slide_id: str) -> DeepZoomGenerator:
+def _get_deepzoom(slide_id: str, kb_target: str = KB_PRODUCTION) -> DeepZoomGenerator:
+    target = _resolve_kb_target(kb_target)
     slide_id = slide_id.strip().upper()
+    key = (target, slide_id)
 
-    if slide_id in _dz_handles:
-        return _dz_handles[slide_id]
+    if key in _dz_handles:
+        return _dz_handles[key]
 
-    slide = _open_slide(slide_id)
+    slide = _open_slide(slide_id, target)
 
     dz = DeepZoomGenerator(
         slide,
@@ -1381,7 +1506,7 @@ def _get_deepzoom(slide_id: str) -> DeepZoomGenerator:
         limit_bounds=False,
     )
 
-    _dz_handles[slide_id] = dz
+    _dz_handles[key] = dz
     return dz
 
 def _img_to_jpeg_bytes(img, quality: int = 85) -> bytes:
@@ -1490,15 +1615,22 @@ def _compute_adjacency(df_slide: pd.DataFrame):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("LOADED TILE SERVER WITH DZI SUPPORT:", __file__)
-    _load_wsi_map()
-    _load_heatmap_probs()
+    # Production only. The test database is optional — warming it here would
+    # make "hpl_kb_test does not exist yet" a server that refuses to start,
+    # rather than a 500 on the one request that asked for it. Both are built
+    # lazily on first use (_get_wsi_map / _get_heatmap_probs).
+    _load_wsi_map(KB_PRODUCTION)
+    _load_heatmap_probs(KB_PRODUCTION)
     yield
-    global _h5_handle
-    if _h5_handle:
-        _h5_handle.close()
+    for handle in _h5_handles.values():
+        try:
+            handle.close()
+        except Exception:
+            pass
+    _h5_handles.clear()
     _dz_handles.clear()
-    for s in _wsi_handles.values():
-        s.close()
+    for slide in _wsi_handles.values():
+        slide.close()
     _wsi_handles.clear()
 
 app = FastAPI(title="HPC Tile Server", lifespan=lifespan)
@@ -1519,8 +1651,14 @@ cache = TileCache(cache_dir=CACHE_DIR)
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "slides_loaded": len(_wsi_map)}
+def health(kb_target: str = Depends(kb_target_param)):
+    return {
+        "status": "ok",
+        "kb_target": kb_target,
+        "database": KB_TARGETS[kb_target],
+        "slides_loaded": len(_get_wsi_map(kb_target)),
+        "kb_targets": sorted(KB_TARGETS),
+    }
 
 
 @app.get("/debug/routes")
@@ -1532,8 +1670,8 @@ def debug_routes():
 
 
 @app.get("/slides")
-def list_slides():
-    return {"slides": sorted(_wsi_map.keys())}
+def list_slides(kb_target: str = Depends(kb_target_param)):
+    return {"slides": sorted(_get_wsi_map(kb_target).keys())}
 
 @app.post("/upload-slide")
 async def upload_slide(
@@ -4270,6 +4408,8 @@ def _kb_load_source_csv(row: dict, override_path: str | None = None) -> Path:
 
 
 class KbLoadPreviewRequest(BaseModel):
+    # See RegistrationRequest.kb_target.
+    kb_target: str = KB_PRODUCTION
     # min_margin previews compute_profiles()'s own exclusion (see
     # load_hpc_assignments.py) — leave-one-out validation put tiles below 0.1
     # vote_margin at 57% correct and 0.1-0.25 at 76%, against 92%+ once margin
@@ -4299,7 +4439,8 @@ def preview_kb_load(submission_id: str, req: KbLoadPreviewRequest = KbLoadPrevie
     except SystemExit as e:
         raise HTTPException(400, str(e))
 
-    report = _inspect_kb_load(_get_engine(), frame, cluster_column, min_margin=req.min_margin)
+    report = _inspect_kb_load(_get_engine(req.kb_target), frame, cluster_column,
+                              min_margin=req.min_margin)
     match_rate = report["matched"] / report["rows"] if report["rows"] else 0.0
     report.update({
         "cluster_column": cluster_column,
@@ -4320,6 +4461,8 @@ def preview_kb_load(submission_id: str, req: KbLoadPreviewRequest = KbLoadPrevie
 
 
 class KbLoadRequest(BaseModel):
+    # See RegistrationRequest.kb_target.
+    kb_target: str = KB_PRODUCTION
     # Mirrors load_hpc_assignments.py's CLI flags. cancer_type stays optional
     # rather than guessed — hpl_profile_summary.cancer_type is left unset when
     # omitted, same as the CLI, rather than this endpoint inventing a value the
@@ -4358,7 +4501,7 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
     except SystemExit as e:
         raise HTTPException(400, str(e))
 
-    eng = _get_engine()
+    eng = _get_engine(req.kb_target)
     report = _inspect_kb_load(eng, frame, cluster_column, min_margin=req.min_margin)
     match_rate = report["matched"] / report["rows"] if report["rows"] else 0.0
 
@@ -4398,10 +4541,13 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
             kb_load_at=datetime.now(timezone.utc),
             kb_load_rows=updated,
             kb_load_reference=reference,
+            kb_load_kb_target=_resolve_kb_target(req.kb_target),
         )
 
     return {
         "submission_id": submission_id,
+        "kb_target": _resolve_kb_target(req.kb_target),
+        "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
         "updated_rows": updated,
         "matched": report["matched"],
         "reference": reference,
@@ -4428,6 +4574,10 @@ class RegistrationRequest(BaseModel):
     # key, and a second, fuller run of the same cohort has a different folder
     # and the same key.
     dataset_id: str | None = None
+    # Which Knowledge Bank to write into. Defaults to production, so a client
+    # that does not know about this field cannot land a cohort in the wrong
+    # database by omission.
+    kb_target: str = KB_PRODUCTION
     scope: str = "full"
     slide_names: list[str] | None = None
     # Opens every slide file, so it is opt-in for the same reason as the CLI
@@ -4517,7 +4667,7 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
     row = _get_dataset_run_row(submission_id)
     try:
         plan, dataset_id, raw_dir = _registration_plan(row, req)
-        report = _registration_preview(_get_engine(), plan, dataset_id)
+        report = _registration_preview(_get_engine(req.kb_target), plan, dataset_id)
     except SystemExit as e:
         raise HTTPException(400, str(e))
 
@@ -4525,6 +4675,8 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
     occupied = {t: v["rows"] for t, v in report["existing"].items() if v["rows"]}
     report.update({
         "submission_id": submission_id,
+        "kb_target": _resolve_kb_target(req.kb_target),
+        "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
         "raw_dir": str(raw_dir) if raw_dir else None,
         "missing_tables": [t for t, v in report["existing"].items() if v.get("missing")],
         # The two states the UI has to gate its button on, computed here so the
@@ -4553,7 +4705,8 @@ def commit_registration(submission_id: str, req: RegistrationRequest):
     row = _get_dataset_run_row(submission_id)
     try:
         plan, dataset_id, raw_dir = _registration_plan(row, req)
-        written = _registration_commit(_get_engine(), plan, dataset_id, req.replace)
+        written = _registration_commit(_get_engine(req.kb_target), plan, dataset_id,
+                                       req.replace)
     except SystemExit as e:
         # register_dataset.py refuses by raising SystemExit with the reason.
         # 400 rather than 500: every one of those is a decision for the
@@ -4567,6 +4720,10 @@ def commit_registration(submission_id: str, req: RegistrationRequest):
         registration_dataset_id=dataset_id,
         registration_raw_dir=str(raw_dir) if raw_dir else None,
         registration_rows=json.dumps(written),
+        # Run tracking stays in production for every stage, by design. That
+        # makes "registration_done" ambiguous on its own — it does not say
+        # which Knowledge Bank the rows went into — so record the target.
+        registration_kb_target=_resolve_kb_target(req.kb_target),
     )
 
     # wsi_registry is cached in memory at startup, so a slide registered now is
@@ -4574,11 +4731,13 @@ def commit_registration(submission_id: str, req: RegistrationRequest):
     # the user to restart the server: _load_wsi_map() is one query and this is
     # the only place that invalidates it outside the upload path.
     if written.get("wsi_registry"):
-        _load_wsi_map()
+        _load_wsi_map(req.kb_target)
 
     return {
         "submission_id": submission_id,
         "dataset_id": dataset_id,
+        "kb_target": _resolve_kb_target(req.kb_target),
+        "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
         "written": written,
         "slides_without_files": plan["slides_without_files"],
         "ambiguous_slides": plan["ambiguous_slides"],
@@ -5044,6 +5203,9 @@ def dataset_job_status(submission_id: str):
     base["registration_at"] = (row["registration_at"].isoformat()
                                if row.get("registration_at") else None)
     base["registration_dataset_id"] = row.get("registration_dataset_id")
+    # Defaults to production for runs registered before targets existed, which
+    # is what they did.
+    base["registration_kb_target"] = row.get("registration_kb_target") or KB_PRODUCTION
     base["registration_rows"] = row.get("registration_rows")
     # Registration reads tile identity out of the packaged .h5, so it is gated
     # on Stage 2 rather than on Stage 4 — it does not need an assignment, and
@@ -5058,6 +5220,8 @@ def dataset_job_status(submission_id: str):
     base["kb_load_at"] = row["kb_load_at"].isoformat() if row.get("kb_load_at") else None
     base["kb_load_rows"] = row.get("kb_load_rows")
     base["kb_load_reference"] = row.get("kb_load_reference")
+    base["kb_load_kb_target"] = row.get("kb_load_kb_target") or KB_PRODUCTION
+    base["kb_targets"] = sorted(KB_TARGETS)
 
     if not row["job_id"] or not row["manifest_path"]:
         return base
@@ -5173,8 +5337,8 @@ def dataset_job_status(submission_id: str):
 
 
 @app.get("/slide/{slide_id}/info")
-def slide_info(slide_id: str):
-    slide = _open_slide(slide_id)
+def slide_info(slide_id: str, kb_target: str = Depends(kb_target_param)):
+    slide = _open_slide(slide_id, kb_target)
     dims = slide.level_dimensions
     return {
         "slide_id": slide_id.upper(),
@@ -5192,8 +5356,8 @@ def slide_info(slide_id: str):
 
 
 @app.get("/dzi/{slide_id}.dzi")
-def dzi_metadata(slide_id: str):
-    dz = _get_deepzoom(slide_id)
+def dzi_metadata(slide_id: str, kb_target: str = Depends(kb_target_param)):
+    dz = _get_deepzoom(slide_id, kb_target)
     dzi_xml = dz.get_dzi("jpeg")
 
     return StreamingResponse(
@@ -5209,8 +5373,9 @@ def dzi_tile(
     col: int,
     row: int,
     quality: int = Query(90, ge=10, le=100),
+    kb_target: str = Depends(kb_target_param),
 ):
-    dz = _get_deepzoom(slide_id)
+    dz = _get_deepzoom(slide_id, kb_target)
 
     try:
         tile = dz.get_tile(level, (col, row)).convert("RGB")
@@ -5227,18 +5392,20 @@ def slide_thumbnail(
     slide_id: str,
     max_width: int = Query(3000, ge=100, le=8000),
     quality: int = Query(85, ge=10, le=100),
+    kb_target: str = Depends(kb_target_param),
 ):
     slide_id = slide_id.strip().upper()
-    cached = cache.get(slide_id, kind="thumbnail", level=None, x=None, y=None,
+    ckey = _cache_key(slide_id, kb_target)
+    cached = cache.get(ckey, kind="thumbnail", level=None, x=None, y=None,
                        width=max_width, height=None)
     if cached:
         return _jpeg_response(_img_to_jpeg_bytes(cached, quality))
 
-    slide = _open_slide(slide_id)
+    slide = _open_slide(slide_id, kb_target)
     w0, h0 = slide.level_dimensions[0]
     thumb_height = int(h0 * (max_width / w0))
     thumb = slide.get_thumbnail((max_width, thumb_height)).convert("RGB")
-    cache.put(thumb, slide_id, quality=quality, kind="thumbnail", level=None,
+    cache.put(thumb, ckey, quality=quality, kind="thumbnail", level=None,
               x=None, y=None, width=max_width, height=None)
     return _jpeg_response(_img_to_jpeg_bytes(thumb, quality))
 
@@ -5252,14 +5419,16 @@ def slide_tile(
     w: int = Query(256, ge=64, le=2048),
     h: int = Query(256, ge=64, le=2048),
     quality: int = Query(85, ge=10, le=100),
+    kb_target: str = Depends(kb_target_param),
 ):
     """Read a tile at (x, y) in *level* coordinates, return JPEG."""
     slide_id = slide_id.strip().upper()
-    cached = cache.get(slide_id, kind="tile", level=level, x=x, y=y, width=w, height=h)
+    ckey = _cache_key(slide_id, kb_target)
+    cached = cache.get(ckey, kind="tile", level=level, x=x, y=y, width=w, height=h)
     if cached:
         return _jpeg_response(_img_to_jpeg_bytes(cached, quality))
 
-    slide = _open_slide(slide_id)
+    slide = _open_slide(slide_id, kb_target)
     if level >= slide.level_count:
         raise HTTPException(400, f"Level {level} out of range (max {slide.level_count - 1})")
 
@@ -5267,7 +5436,7 @@ def slide_tile(
     origin_x = int(x * ds)
     origin_y = int(y * ds)
     region = slide.read_region((origin_x, origin_y), level, (w, h)).convert("RGB")
-    cache.put(region, slide_id, quality=quality, kind="tile", level=level,
+    cache.put(region, ckey, quality=quality, kind="tile", level=level,
               x=x, y=y, width=w, height=h)
     return _jpeg_response(_img_to_jpeg_bytes(region, quality))
 
@@ -5281,10 +5450,12 @@ def slide_region(
     h: int = Query(TILE_SIZE_NATIVE),
     level: int = Query(0, ge=0),
     quality: int = Query(85),
+    kb_target: str = Depends(kb_target_param),
 ):
     """Read an arbitrary region in native (level-0) coordinates."""
     slide_id = slide_id.strip().upper()
-    cached = cache.get(slide_id, kind="region", level=level, x=x, y=y, width=w, height=h)
+    ckey = _cache_key(slide_id, kb_target)
+    cached = cache.get(ckey, kind="region", level=level, x=x, y=y, width=w, height=h)
     if cached:
         return _jpeg_response(_img_to_jpeg_bytes(cached, quality))
 
@@ -5293,16 +5464,16 @@ def slide_region(
     read_w = int(w / ds)
     read_h = int(h / ds)
     region = slide.read_region((x, y), level, (read_w, read_h)).convert("RGB")
-    cache.put(region, slide_id, quality=quality, kind="region", level=level,
+    cache.put(region, ckey, quality=quality, kind="region", level=level,
               x=x, y=y, width=w, height=h)
     return _jpeg_response(_img_to_jpeg_bytes(region, quality))
 
 
 @app.get("/slide/{slide_id}/tiles_meta")
-def slide_tiles_meta(slide_id: str):
+def slide_tiles_meta(slide_id: str, kb_target: str = Depends(kb_target_param)):
     """Return tile coordinates + HPC labels + heatmap probs for a slide (JSON)."""
     slide_id = slide_id.strip().upper()
-    eng = _get_engine()
+    eng = _get_engine(kb_target)
     q = text("""
         SELECT
             tc.slide_tile, tc.slides, tc.tiles,
@@ -5323,9 +5494,12 @@ def slide_tiles_meta(slide_id: str):
     if "slide_tile" in df.columns:
         df["slide_tile"] = df["slide_tile"].astype(str).str.strip().str.upper()
 
-    # Merge heatmap probs
-    if _heatmap_probs is not None and "slide_tile" in df.columns:
-        df = df.merge(_heatmap_probs, on="slide_tile", how="left")
+    # Merge heatmap probs — this target's, not the process's. Merging
+    # production's numbers into a test cohort's tiles would render an overlay
+    # for tiles they were never computed for.
+    probs = _get_heatmap_probs(kb_target)
+    if probs is not None and "slide_tile" in df.columns:
+        df = df.merge(probs, on="slide_tile", how="left")
 
     # Replace NaN with None for JSON
     df = df.where(df.notna(), None)
@@ -5333,9 +5507,9 @@ def slide_tiles_meta(slide_id: str):
 
 
 @app.get("/slide/{slide_id}/adjacency")
-def slide_adjacency(slide_id: str):
+def slide_adjacency(slide_id: str, kb_target: str = Depends(kb_target_param)):
     slide_id = slide_id.strip().upper()
-    eng = _get_engine()
+    eng = _get_engine(kb_target)
     q = text("""
         SELECT tc.slide_tile, tc.x_native, tc.y_native, tr.hpc_id
         FROM tile_coordinates tc
@@ -5350,8 +5524,8 @@ def slide_adjacency(slide_id: str):
 
 
 @app.get("/hpc/{hpc_id}/info")
-def hpc_info(hpc_id: int):
-    eng = _get_engine()
+def hpc_info(hpc_id: int, kb_target: str = Depends(kb_target_param)):
+    eng = _get_engine(kb_target)
     with eng.connect() as conn:
         base = conn.execute(
             text("SELECT * FROM hpc_dictionary WHERE hpc_id = :h LIMIT 1"), {"h": str(hpc_id)}
@@ -5373,8 +5547,8 @@ def hpc_info(hpc_id: int):
 
 
 @app.get("/hpc/{hpc_id}/survival")
-def hpc_survival(hpc_id: int):
-    eng = _get_engine()
+def hpc_survival(hpc_id: int, kb_target: str = Depends(kb_target_param)):
+    eng = _get_engine(kb_target)
     with eng.connect() as conn:
         row = conn.execute(
             text("SELECT * FROM hpc_survival_analysis WHERE hpc_id = :h LIMIT 1"),
@@ -5385,22 +5559,48 @@ def hpc_survival(hpc_id: int):
     return dict(row._mapping)
 
 
+# The image dataset's name inside a packaged .h5. Ours is "img"
+# (make_hpl_hdf5.py:631); the legacy TCGA file this endpoint was written
+# against uses "train_img", HPL's own convention. Tried in order rather than
+# hardcoded, because hardcoding either one makes the other cohort 500.
+_H5_IMAGE_DATASETS = ("img", "train_img")
+
+
 @app.get("/tile_image/{slide_tile}")
-def tile_image_by_key(slide_tile: str, quality: int = Query(85)):
-    """Return the H5-backed tile image for a slide_tile key."""
+def tile_image_by_key(slide_tile: str, quality: int = Query(85),
+                      kb_target: str = Depends(kb_target_param)):
+    """Return the H5-backed tile image for a slide_tile key.
+
+    The .h5 comes from the tile's own row, not from the module-level H5_PATH.
+    That constant is one TCGA file, and it was being used for every slide of
+    every cohort — so a Radiogenomics tile did not fail, it rendered whatever
+    TCGA tile happened to sit at the same index. Registration records
+    h5_source_path per tile precisely so this is answerable from the data.
+    """
     slide_tile = slide_tile.strip().upper()
-    eng = _get_engine()
+    eng = _get_engine(kb_target)
     with eng.connect() as conn:
         row = conn.execute(
-            text("SELECT image_index FROM tile_registry WHERE UPPER(slide_tile) = :st LIMIT 1"),
+            text("SELECT image_index, h5_source_path FROM tile_registry "
+                 "WHERE UPPER(slide_tile) = :st LIMIT 1"),
             {"st": slide_tile}
         ).fetchone()
     if not row or row.image_index is None:
         raise HTTPException(404, f"No H5 index for {slide_tile}")
 
     idx = int(row.image_index)
-    f = _get_h5()
-    ds = f["train_img"]
+    # Falls back to H5_PATH only for rows that predate registration — the
+    # hand-loaded TCGA cohort has no h5_source_path of its own.
+    f = _get_h5(row.h5_source_path)
+    ds = None
+    for name in _H5_IMAGE_DATASETS:
+        if name in f:
+            ds = f[name]
+            break
+    if ds is None:
+        raise HTTPException(
+            500, f"{f.filename} has none of {list(_H5_IMAGE_DATASETS)} — "
+                 f"not a packaged tile .h5.")
     if idx < 0 or idx >= ds.shape[0]:
         raise HTTPException(400, f"Index {idx} out of range")
 
@@ -5418,6 +5618,10 @@ def tile_image_by_key(slide_tile: str, quality: int = Query(85)):
 class QueryRequest(BaseModel):
     query: str
     slide_id: Optional[str] = None
+    # Defaults to production for the same reason every other kb_target does:
+    # an older client that does not send it keeps working, and forgetting it
+    # is the harmless case.
+    kb_target: str = KB_PRODUCTION
 
 
 @app.post("/query")
@@ -5435,6 +5639,7 @@ def handle_query(req: QueryRequest):
     result = {
         "plan": plan,
         "slide_id": req.slide_id,
+        "kb_target": _resolve_kb_target(req.kb_target),
         "structured_answer": None,
     }
 

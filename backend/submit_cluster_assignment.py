@@ -63,11 +63,20 @@ ASSIGN_SCRIPT = "assign_hpc_clusters.py"
 # The assignment itself dominates. It is one faiss flat-L2 scan of the reference
 # per query batch, so its cost is (queries x reference rows) and it grows with
 # the dataset: 545,185 TCGA queries against 2.5M reference rows took about an
-# hour, so a 14,000-slide cohort is a different order of magnitude. Two days is
-# not an estimate, it is headroom -- a job that finishes early costs nothing,
-# and one that hits the wall at 95% has to be redone from the start because the
-# assigner has no resume.
-ASSIGN_TIME_LIMIT = "2-00:00:00"
+# hour, so a 14,000-slide cohort is a different order of magnitude -- roughly
+# 11M tiles, which extrapolates to about 20 hours unsharded. Four days is not an
+# estimate, it is headroom -- a job that finishes early costs nothing, and one
+# that hits the wall at 95% has to be redone from the start because the assigner
+# has no resume. Sharding divides this: N shards each do 1/N of the work, so the
+# same limit covers a proportionally worse-than-expected run.
+#
+# Check it fits before raising it further. Nothing here verifies the walltime
+# against the partition's MaxTime, despite what --time-limit's help used to
+# claim; sbatch either rejects the job outright or -- with EnforcePartLimits=NO,
+# which is the more confusing case -- accepts it and leaves it pending forever
+# with reason PartitionTimeLimit. Neither is silent, but the second is easy to
+# read as a busy queue. `sinfo -o "%P %l"` is the check.
+ASSIGN_TIME_LIMIT = "4-00:00:00"
 # One full pass over the projections .h5 to compute the shared query mean. Same
 # I/O as the assignment without the search, so much cheaper -- but it scales with
 # the same input, which is why it is no longer 2 hours.
@@ -856,9 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Slurm walltime for the assignment job. Default "
                              f"{ASSIGN_TIME_LIMIT}. The assigner has no resume, "
                              f"so hitting the wall means redoing the whole run — "
-                             f"prefer headroom. Refused if the partition's MaxTime "
-                             f"is lower, so check `sinfo -o \"%P %l\"` before "
-                             f"raising it.")
+                             f"prefer headroom. Not checked against the partition's "
+                             f"MaxTime here: sbatch rejects it, or leaves the job "
+                             f"pending with reason PartitionTimeLimit. Check with "
+                             f"`sinfo -o \"%P %l\"` before raising it.")
     parser.add_argument("--mean-time-limit", type=str, default=MEAN_TIME_LIMIT,
                         help=f"Walltime for the shared query-mean job, submitted "
                              f"only when sharding with --centering query. Default "

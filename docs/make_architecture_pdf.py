@@ -836,10 +836,12 @@ def story():
          "0.252 mpp. <font face='Courier'>dataset_config</font> and "
          "<font face='Courier'>wsi_metadata</font> now carry the real numbers per cohort; "
          "using them is a separate change with real risk to the viewer."],
-        ["No end-to-end run has exercised Stage 5 against real Postgres",
-         "Registration is covered by 26 tests against SQLite and the guards are the same "
-         "functions the CLI runs, but the first real cohort should be previewed before "
-         "it is committed."],
+        ["No cohort has been registered against the <i>live</i> database",
+         "The path was verified end to end against a local PostgreSQL 16.2 — empty database, "
+         "migrate, register, load — which found two bugs SQLite could not: a fresh schema that "
+         "still would not build, and <font face='Courier'>dataset_id</font> never being set on "
+         "the aggregates although it is NOT NULL there. Both fixed. The live database has real "
+         "slide names and real scale, so preview the first cohort before committing it."],
     ], [CONTENT_W * 0.30, CONTENT_W * 0.70]))
 
     return s

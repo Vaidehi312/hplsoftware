@@ -103,7 +103,9 @@ together** — a stale copy silently installs the wrong set.
 Postgres `hpl_kb`, 26 relations — 17 tables, 1 view, 8 sequences. Column-level definitions are in
 `backend/kb_live_schema_2026-08-26.txt`, transcribed from `\d` against the live database; that capture
 is the only complete record of this schema, and `backend/migrate_kb_base_tables.sql` was written from
-it. **`schema.sql` in the repo root is a stale 2025-10-23 `pg_dump`** that declares
+it. `backend/migrate_all.sql` builds 13 of the 17 tables from an empty database — verified by running
+it against a real PostgreSQL — and stops at the four `hpc_*` reference tables, whose `\d` has never
+been captured. **`schema.sql` in the repo root is a stale 2025-10-23 `pg_dump`** that declares
 `tile_registry.hpc_id` as `varchar(100)` with an `id` primary key and no `slide_tile`, `dataset_id`, or
 confidence columns. Do not build a database from it.
 

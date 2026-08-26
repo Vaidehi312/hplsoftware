@@ -30,8 +30,8 @@ client method and no UI step, so "automated" was never true of it either.
 **What changed in this session:** registration now covers all five tables in one transaction,
 runs from the UI as pipeline step 5 (both frontends), and the KB load is step 6 and gated on it.
 Stage 6 also refreshes `slide_hpc_membership`, which turned out to have a live reader a grep cannot
-see (§4.1). The eight tables that had no `CREATE TABLE` anywhere in git now have one. 53 new tests,
-391 passing.
+see (§4.1). The eight tables that had no `CREATE TABLE` anywhere in git now have one. 55 new tests, 393 passing, and the whole path verified
+against a real PostgreSQL (§8.1).
 
 **What is still open, and is a modelling problem rather than plumbing:** `tile_hpc_heatmap` — 149 MB,
 71 probability columns, read into memory at server startup, and nothing has ever written it.
@@ -362,8 +362,35 @@ backend/tests/test_register_dataset.py 10 → 26 — slide matching by the same 
                                        the database as NULL
 ```
 
-Not run against a real PostgreSQL — there is none on the machine this was written on. The DDL is
-transcribed and reviewed, not executed. **Preview the first real cohort before committing it.**
+### 8.1 Verified against a real PostgreSQL
+
+Everything above was first written without a database to run it on. It was then executed against a
+real PostgreSQL 16.2 (`pgserver` — a pip-installable server — in a scratchpad, no system install):
+`migrate_all.sql` against an empty database, twice, then registration and the KB load through the
+real modules. Two bugs surfaced that 391 SQLite tests had not.
+
+**1. `migrate_all.sql` still could not build a fresh schema.** `tile_registry`,
+`hpl_profile_summary` and `hpl_profile_proportion` have a `CREATE TABLE` only in `schema.sql`, which
+the chain never runs — and `CREATE INDEX IF NOT EXISTS` still raises when the *table* is absent, so
+the trailing `dataset_id` indexes and `migrate_indexes.sql`'s last two lines stopped the run. Now
+13 of 17 tables from empty, stopping only at §6's four reference tables.
+
+**2. `compute_profiles()` never set `dataset_id`, which is `NOT NULL` on both aggregate tables.**
+The `INSERT` raised `NotNullViolation`, and because `load()` is one transaction the rollback took
+the `tile_registry` update with it. This would have hit the first cohort that got past the 95% match
+gate — that is, the first one that worked.
+
+Why it stayed hidden is the more useful half. No dataset had ever reached that line, *and* every
+SQLite fixture in the suite declares `dataset_id` nullable. **A fixture more permissive than
+production does not hide a risk; it hides a certainty.** The cohort is now resolved from
+`tile_registry`, an unregistered slide is refused by name rather than surfacing as a not-null
+violation from inside a rollback, and the regression test uses a `NOT NULL` fixture.
+
+End-to-end on that database: empty → `migrate_all` → register → load, with correct `hpc_id`,
+aggregates, proportions and membership, and no duplication on a second run.
+
+**Still preview the first real cohort before committing it.** The live database has 26 relations,
+real slide names and real scale, none of which is reproduced here.
 
 ---
 

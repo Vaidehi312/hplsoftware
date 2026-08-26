@@ -1372,24 +1372,55 @@ def _pipeline_steps(status: dict) -> list[dict]:
     else:
         assignment = ("blocked", "waiting on feature extraction")
 
-    # --- 5. Knowledge Bank load --------------------------------------------
+    # --- 5. Registration -----------------------------------------------------
+    # Gated on h5_ready, not on the assignment: registration reads tile
+    # identity out of the packaged .h5 and the raw slides, and needs no cluster
+    # labels at all. Making it wait for Stage 4 would keep Stage 6 blocked
+    # behind a step that could have finished hours earlier.
+    #
+    # This step is new, and everything before it is unchanged, so a run that
+    # completed before it existed shows it as "action" — which is correct.
+    # Those runs did not register; their tiles reached the KB by hand or not at
+    # all.
+    if status.get("registration_done"):
+        rows = status.get("registration_rows") or {}
+        if isinstance(rows, dict) and rows:
+            summary = ", ".join(f"{n:,} {t.replace('_', ' ')}" for t, n in rows.items())
+        else:
+            summary = "registered"
+        registration = ("done", summary[:70])
+    elif status.get("registration_ready"):
+        registration = ("action", "ready to register")
+    else:
+        registration = ("blocked", "waiting on packaging")
+
+    # --- 6. Knowledge Bank load ---------------------------------------------
     # Gated on assignment_ready, not assignment_job_id, for the same reason
     # Stage 4 gates on extraction_ready: this stage reads the CSV Stage 4
     # wrote, so a finished-but-unusable one is not a state it can load from.
+    #
+    # Also gated on registration, and this is the whole point of the step
+    # above: load_hpc_assignments only UPDATEs, so without identity rows its
+    # match rate is 0% and it refuses. Before this, that refusal was the first
+    # sign anything was wrong, and it named a match rate rather than a missing
+    # step.
     if status.get("kb_load_done"):
         rows = status.get("kb_load_rows")
         kb_load = ("done", f"{rows:,} tiles in the KB" if rows is not None else "loaded")
-    elif status.get("assignment_ready"):
-        kb_load = ("action", "ready to load")
-    else:
+    elif not status.get("assignment_ready"):
         kb_load = ("blocked", "waiting on cluster classification")
+    elif not status.get("registration_done"):
+        kb_load = ("blocked", "waiting on registration")
+    else:
+        kb_load = ("action", "ready to load")
 
     return [
         {"key": "tiling", "title": "1. Tiling", "state": tiling[0], "summary": tiling[1]},
         {"key": "packaging", "title": "2. Packaging (.h5)", "state": packaging[0], "summary": packaging[1]},
         {"key": "extraction", "title": "3. Feature extraction", "state": extraction[0], "summary": extraction[1]},
         {"key": "assignment", "title": "4. Cluster classification", "state": assignment[0], "summary": assignment[1]},
-        {"key": "kb_load", "title": "5. Knowledge Bank load", "state": kb_load[0], "summary": kb_load[1]},
+        {"key": "registration", "title": "5. Register in the Knowledge Bank", "state": registration[0], "summary": registration[1]},
+        {"key": "kb_load", "title": "6. Knowledge Bank load", "state": kb_load[0], "summary": kb_load[1]},
     ]
 
 
@@ -2692,8 +2723,181 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
         st.error(f"Failed to start cluster assignment: {e}")
 
 
+def _render_registration_step(status: dict, submission_id: str, key_prefix: str, state: str):
+    """Stage 5: create this cohort's identity rows in the Knowledge Bank.
+
+    This step exists because Stage 6 could not work without it and said so only
+    obliquely. load_hpc_assignments.py exclusively UPDATEs tile_registry, so a
+    cohort that has never been in the KB has nothing to update and the load
+    refuses at a 0% match rate — a number that reads like a naming bug and is
+    in fact a missing step.
+
+    Same preview-then-commit shape as Stage 6, and for the same reason: it
+    writes to the shared Knowledge Bank, and its failure mode is a registration
+    that succeeds against the wrong cohort.
+    """
+    if status.get("registration_done"):
+        rows = status.get("registration_rows") or {}
+        dataset_id = status.get("registration_dataset_id")
+        st.success(
+            "Registered in the Knowledge Bank"
+            + (f" as `{dataset_id}`" if dataset_id else "")
+        )
+        if isinstance(rows, dict) and rows:
+            st.caption(" · ".join(f"{t}: {n:,}" for t, n in rows.items()))
+        if status.get("registration_at"):
+            st.caption(f"Last registered: {status['registration_at']}")
+
+    if state == "blocked":
+        st.info(
+            "Registration reads tile identity out of the packaged .h5, so it "
+            "needs Stage 2 to have finished. It does not need Stages 3 or 4 — "
+            "as soon as the .h5 is ready this can run, and Stage 6 will be "
+            "waiting only on the assignment."
+        )
+        return
+
+    default_id = (status.get("registration_dataset_id")
+                  or (status.get("dataset_name") or "").upper())
+    dataset_id = st.text_input(
+        "Knowledge Bank cohort (dataset_id)",
+        value=default_id,
+        key=f"{key_prefix}reg_dataset_id_{submission_id}",
+        help="Every row this writes is scoped to this key, and a --replace only "
+             "ever touches its own. It defaults to the run's dataset_name but is "
+             "a different thing: dataset_name is the folder of slides on scratch, "
+             "this is the cohort the KB groups by. A second, fuller run of the "
+             "same cohort has a different folder and the same key.",
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        slide_metadata = st.checkbox(
+            "Also read slide headers (wsi_metadata)",
+            value=False,
+            key=f"{key_prefix}reg_slide_meta_{submission_id}",
+            help="Opens every slide file to record mpp, objective power and level "
+                 "dimensions. Minutes, not seconds, on a large cohort. Nothing "
+                 "reads wsi_metadata today — it is where the numbers would live "
+                 "that let the viewer stop assuming every cohort was scanned at "
+                 "0.252 mpp.",
+        )
+    with col_b:
+        write_dataset_config = st.checkbox(
+            "Write dataset_config",
+            value=True,
+            key=f"{key_prefix}reg_dataset_config_{submission_id}",
+            help="Records this cohort's target_mpp and tile size from the run's own "
+                 "tiling_params. Skipped automatically for a run that predates that "
+                 "column, since the alternative is asserting a geometry nobody "
+                 "recorded.",
+        )
+
+    replace = st.checkbox(
+        "Replace this cohort's existing rows",
+        value=False,
+        key=f"{key_prefix}reg_replace_{submission_id}",
+        help="Required to re-register a dataset_id that already has rows. Only ever "
+             "deletes WHERE dataset_id = the key above; a tile or slide claimed by a "
+             "different cohort is refused outright, not reassigned.",
+    )
+
+    preview_key = f"{key_prefix}reg_preview_{submission_id}"
+    if st.button("Preview registration",
+                 key=f"{key_prefix}reg_preview_btn_{submission_id}"):
+        if not dataset_id.strip():
+            st.error("Enter a dataset_id — every row written is scoped to it.")
+        else:
+            try:
+                st.session_state[preview_key] = client.preview_registration(
+                    submission_id, dataset_id=dataset_id.strip(),
+                    slide_metadata=slide_metadata,
+                    write_dataset_config=write_dataset_config,
+                    replace=replace,
+                )
+            except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
+                st.session_state.pop(preview_key, None)
+                st.error(f"Preview failed: {e}")
+
+    report = st.session_state.get(preview_key)
+    if not report:
+        st.caption("Preview first — this writes to the shared Knowledge Bank, so "
+                   "it never commits without showing you the numbers.")
+        return
+
+    cols = st.columns(4)
+    cols[0].metric("Slides", f"{report.get('slides', 0):,}")
+    cols[1].metric("Tiles in .h5", f"{report.get('tiles_in_h5', 0):,}")
+    cols[2].metric("With coordinates", f"{report.get('tiles_with_coordinates', 0):,}")
+    cols[3].metric("Slides registered", f"{report.get('slides_registered', 0):,}")
+
+    if not report.get("slides_registered"):
+        st.warning(
+            "No wsi_registry rows would be written — the run's raw slide "
+            "directory could not be read. The tiles would register and Stage 6 "
+            "would load, and the viewer would still 404 on every slide in this "
+            "cohort, because it resolves slide paths from wsi_registry alone."
+        )
+
+    for field, label in (
+        ("ambiguous_slides", "slide id(s) match more than one file — neither is registered"),
+        ("slides_without_files", "slide(s) have no raw file; their tiles register, the slide will not open"),
+        ("unreadable_slides", "slide(s) could not be opened for metadata"),
+        ("conflicting_samples", "slide(s) carry more than one sample_id in the .h5"),
+        ("missing_slides", "slide(s) have no usable Stage 1 metadata; no coordinates for their tiles"),
+    ):
+        items = report.get(field) or []
+        if items:
+            with st.expander(f"⚠️ {len(items):,} {label}", expanded=False):
+                for item in items[:200]:
+                    st.text(item)
+                if len(items) > 200:
+                    st.caption(f"...and {len(items) - 200:,} more")
+
+    if report.get("missing_tables"):
+        st.error(
+            f"This database has no {', '.join(report['missing_tables'])}. Run "
+            f"`psql ... -f backend/migrate_kb_base_tables.sql` first — eight of "
+            f"the Knowledge Bank's tables had no CREATE TABLE in git until that "
+            f"file existed."
+        )
+    if report.get("would_refuse_collision"):
+        st.error(
+            "Refusing: some of these tiles or slides already belong to a "
+            "different dataset_id. Two cohorts cannot claim the same tile, and "
+            "overwriting would repoint the viewer at another cohort's files. "
+            "This needs investigating, not overwriting."
+        )
+    if report.get("needs_replace"):
+        st.warning(
+            "This dataset_id already has rows. Tick “Replace this cohort's "
+            "existing rows” and preview again to overwrite them."
+        )
+
+    blocked = bool(report.get("would_refuse_collision")
+                   or report.get("needs_replace")
+                   or report.get("missing_tables"))
+    if st.button("Register in the Knowledge Bank",
+                 key=f"{key_prefix}reg_commit_btn_{submission_id}",
+                 type="primary", disabled=blocked):
+        try:
+            result = client.commit_registration(
+                submission_id, dataset_id=dataset_id.strip(),
+                slide_metadata=slide_metadata,
+                write_dataset_config=write_dataset_config,
+                replace=replace,
+            )
+            written = result.get("written") or {}
+            st.success("Registered: " + ", ".join(
+                f"{t} +{n:,}" for t, n in written.items()))
+            st.session_state.pop(preview_key, None)
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Registration refused: {e}")
+
+
 def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, state: str):
-    """Stage 5: load this run's cluster-assignment CSV into the Knowledge Bank.
+    """Stage 6: load this run's cluster-assignment CSV into the Knowledge Bank.
 
     Mirrors load_hpc_assignments.py's own shape — a dry-run preview, then an
     explicit commit — rather than a single button. This is the one stage that
@@ -2914,6 +3118,7 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
         "packaging": lambda s: _render_packaging_step(status, submission_id, key_prefix, s["state"]),
         "extraction": lambda s: _render_extraction_step(status, submission_id, key_prefix, s["state"]),
         "assignment": lambda s: _render_assignment_step(status, submission_id, key_prefix, s["state"]),
+        "registration": lambda s: _render_registration_step(status, submission_id, key_prefix, s["state"]),
         "kb_load": lambda s: _render_kb_load_step(status, submission_id, key_prefix, s["state"]),
     }
     for step in steps:

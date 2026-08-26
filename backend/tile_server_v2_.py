@@ -103,6 +103,15 @@ from load_hpc_assignments import (
     _MIN_MATCH_RATE as _KB_MIN_MATCH_RATE,
 )
 
+# Registration — the step that creates the identity rows Stage 5 UPDATEs.
+# Imported, not reimplemented, for the same reason as the Stage 5 functions
+# above: one implementation of what makes a write to the shared KB safe.
+from register_dataset import (
+    build_registration as _build_registration,
+    preview as _registration_preview,
+    commit as _registration_commit,
+)
+
 # Columns assign_hpc_clusters.py writes. The cluster column itself is named
 # after the reference's groupby (e.g. 'leiden_2.5'), so it is matched by
 # elimination rather than by name — hardcoding a name here would break the
@@ -4403,6 +4412,158 @@ def commit_kb_load(submission_id: str, req: KbLoadRequest):
     }
 
 
+# --- Registration: the identity rows Stage 5 needs to exist -----------------
+#
+# Every argument register_dataset.py takes is already recorded on the run —
+# h5_output_path, tile_dir, dataset_name, raw_dir, tiling_params — so these
+# endpoints derive them rather than asking the UI to retype paths that the
+# server already knows and could be typed wrong. dataset_id is the exception:
+# it is the KB cohort key, it outlives the run, and a re-run under a new
+# submission must be able to target the same cohort.
+
+
+class RegistrationRequest(BaseModel):
+    # Defaults to the run's own dataset_name, upper-cased, but stays settable:
+    # dataset_name is a folder on scratch and dataset_id is the KB's cohort
+    # key, and a second, fuller run of the same cohort has a different folder
+    # and the same key.
+    dataset_id: str | None = None
+    # Opens every slide file, so it is opt-in for the same reason as the CLI
+    # flag: 14,044 headers is minutes, not seconds.
+    slide_metadata: bool = False
+    # Written only when both are present, matching the CLI. Defaults come from
+    # the run's recorded tiling_params, which is where the numbers actually
+    # used live — not from the server's module constants, which assume one
+    # geometry for every cohort (see TILE_SIZE_5X / SCALE).
+    write_dataset_config: bool = True
+    replace: bool = False
+
+
+def _registration_plan(row, req: "RegistrationRequest"):
+    """Build register_dataset.py's plan from what the run already recorded."""
+    packaged = row.get("h5_output_path")
+    if not packaged:
+        raise HTTPException(400, "This run has no packaged .h5 yet — registration "
+                                 "reads tile identity out of it. Finish Stage 2 first.")
+    h5_path = Path(packaged)
+    if not h5_path.is_file():
+        raise HTTPException(400, f"The recorded .h5 is not on disk: {h5_path}")
+
+    tile_dir = Path(row.get("tile_dir") or PROCESSED_TILES_DIR)
+    dataset_name = row.get("dataset_name")
+    if not dataset_name:
+        raise HTTPException(400, "This run predates the dataset_name column, so the "
+                                 "folder its tiles live under cannot be determined. "
+                                 "Register it with the CLI instead.")
+
+    raw_dir = Path(row["raw_dir"]) if row.get("raw_dir") else None
+    if raw_dir is not None and not raw_dir.is_dir():
+        # Reported rather than fatal: the tile tables are still registerable,
+        # and saying so is more useful than refusing everything because the
+        # slides have been moved off scratch.
+        raw_dir = None
+
+    dataset_id = (req.dataset_id or dataset_name).strip().upper()
+
+    target_mpp = tile_px = None
+    if req.write_dataset_config:
+        params = _row_tiling_params(row) or {}
+        target_mpp = params.get("target_mpp")
+        tile_px = params.get("target_tile_px")
+
+    plan = _build_registration(
+        h5_path, tile_dir, dataset_name, str(h5_path), dataset_id,
+        raw_dir=raw_dir,
+        slide_metadata=req.slide_metadata,
+        target_mpp=target_mpp,
+        tile_size_5x_px=tile_px,
+    )
+    return plan, dataset_id, raw_dir
+
+
+@app.post("/dataset-jobs/{submission_id}/register-preview")
+def preview_registration(submission_id: str, req: RegistrationRequest):
+    """What registering this run would write, without writing it.
+
+    Same preview-then-commit shape as Stage 5, and for the same reason: this
+    writes to the shared Knowledge Bank, and the failure it guards against is
+    a registration that succeeds against the wrong cohort.
+    """
+    row = _get_dataset_run_row(submission_id)
+    try:
+        plan, dataset_id, raw_dir = _registration_plan(row, req)
+        report = _registration_preview(_get_engine(), plan, dataset_id)
+    except SystemExit as e:
+        raise HTTPException(400, str(e))
+
+    collisions = sum(report["foreign_collisions"].values())
+    occupied = {t: v["rows"] for t, v in report["existing"].items() if v["rows"]}
+    report.update({
+        "submission_id": submission_id,
+        "raw_dir": str(raw_dir) if raw_dir else None,
+        "missing_tables": [t for t, v in report["existing"].items() if v.get("missing")],
+        # The two states the UI has to gate its button on, computed here so the
+        # rule lives next to the guard that enforces it rather than being
+        # reimplemented in two frontends.
+        "would_refuse_collision": bool(collisions),
+        "needs_replace": bool(occupied) and not req.replace,
+        "already_registered": bool(row.get("registration_done")),
+        "registration_at": (row["registration_at"].isoformat()
+                            if row.get("registration_at") else None),
+    })
+    return report
+
+
+@app.post("/dataset-jobs/{submission_id}/register")
+def commit_registration(submission_id: str, req: RegistrationRequest):
+    """Create this dataset's identity rows in the Knowledge Bank.
+
+    register_dataset.py's --commit path, called in-process rather than
+    reimplemented, for the reason commit_kb_load gives: the guards that make a
+    write to the shared KB safe should have one implementation, not a strict
+    one for the terminal and a looser one for the UI. Every refusal here —
+    a cohort collision, an existing registration without replace, a base table
+    the database does not have — is raised by the same function the CLI runs.
+    """
+    row = _get_dataset_run_row(submission_id)
+    try:
+        plan, dataset_id, raw_dir = _registration_plan(row, req)
+        written = _registration_commit(_get_engine(), plan, dataset_id, req.replace)
+    except SystemExit as e:
+        # register_dataset.py refuses by raising SystemExit with the reason.
+        # 400 rather than 500: every one of those is a decision for the
+        # operator, not a server fault.
+        raise HTTPException(400, str(e))
+
+    _update_dataset_run(
+        submission_id,
+        registration_done=True,
+        registration_at=datetime.now(timezone.utc),
+        registration_dataset_id=dataset_id,
+        registration_raw_dir=str(raw_dir) if raw_dir else None,
+        registration_rows=json.dumps(written),
+    )
+
+    # wsi_registry is cached in memory at startup, so a slide registered now is
+    # not openable until the map is rebuilt. Doing it here rather than telling
+    # the user to restart the server: _load_wsi_map() is one query and this is
+    # the only place that invalidates it outside the upload path.
+    if written.get("wsi_registry"):
+        _load_wsi_map()
+
+    return {
+        "submission_id": submission_id,
+        "dataset_id": dataset_id,
+        "written": written,
+        "slides_without_files": plan["slides_without_files"],
+        "ambiguous_slides": plan["ambiguous_slides"],
+        "unreadable_slides": plan["unreadable_slides"],
+        "conflicting_samples": plan["conflicting_samples"],
+        "missing_slides": plan["missing_slides"],
+        "unmatched_tiles": len(plan["unmatched_tiles"]),
+    }
+
+
 @app.post("/dataset-jobs/{submission_id}/cancel")
 def cancel_dataset_job(submission_id: str):
     """Cancel every Slurm job (all tiling batches + the packaging job, if
@@ -4849,6 +5010,21 @@ def dataset_job_status(submission_id: str):
         base["assignment_vote"] = row.get("assignment_vote")
         if not base["assignment_ready"] and asg_path and asg_path.is_file():
             base["assignment_invalid_reason"] = _validate_assignment_output(asg_path)[1] or None
+
+    # Registration. Like Stage 5, in-process and all-or-nothing, so a single
+    # boolean is the whole state (see migrate_dataset_runs_registration.sql).
+    # .get throughout: a deployment that has not applied that migration reports
+    # None and the UI shows the step as never run, rather than 500-ing.
+    base["registration_done"] = bool(row.get("registration_done"))
+    base["registration_at"] = (row["registration_at"].isoformat()
+                               if row.get("registration_at") else None)
+    base["registration_dataset_id"] = row.get("registration_dataset_id")
+    base["registration_rows"] = row.get("registration_rows")
+    # Registration reads tile identity out of the packaged .h5, so it is gated
+    # on Stage 2 rather than on Stage 4 — it does not need an assignment, and
+    # making it wait for one would keep Stage 5 blocked behind a step it could
+    # have finished hours earlier.
+    base["registration_ready"] = bool(base.get("h5_ready"))
 
     # Stage 5. No job_id/slurm_state pair here — the load runs in-process and
     # either commits in one transaction or doesn't, so kb_load_done is the

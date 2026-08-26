@@ -475,6 +475,57 @@ class TileServerClient:
             },
         )
 
+    def preview_registration(self, submission_id: str,
+                             dataset_id: str | None = None,
+                             slide_metadata: bool = False,
+                             write_dataset_config: bool = True,
+                             replace: bool = False) -> dict:
+        """Dry run of the registration step: what identity rows creating this
+        cohort would write, without writing them.
+
+        Registration is what makes Stage 5 possible at all. Stage 5 only ever
+        UPDATEs tile_registry.hpc_id, so for a cohort that has never touched
+        the KB its match rate is 0% by construction — there is nothing to
+        update. This creates wsi_registry, wsi_metadata, dataset_config,
+        tile_coordinates and tile_registry from what Stages 1–2 wrote to disk.
+
+        Every path it needs is already on the run record, so nothing but the
+        cohort key is passed: dataset_id defaults to the run's own
+        dataset_name, upper-cased."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/register-preview",
+            {
+                "dataset_id": dataset_id,
+                "slide_metadata": slide_metadata,
+                "write_dataset_config": write_dataset_config,
+                "replace": replace,
+            },
+        )
+
+    def commit_registration(self, submission_id: str,
+                            dataset_id: str | None = None,
+                            slide_metadata: bool = False,
+                            write_dataset_config: bool = True,
+                            replace: bool = False) -> dict:
+        """User-triggered: create this cohort's identity rows in the KB, in one
+        transaction, after the same guards register_dataset.py --commit
+        enforces on the CLI — a slide or tile already claimed by a different
+        dataset_id is refused rather than reassigned, and an existing
+        registration needs replace=True.
+
+        slide_metadata additionally reads each slide's OpenSlide header into
+        wsi_metadata. It opens every file, so it costs minutes on a large
+        cohort and is off by default."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/register",
+            {
+                "dataset_id": dataset_id,
+                "slide_metadata": slide_metadata,
+                "write_dataset_config": write_dataset_config,
+                "replace": replace,
+            },
+        )
+
     def start_test_packaging(
         self,
         submission_id: str,

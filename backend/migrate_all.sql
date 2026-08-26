@@ -64,6 +64,9 @@
 \ir migrate_dataset_runs_assignment.sql
 \ir migrate_dataset_runs_kb_load.sql
 \ir migrate_dataset_runs_assignment_vote.sql
+-- Registration creates the identity rows Stage 5's UPDATE needs, so it is
+-- tracked next to Stage 5 even though it runs before it.
+\ir migrate_dataset_runs_registration.sql
 
 \echo '== slide processing status =='
 \ir migrate_processing_status.sql

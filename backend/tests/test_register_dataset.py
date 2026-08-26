@@ -11,6 +11,7 @@ shouldn't.
 
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import h5py
@@ -76,7 +77,31 @@ def _kb_engine(tmp_path: Path, with_dataset_id_column=True):
                 slide_tile TEXT PRIMARY KEY, slides TEXT, tiles TEXT,
                 col INTEGER, row INTEGER, x_5x INTEGER, y_5x INTEGER,
                 x_native INTEGER, y_native INTEGER, h5_index INTEGER, {dsid})"""))
+        conn.execute(text(f"""
+            CREATE TABLE wsi_registry (
+                slide_id TEXT PRIMARY KEY, sample_id TEXT, file_uuid TEXT,
+                filename TEXT, hpc_path TEXT, file_size_bytes BIGINT,
+                mtime_utc TIMESTAMP, added_at TIMESTAMP, {dsid})"""))
+        conn.execute(text(f"""
+            CREATE TABLE wsi_metadata (
+                slide_id TEXT PRIMARY KEY, sample_id TEXT, level_count INTEGER,
+                level_dimensions_json TEXT, level_downsamples_json TEXT,
+                mpp_x REAL, mpp_y REAL, objective_power REAL, vendor TEXT,
+                scanner_model TEXT, scanner_date TIMESTAMP, tile_width INTEGER,
+                tile_height INTEGER, quickhash TEXT, {dsid})"""))
+        conn.execute(text(f"""
+            CREATE TABLE dataset_config (
+                dataset_id TEXT PRIMARY KEY, target_mpp REAL,
+                tile_size_5x_px INTEGER)"""))
     return engine
+
+
+def _write_raw_slides(raw_dir: Path, names):
+    """Files OpenSlide would accept, with real bytes so st_size is meaningful."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (raw_dir / name).write_bytes(b"not really a slide, but a real file")
+    return raw_dir
 
 
 def test_image_index_is_the_h5_row_position_not_csv_order(tmp_path):
@@ -332,6 +357,319 @@ def test_registration_takes_stage5_from_zero_percent_to_full_match(tmp_path):
     assert after["matched"] == 3, after
     assert after["unmatched"] == 0
     assert after["matched"] / after["rows"] >= loader._MIN_MATCH_RATE
+
+
+# --- slide identity: wsi_registry, wsi_metadata, dataset_config ----------
+#
+# These exist because registering tiles without registering slides passes every
+# check the pipeline has and still leaves the cohort invisible: _open_slide()
+# in tile_server_v2_.py resolves paths from wsi_registry alone. Before this,
+# the only INSERT into wsi_registry was the interactive single-slide upload
+# path, so no bulk Slurm run had ever registered a slide.
+
+
+def test_slides_are_matched_to_raw_files_by_the_same_rule_stage1_used(tmp_path):
+    """slide_id_from_raw_path() is what tile_mask.py derived Stage 1's names
+    with, so a GDC file "{barcode}.{uuid}.svs" must be found for the barcode
+    the .h5 carries — not only for a file named exactly after it."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "TCGA-55-7574-01Z-00-DX1", "24_10.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "TCGA-55-7574-01Z-00-DX1", [(24, 10)])
+    raw = _write_raw_slides(tmp_path / "raw", [
+        "TCGA-55-7574-01Z-00-DX1.0f1c7e5a-9b2d-4c3e-8a1f-2b3c4d5e6f70.svs",
+    ])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    assert len(plan["wsi_registry"]) == 1
+    row = plan["wsi_registry"].iloc[0]
+    assert row["slide_id"] == "TCGA-55-7574-01Z-00-DX1"
+    assert row["file_uuid"] == "0f1c7e5a-9b2d-4c3e-8a1f-2b3c4d5e6f70"
+    assert row["file_size_bytes"] > 0
+    assert not plan["slides_without_files"]
+
+
+def test_slide_id_is_upper_cased_because_every_reader_looks_it_up_that_way(tmp_path):
+    """_load_wsi_map() and _open_slide() both upper-case before looking up. A
+    row written in the .h5's own casing exists and is never found."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "lower-case-slide", "24_10.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "lower-case-slide", [(24, 10)])
+    raw = _write_raw_slides(tmp_path / "raw", ["lower-case-slide.svs"])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    assert plan["wsi_registry"].iloc[0]["slide_id"] == "LOWER-CASE-SLIDE"
+
+
+def test_a_slide_with_two_candidate_files_is_refused_not_picked(tmp_path):
+    """Two files claiming one slide_id means the viewer would serve whichever
+    happened to sort first. Being wrong about which physical slide a cohort's
+    tiles came from is not a tie to break silently."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "AMBIG", "24_10.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "AMBIG", [(24, 10)])
+    raw = tmp_path / "raw"
+    _write_raw_slides(raw / "batch_a", ["AMBIG.svs"])
+    _write_raw_slides(raw / "batch_b", ["AMBIG.ndpi"])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    assert len(plan["ambiguous_slides"]) == 1
+    assert "AMBIG" in plan["ambiguous_slides"][0]
+    assert plan["wsi_registry"].empty, "an ambiguous slide must not be registered"
+
+
+def test_a_slide_with_no_raw_file_is_reported_and_its_tiles_still_register(tmp_path):
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "HAS-FILE", "1_1.jpeg"), ("S1", "NO-FILE", "2_2.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "HAS-FILE", [(1, 1)])
+    _write_metadata(tile_dir, "Radiogenomics", "NO-FILE", [(2, 2)])
+    raw = _write_raw_slides(tmp_path / "raw", ["HAS-FILE.svs"])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    assert plan["slides_without_files"] == ["NO-FILE"]
+    assert len(plan["wsi_registry"]) == 1
+    assert len(plan["registry"]) == 2, "both slides' tiles still register"
+
+
+def test_non_slide_files_in_the_raw_directory_are_not_registered(tmp_path):
+    """A partially-transferred .svs.part or a stray manifest must not become a
+    wsi_registry row whose path 404s the first time somebody clicks it."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    raw = _write_raw_slides(tmp_path / "raw", ["SLIDE-A.svs.part", "SLIDE-A.csv"])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    assert plan["wsi_registry"].empty
+    assert plan["slides_without_files"] == ["SLIDE-A"]
+
+
+def test_without_raw_dir_nothing_slide_level_is_written(tmp_path):
+    """The pre-existing tiles-only behaviour has to stay reachable unchanged,
+    since re-registering tiles for a cohort whose slides are already in
+    wsi_registry is a real thing to want."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "24_10.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", SLIDE, [(24, 10)])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS")
+    assert plan["wsi_registry"].empty
+    assert plan["wsi_metadata"].empty
+    assert plan["dataset_config"].empty
+
+    engine = _kb_engine(tmp_path)
+    written = rd.commit(engine, plan, "RADIOGENOMICS", replace=False)
+    assert set(written) == {"tile_registry", "tile_coordinates"}
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM wsi_registry")).scalar() == 0
+
+
+def test_dataset_config_is_written_only_when_both_numbers_are_given(tmp_path):
+    """Its two columns are NOT NULL, and a row asserting the wrong tiling
+    geometry is worse than no row — every coordinate conversion downstream
+    would trust it."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "24_10.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", SLIDE, [(24, 10)])
+
+    without = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                    str(h5_path), "RADIOGENOMICS", target_mpp=1.8)
+    assert without["dataset_config"].empty, "one number alone must write nothing"
+
+    with_both = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                      str(h5_path), "RADIOGENOMICS",
+                                      target_mpp=1.8, tile_size_5x_px=224)
+    assert len(with_both["dataset_config"]) == 1
+    row = with_both["dataset_config"].iloc[0]
+    assert row["target_mpp"] == 1.8 and row["tile_size_5x_px"] == 224
+
+
+def test_slide_id_collision_across_datasets_is_refused(tmp_path):
+    """Sharper than the tile-level collision: slide_id is wsi_registry's whole
+    primary key, so overwriting one repoints the viewer at another cohort's
+    file while every tile row still says otherwise."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SHARED-SLIDE", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SHARED-SLIDE", [(1, 1)])
+    raw = _write_raw_slides(tmp_path / "raw", ["SHARED-SLIDE.svs"])
+
+    engine = _kb_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO wsi_registry (slide_id, hpc_path, dataset_id) "
+            "VALUES ('SHARED-SLIDE', '/somewhere/else.svs', 'TCGA_LUAD_5X')"))
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    try:
+        rd.commit(engine, plan, "RADIOGENOMICS", replace=False)
+    except SystemExit as e:
+        assert "DIFFERENT dataset_id" in str(e), str(e)
+    else:
+        raise AssertionError("a slide claimed by another cohort must be refused")
+
+    with engine.connect() as conn:
+        path = conn.execute(text(
+            "SELECT hpc_path FROM wsi_registry WHERE slide_id='SHARED-SLIDE'")).scalar()
+        assert path == "/somewhere/else.svs", "the other cohort's row was modified"
+        assert conn.execute(text("SELECT COUNT(*) FROM tile_registry")).scalar() == 0, \
+            "the refusal must roll the tile writes back too"
+
+
+def test_slide_and_tile_tables_are_written_in_one_transaction(tmp_path):
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg"), ("S1", "SLIDE-A", "2_2.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1), (2, 2)])
+    raw = _write_raw_slides(tmp_path / "raw", ["SLIDE-A.svs"])
+
+    engine = _kb_engine(tmp_path)
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw,
+                                 target_mpp=1.8, tile_size_5x_px=224)
+    written = rd.commit(engine, plan, "RADIOGENOMICS", replace=False)
+    assert written == {"wsi_registry": 1, "dataset_config": 1,
+                       "tile_registry": 2, "tile_coordinates": 2}
+
+    with engine.connect() as conn:
+        for table, expected in (("wsi_registry", 1), ("dataset_config", 1),
+                                ("tile_registry", 2), ("tile_coordinates", 2)):
+            n = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
+            assert n == expected, f"{table} has {n}, expected {expected}"
+
+
+def test_replace_clears_the_slide_tables_too(tmp_path):
+    """A --replace that dropped tiles but left wsi_registry would leave a
+    superseded run's slide paths pointing at files the new run may not use."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    raw = _write_raw_slides(tmp_path / "raw", ["SLIDE-A.svs"])
+    engine = _kb_engine(tmp_path)
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    rd.commit(engine, plan, "RADIOGENOMICS", replace=False)
+
+    try:
+        rd.commit(engine, plan, "RADIOGENOMICS", replace=False)
+    except SystemExit as e:
+        assert "wsi_registry" in str(e), str(e)
+    else:
+        raise AssertionError("a second registration must be refused")
+
+    rd.commit(engine, plan, "RADIOGENOMICS", replace=True)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM wsi_registry")).scalar() == 1, \
+            "--replace must leave exactly one row, not two"
+
+
+def test_a_slide_with_two_sample_ids_is_reported(tmp_path):
+    """samples is per-tile in the .h5 but a slide-level fact. A slide mapped to
+    two sample ids would put half its tiles under the wrong patient."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("SAMPLE-A", "SLIDE-A", "1_1.jpeg"),
+                        ("SAMPLE-B", "SLIDE-A", "2_2.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1), (2, 2)])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS")
+    assert plan["conflicting_samples"] == ["SLIDE-A"]
+
+
+def test_the_conflicting_sample_check_can_fail(tmp_path):
+    """The companion: a slide with one consistent sample must NOT be flagged,
+    or the check above is just always true."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("SAMPLE-A", "SLIDE-A", "1_1.jpeg"),
+                        ("SAMPLE-A", "SLIDE-A", "2_2.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1), (2, 2)])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS")
+    assert plan["conflicting_samples"] == []
+
+
+def test_committing_to_a_database_without_the_base_tables_is_refused(tmp_path):
+    """A database built from schema.sql has no wsi_registry at all. Refuse with
+    the migration to run, rather than raising an OperationalError naming a
+    table nobody knew was missing."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "SLIDE-A", "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "SLIDE-A", [(1, 1)])
+    raw = _write_raw_slides(tmp_path / "raw", ["SLIDE-A.svs"])
+
+    engine = _kb_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE wsi_registry"))
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS", raw_dir=raw)
+    try:
+        rd.commit(engine, plan, "RADIOGENOMICS", replace=False)
+    except SystemExit as e:
+        assert "migrate_kb_base_tables.sql" in str(e), str(e)
+    else:
+        raise AssertionError("a missing base table must be refused by name")
+
+
+def test_missing_values_reach_the_database_as_null_not_as_nan(tmp_path):
+    """Building a DataFrame promotes any column with a gap to float64, so an
+    absent mpp arrives as float('nan'). sqlite refuses it outright; psycopg2
+    coerces it into a numeric column, which is worse because it succeeds — a
+    slide whose mpp is unknown would read back as a number.
+    """
+    assert rd._native(float("nan")) is None
+    assert rd._native(pd.NaT) is None
+    assert rd._native(None) is None
+    assert isinstance(rd._native(pd.Timestamp("2026-08-26 12:00")), datetime)
+    assert not isinstance(rd._native(pd.Timestamp("2026-08-26 12:00")), pd.Timestamp)
+    # and it must leave real values alone
+    assert rd._native(1.8) == 1.8
+    assert rd._native("SLIDE-A") == "SLIDE-A"
+
+
+def test_a_frame_with_gaps_writes_nulls(tmp_path):
+    """The end-to-end version of the check above, through the real insert."""
+    engine = _kb_engine(tmp_path)
+    frame = pd.DataFrame([
+        {"slide_id": "A", "mpp_x": 0.252, "objective_power": 40.0, "dataset_id": "D"},
+        {"slide_id": "B", "mpp_x": None, "objective_power": None, "dataset_id": "D"},
+    ])
+    with engine.begin() as conn:
+        rd._insert(conn, "wsi_metadata", frame,
+                   ("slide_id", "mpp_x", "objective_power", "dataset_id"))
+    with engine.connect() as conn:
+        got = conn.execute(text(
+            "SELECT mpp_x FROM wsi_metadata WHERE slide_id='B'")).scalar()
+    assert got is None, f"an absent mpp came back as {got!r}, not NULL"
+
+
+def test_file_uuid_is_none_for_a_slide_that_has_no_uuid(tmp_path):
+    """None because there is no uuid to report, not because one is missing —
+    the distinction matters when auditing which slides came from the GDC."""
+    from slide_naming import file_uuid_from_raw_path
+    assert file_uuid_from_raw_path("BB232560 A3-1 - 2023-10-11 16.41.02.svs") is None
+    assert file_uuid_from_raw_path(
+        "TCGA-55-7574-01Z-00-DX1.0f1c7e5a-9b2d-4c3e-8a1f-2b3c4d5e6f70.svs"
+    ) == "0f1c7e5a-9b2d-4c3e-8a1f-2b3c4d5e6f70"
 
 
 # --- standalone runner ---------------------------------------------------

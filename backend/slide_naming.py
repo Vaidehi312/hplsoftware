@@ -28,6 +28,23 @@ def slide_id_from_raw_path(raw_path) -> str:
     return Path(raw_path).stem
 
 
+# GDC/TCGA downloads carry the file's own uuid between the barcode and the
+# extension: "{barcode}.{file_uuid}.svs". wsi_registry has a file_uuid column
+# for it, so recover it here — beside the pattern that already knows the shape
+# — rather than re-deriving the same regex at the call site.
+_GDC_FILE_UUID_RE = re.compile(rf"^[^.]+\.(?P<file_uuid>{_UUID4})\.")
+
+
+def file_uuid_from_raw_path(raw_path):
+    """The GDC file uuid in a downloaded slide's name, or None.
+
+    None for anything not named that way — an app upload, a locally produced
+    slide — because there is no uuid to report, not because one is missing.
+    """
+    match = _GDC_FILE_UUID_RE.match(Path(raw_path).name)
+    return match.group("file_uuid") if match else None
+
+
 # --- the tile_coordinates / tile_registry join key -------------------------
 #
 # slide_tile is "<slides>_<tiles>" upper-cased, and it is the primary key of

@@ -55,6 +55,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from sqlalchemy import inspect as sqlalchemy_inspect
 from openslide.deepzoom import DeepZoomGenerator
 import shutil
 import uuid
@@ -2354,6 +2355,26 @@ def _run_job_history(submission_id: str) -> list[dict]:
             "slurm_state": state,
         })
     return history
+
+
+# Columns the run record needs before a stage can record where it wrote. They
+# live in PRODUCTION for every target, because run tracking is not split across
+# databases — so a deployment that migrated hpl_kb_test but forgot hpl_kb would
+# register into test successfully and then fail writing the run row, leaving the
+# rows in place and the run claiming it never registered. Checked at preview.
+_RUN_TRACKING_COLUMNS = ("registration_done", "registration_at",
+                         "registration_dataset_id", "registration_raw_dir",
+                         "registration_rows", "registration_kb_target")
+
+
+def _missing_run_tracking_columns() -> list[str]:
+    """Which of the above slurm_dataset_runs does not have, in production."""
+    try:
+        existing = {c["name"] for c in sqlalchemy_inspect(
+            _get_engine(KB_PRODUCTION)).get_columns("slurm_dataset_runs")}
+    except Exception:
+        return []
+    return [c for c in _RUN_TRACKING_COLUMNS if c not in existing]
 
 
 def _update_dataset_run(submission_id: str, **fields):
@@ -4684,6 +4705,9 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
         # reimplemented in two frontends.
         "would_refuse_collision": bool(collisions),
         "needs_replace": bool(occupied) and not req.replace,
+        # Reported here, before anything is written, because the write that
+        # would fail happens after the rows are already committed.
+        "missing_run_tracking_columns": _missing_run_tracking_columns(),
         "already_registered": bool(row.get("registration_done")),
         "registration_at": (row["registration_at"].isoformat()
                             if row.get("registration_at") else None),

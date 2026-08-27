@@ -2941,6 +2941,16 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             f"the Knowledge Bank's tables had no CREATE TABLE in git until that "
             f"file existed."
         )
+    if report.get("missing_run_tracking_columns"):
+        st.error(
+            "`slurm_dataset_runs` is missing "
+            f"{', '.join(report['missing_run_tracking_columns'])} in the "
+            "**production** database. Run tracking lives there whichever "
+            "Knowledge Bank you write to, so registering would succeed and then "
+            "fail recording it — leaving the rows in place and this run saying "
+            "it never registered. Run `psql ... -f backend/migrate_all.sql` "
+            "against production first."
+        )
     if report.get("would_refuse_collision"):
         st.error(
             "Refusing: some of these tiles or slides already belong to a "
@@ -2956,7 +2966,8 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
 
     blocked = bool(report.get("would_refuse_collision")
                    or report.get("needs_replace")
-                   or report.get("missing_tables"))
+                   or report.get("missing_tables")
+                   or report.get("missing_run_tracking_columns"))
     if st.button(
         "Register subset in the Knowledge Bank"
         if registration_scope == "Subset"

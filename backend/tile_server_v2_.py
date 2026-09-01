@@ -4574,6 +4574,15 @@ class RegistrationRequest(BaseModel):
     # key, and a second, fuller run of the same cohort has a different folder
     # and the same key.
     dataset_id: str | None = None
+    # The folder under tile_dir this run's tiles live in — register_dataset.py
+    # reads Stage 1's per-slide _tile_metadata.csv out of it, so without it
+    # there are no coordinates for any tile. It is normally recorded on the run
+    # (slurm_dataset_runs.dataset_name), but a run submitted before that column
+    # existed — or tiled by hand, outside /submit-dataset-job — has it NULL.
+    # Those were refused outright ("register it with the CLI instead"), which is
+    # a dead end reached with the KB cohort key already filled in, because that
+    # key is a different thing from this folder. Supplying it here is the fix.
+    tile_dataset_name: str | None = None
     # Which Knowledge Bank to write into. Defaults to production, so a client
     # that does not know about this field cannot land a cohort in the wrong
     # database by omission.
@@ -4602,11 +4611,43 @@ def _registration_plan(row, req: "RegistrationRequest"):
         raise HTTPException(400, f"The recorded .h5 is not on disk: {h5_path}")
 
     tile_dir = Path(row.get("tile_dir") or PROCESSED_TILES_DIR)
-    dataset_name = row.get("dataset_name")
+    # An explicitly supplied name wins over the recorded one: it is the only way
+    # to register a run whose dataset_name is NULL, and it is charset-checked
+    # here because it becomes a literal path segment under tile_dir.
+    supplied_name = (req.tile_dataset_name or "").strip()
+    if supplied_name:
+        try:
+            dataset_name = _sanitize_dataset_name(supplied_name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    else:
+        dataset_name = row.get("dataset_name")
     if not dataset_name:
-        raise HTTPException(400, "This run predates the dataset_name column, so the "
-                                 "folder its tiles live under cannot be determined. "
-                                 "Register it with the CLI instead.")
+        raise HTTPException(
+            400,
+            "This run has no recorded dataset_name, so the folder its tiles live "
+            "under cannot be determined. Send tile_dataset_name: the folder under "
+            f"{tile_dir} holding this run's per-slide _tile_metadata.csv files. "
+            "It is not the same as dataset_id — that is the Knowledge Bank cohort "
+            "key, this is the directory on disk.",
+        )
+
+    # Refuse a folder that is not on disk, rather than reading no metadata out
+    # of it. A wrong name does not fail anywhere downstream — it registers every
+    # tile with no coordinates, which is the shape of a successful run. Case is
+    # the likely way to get it wrong: macOS matches RADIOGENOMICS to
+    # Radiogenomics and the cluster's Linux filesystem does not, so a name that
+    # works locally can come back empty there.
+    if not (tile_dir / dataset_name).is_dir():
+        near = [p.name for p in tile_dir.iterdir()
+                if p.is_dir() and p.name.lower() == dataset_name.lower()] \
+            if tile_dir.is_dir() else []
+        hint = (f" Did you mean '{near[0]}'? Folder names are case-sensitive here."
+                if near else
+                " Registration reads every tile's coordinates from that folder, so "
+                "continuing would register tiles with no coordinates at all.")
+        raise HTTPException(
+            400, f"No tile folder '{dataset_name}' under {tile_dir}.{hint}")
 
     raw_dir = Path(row["raw_dir"]) if row.get("raw_dir") else None
     if raw_dir is not None and not raw_dir.is_dir():
@@ -4653,6 +4694,9 @@ def _registration_plan(row, req: "RegistrationRequest"):
         scope=scope,
         slide_names=slide_names,
     )
+    # Carried on the plan so both endpoints can report which tile folder was
+    # actually read, without re-deriving it.
+    plan["tile_dataset_name"] = dataset_name
     return plan, dataset_id, raw_dir
 
 
@@ -4678,6 +4722,10 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
         "kb_target": _resolve_kb_target(req.kb_target),
         "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
         "raw_dir": str(raw_dir) if raw_dir else None,
+        # Which tile folder the coordinates were read from. Named in the report
+        # because a wrong folder does not fail — it comes back as tiles with no
+        # coordinates, which reads like missing Stage 1 output.
+        "tile_dataset_name": plan["tile_dataset_name"],
         "missing_tables": [t for t, v in report["existing"].items() if v.get("missing")],
         # The two states the UI has to gate its button on, computed here so the
         # rule lives next to the guard that enforces it rather than being
@@ -4736,6 +4784,7 @@ def commit_registration(submission_id: str, req: RegistrationRequest):
     return {
         "submission_id": submission_id,
         "dataset_id": dataset_id,
+        "tile_dataset_name": plan["tile_dataset_name"],
         "kb_target": _resolve_kb_target(req.kb_target),
         "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
         "written": written,

@@ -771,6 +771,158 @@ def test_subset_matching_is_case_insensitive(tmp_path):
     assert plan["slides"] == ["SLIDE-B"]
 
 
+# --- the tile folder the server registers from ---------------------------
+#
+# register_dataset.py is handed a tile_dataset_name; the server used to take it
+# only from slurm_dataset_runs.dataset_name and refuse when that was NULL
+# ("register it with the CLI instead"). That is a dead end for any run tiled
+# before the column existed, or tiled by hand — and one reached with the KB
+# cohort key already filled in, because dataset_id is a different thing from
+# this folder. The request can now carry it.
+
+
+def _server():
+    import tile_server_v2_ as srv
+    return srv
+
+
+def _run_row(tmp_path: Path, *, dataset_name=None):
+    """A slurm_dataset_runs row shaped the way _registration_plan reads it,
+    with a real packaged .h5 and real Stage 1 metadata under "TCGA"."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "1_1.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "TCGA", SLIDE, [(1, 1)])
+    raw_dir = _write_raw_slides(tmp_path / "raw", [f"{SLIDE}.svs"])
+    return {
+        "h5_output_path": str(h5_path),
+        "tile_dir": str(tile_dir),
+        "dataset_name": dataset_name,
+        "raw_dir": str(raw_dir),
+        "tiling_params": None,
+    }
+
+
+def test_a_run_with_no_recorded_tile_folder_is_registerable_by_naming_it(tmp_path):
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name="TCGA")
+
+    plan, dataset_id, _raw = srv._registration_plan(row, req)
+
+    assert dataset_id == "TCGA"
+    assert plan["tile_dataset_name"] == "TCGA"
+    # The point of the field: coordinates, which come only from that folder.
+    assert len(plan["coordinates"]) == 1
+
+
+def test_a_dataset_id_alone_does_not_stand_in_for_the_tile_folder(tmp_path):
+    """The reported failure, exactly: a filled-in cohort key and a NULL
+    dataset_name still refuses — and the message has to say which of the two
+    names is missing, or it reads as "I already told you the dataset name"."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    req = srv.RegistrationRequest(dataset_id="TCGA")
+
+    try:
+        srv._registration_plan(row, req)
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "tile_dataset_name" in str(e.detail)
+        assert "dataset_id" in str(e.detail)
+    else:
+        raise AssertionError("a run with no tile folder anywhere was accepted")
+
+
+def test_a_supplied_folder_name_cannot_escape_the_tile_directory(tmp_path):
+    """It becomes a literal path segment under tile_dir, so it is charset-checked
+    the same way /submit-dataset-job checks it."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+
+    for bad in ("../../etc", "TCGA/../other", "/absolute", ".hidden", ""):
+        req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name=bad)
+        if not bad:
+            # Empty falls through to the recorded name rather than being an
+            # error — the UI's own required field is what stops a blank there.
+            plan, _id, _raw = srv._registration_plan(row, req)
+            assert plan["tile_dataset_name"] == "TCGA"
+            continue
+        try:
+            srv._registration_plan(row, req)
+        except HTTPException as e:
+            assert e.status_code == 400
+        else:
+            raise AssertionError(f"{bad!r} was accepted as a tile folder name")
+
+
+def test_the_supplied_name_wins_over_the_recorded_one_and_is_reported(tmp_path):
+    """Overriding is deliberate — a run may have been re-tiled elsewhere — but a
+    wrong override produces tiles with no coordinates rather than an error, so
+    the folder actually read is carried on the plan for the preview to name."""
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    # A real folder that simply does not hold this run's slides — the existence
+    # guard passes, so what is left is the quiet failure it cannot catch.
+    (Path(row["tile_dir"]) / "Radiogenomics").mkdir(parents=True, exist_ok=True)
+    req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name="Radiogenomics")
+
+    plan, _dataset_id, _raw = srv._registration_plan(row, req)
+
+    assert plan["tile_dataset_name"] == "Radiogenomics"
+    assert len(plan["registry"]) == 1
+    assert len(plan["coordinates"]) == 0
+    assert len(plan["missing_slides"]) == 1
+    assert plan["missing_slides"][0].startswith(SLIDE)
+
+
+def test_a_tile_folder_that_is_not_on_disk_is_refused_not_read_as_empty(tmp_path):
+    """The silent version of this bug: a folder that does not exist yields no
+    metadata, and registration succeeds with every tile carrying no
+    coordinates. Refuse instead."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    req = srv.RegistrationRequest(dataset_id="TCGA", tile_dataset_name="Nonexistent")
+
+    try:
+        srv._registration_plan(row, req)
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "Nonexistent" in str(e.detail)
+    else:
+        raise AssertionError("a tile folder that is not on disk was accepted")
+
+
+def test_a_case_mismatch_names_the_folder_that_does_exist(tmp_path):
+    """RADIOGENOMICS vs Radiogenomics resolves on macOS and does not on the
+    cluster's Linux filesystem, so the error has to name the real one rather
+    than leaving 'no such folder' to be squared with a folder that is visibly
+    there."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    (Path(row["tile_dir"]) / "Radiogenomics").mkdir(parents=True, exist_ok=True)
+    req = srv.RegistrationRequest(dataset_id="RADIOGENOMICS",
+                                  tile_dataset_name="RADIOGENOMICS")
+
+    try:
+        srv._registration_plan(row, req)
+    except HTTPException as e:
+        assert "Radiogenomics" in str(e.detail)
+        assert "case-sensitive" in str(e.detail)
+    else:
+        # macOS resolves the mismatched case, so the guard cannot fire here —
+        # but then the folder really was found, which is the safe direction.
+        pass
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

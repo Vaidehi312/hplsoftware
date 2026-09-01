@@ -2812,6 +2812,69 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
              "this is the cohort the KB groups by. A second, fuller run of the "
              "same cohort has a different folder and the same key.",
     )
+    # Mandatory, and asked for even when the run recorded it, because Stage 5's
+    # whole coordinate half is read out of <tile_dir>/<this name>/. It is NOT
+    # dataset_id above: that is the cohort key the KB groups by, this is a
+    # directory on disk. Conflating the two is what made the refusal below read
+    # as "I already told you the dataset name".
+    recorded_dataset_name = (status.get("dataset_name") or "").strip()
+    try:
+        tile_folders = client.get_tile_dataset_names()
+    except Exception:
+        # Server unreachable or the route missing — fall back to typing it
+        # rather than blocking the step on a convenience lookup.
+        tile_folders = []
+
+    tile_folder_help = (
+        "The folder under processed_tiles that Stage 1 wrote this run's "
+        "per-slide _tile_metadata.csv files into. Every tile's x/y comes from "
+        "there, so a wrong name does not fail — it registers tiles with no "
+        "coordinates."
+    )
+    _TYPE_IT = "Other — type it"
+    if tile_folders:
+        # A picker rather than free text wherever possible: the names come off
+        # disk, so a typo cannot silently select a folder that does not exist.
+        options = [*tile_folders, _TYPE_IT]
+        index = tile_folders.index(recorded_dataset_name) \
+            if recorded_dataset_name in tile_folders else 0
+        choice = st.selectbox(
+            "Tile folder (dataset_name)",
+            options,
+            index=index,
+            key=f"{key_prefix}reg_tile_folder_{submission_id}",
+            help=tile_folder_help,
+        )
+        tile_dataset_name = "" if choice == _TYPE_IT else choice
+        if choice == _TYPE_IT:
+            tile_dataset_name = st.text_input(
+                "Tile folder name",
+                value=recorded_dataset_name,
+                key=f"{key_prefix}reg_tile_folder_other_{submission_id}",
+                placeholder="TCGA",
+            )
+    else:
+        tile_dataset_name = st.text_input(
+            "Tile folder (dataset_name)",
+            value=recorded_dataset_name,
+            key=f"{key_prefix}reg_tile_folder_other_{submission_id}",
+            placeholder="TCGA",
+            help=tile_folder_help,
+        )
+
+    if not recorded_dataset_name:
+        st.caption(
+            ":grey[This run recorded no tile folder — it predates that column, or "
+            "was tiled outside the submit flow — so the choice above is the only "
+            "thing that says where its Stage 1 metadata is.]"
+        )
+    elif tile_dataset_name.strip() and tile_dataset_name.strip() != recorded_dataset_name:
+        st.warning(
+            f"This run recorded its tiles under `{recorded_dataset_name}`, not "
+            f"`{tile_dataset_name.strip()}`. Registration reads the folder "
+            f"selected above — check it before previewing."
+        )
+
     registration_scope = st.radio(
         "Registration scope",
         ["Full packaged dataset", "Subset"],
@@ -2879,6 +2942,13 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
         if not dataset_id.strip():
             st.error("Enter a dataset_id — every row written is scoped to it.")
 
+        elif not tile_dataset_name.strip():
+            st.error(
+                "Choose the tile folder (dataset_name) — Stage 1's per-slide "
+                "metadata is read from processed_tiles/<that folder>/, and it is "
+                "not the same thing as the dataset_id above."
+            )
+
         elif registration_scope == "Subset" and not registration_slide_names:
             st.error(
                 "Enter at least one slide ID or filename for subset registration."
@@ -2889,6 +2959,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
                 st.session_state[preview_key] = client.preview_registration(
                     submission_id,
                     dataset_id=dataset_id.strip(),
+                    tile_dataset_name=tile_dataset_name.strip(),
                     scope="subset" if registration_scope == "Subset" else "full",
                     slide_names=registration_slide_names,
                     slide_metadata=slide_metadata,
@@ -2910,6 +2981,12 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
     cols[1].metric("Tiles in .h5", f"{report.get('tiles_in_h5', 0):,}")
     cols[2].metric("With coordinates", f"{report.get('tiles_with_coordinates', 0):,}")
     cols[3].metric("Slides registered", f"{report.get('slides_registered', 0):,}")
+
+    # The folder the numbers above came out of. "With coordinates" is only
+    # interpretable alongside it: a zero there means either Stage 1 never ran or
+    # this name points somewhere else, and nothing else on screen separates them.
+    if report.get("tile_dataset_name"):
+        st.caption(f"Tile metadata read from tile folder `{report['tile_dataset_name']}`.")
 
     if not report.get("slides_registered"):
         st.warning(
@@ -2965,6 +3042,13 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
         type="primary",
         disabled=blocked,
     ):
+        if not tile_dataset_name.strip():
+            st.error(
+                "Choose the tile folder (dataset_name) — Stage 1's per-slide "
+                "metadata is read from processed_tiles/<that folder>/."
+            )
+            return
+
         if registration_scope == "Subset" and not registration_slide_names:
             st.error(
                 "Enter at least one slide ID or filename for subset registration."
@@ -2975,6 +3059,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             result = client.commit_registration(
                 submission_id,
                 dataset_id=dataset_id.strip(),
+                tile_dataset_name=tile_dataset_name.strip(),
                 scope="subset" if registration_scope == "Subset" else "full",
                 slide_names=registration_slide_names,
                 slide_metadata=slide_metadata,

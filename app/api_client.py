@@ -512,6 +512,7 @@ class TileServerClient:
 
     def preview_registration(self, submission_id: str,
                          dataset_id: str | None = None,
+                         tile_dataset_name: str | None = None,
                          scope: str = "full",
                          slide_names: list[str] | None = None,
                          slide_metadata: bool = False,
@@ -527,12 +528,16 @@ class TileServerClient:
         tile_coordinates and tile_registry from what Stages 1–2 wrote to disk.
 
         Every path it needs is already on the run record, so nothing but the
-        cohort key is passed: dataset_id defaults to the run's own
-        dataset_name, upper-cased."""
+        cohort key and the tile folder is passed: dataset_id defaults to the
+        run's own dataset_name, upper-cased, and tile_dataset_name to the
+        recorded dataset_name itself — which a run predating that column, or one
+        tiled by hand, does not have, so the UI asks for it outright rather than
+        letting registration refuse."""
         return self._post_json(
             f"/dataset-jobs/{submission_id}/register-preview",
             {
             "dataset_id": dataset_id,
+            "tile_dataset_name": tile_dataset_name,
             "kb_target": self.kb_target,
             "scope": scope,
             "slide_names": slide_names,
@@ -544,6 +549,7 @@ class TileServerClient:
 
     def commit_registration(self, submission_id: str,
                         dataset_id: str | None = None,
+                        tile_dataset_name: str | None = None,
                         scope: str = "full",
                         slide_names: list[str] | None = None,
                         slide_metadata: bool = False,
@@ -562,6 +568,11 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/register",
             {
             "dataset_id": dataset_id,
+            # The tile folder Stage 1 wrote into. Sent on both calls because
+            # the two have to read the same folder — a preview against one and
+            # a commit against another would report numbers from a cohort it
+            # did not write.
+            "tile_dataset_name": tile_dataset_name,
             "kb_target": self.kb_target,
             # scope and slide_names were accepted by this method and then left
             # out of the body, so a subset previewed as three slides committed

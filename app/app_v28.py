@@ -2839,6 +2839,64 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             if line.strip()
         ]
 
+    # Registration normally takes these four off the run record. A run that
+    # predates a column — or work done on the cluster before this pipeline
+    # existed — has no dataset_name and sometimes no packaged .h5, and until now
+    # the only thing this step could say was "register it with the CLI instead".
+    #
+    # Pre-filled from the run and left blank where it holds nothing, so the
+    # common case is untouched. Blank means "use the run's value", so clearing a
+    # box does not silently override with an empty string.
+    with st.expander(
+        "Where the data is — normally taken from the run record",
+        expanded=not status.get("dataset_name"),
+    ):
+        if not status.get("dataset_name"):
+            st.info(
+                "This run has no `dataset_name` recorded, so the folder its tiles "
+                "live under cannot be determined. Fill in **Tile folder name** "
+                "below — for Radiogenomics that is `Radiogenomics`, the directory "
+                "under the tile root that holds one folder per slide. This is not "
+                "the same as the cohort above: that is the key the Knowledge Bank "
+                "groups by, this is where the tiles are on disk."
+            )
+        ov_dataset_name = st.text_input(
+            "Tile folder name (dataset_name)",
+            value=status.get("dataset_name") or "",
+            key=f"{key_prefix}reg_ov_name_{submission_id}",
+            help="A folder name, not a path — it is joined onto the tile root below.",
+        )
+        ov_tile_dir = st.text_input(
+            "Tile root",
+            value=status.get("tile_dir") or "",
+            key=f"{key_prefix}reg_ov_tiledir_{submission_id}",
+            help="The directory the folder above sits in — the --tile-dir Stage 1 "
+                 "was given.",
+        )
+        ov_h5 = st.text_input(
+            "Packaged .h5",
+            value=status.get("h5_output_path") or "",
+            key=f"{key_prefix}reg_ov_h5_{submission_id}",
+            help="Tile identity and each tile's row position are read out of this "
+                 "file. It must be the .h5 the assignment CSV was produced from, or "
+                 "image_index points at the wrong tiles.",
+        )
+        ov_raw_dir = st.text_input(
+            "Raw slide directory",
+            value=status.get("raw_dir") or "",
+            key=f"{key_prefix}reg_ov_rawdir_{submission_id}",
+            help="Searched recursively for each slide's file. Without it "
+                 "wsi_registry is not written and the cohort's slides will not open "
+                 "in the viewer.",
+        )
+
+    _overrides = dict(
+        dataset_name=ov_dataset_name.strip() or None,
+        tile_dir=ov_tile_dir.strip() or None,
+        h5_path=ov_h5.strip() or None,
+        raw_dir=ov_raw_dir.strip() or None,
+    )
+
     col_a, col_b = st.columns(2)
     with col_a:
         slide_metadata = st.checkbox(
@@ -2893,6 +2951,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
                     slide_names=registration_slide_names,
                     slide_metadata=slide_metadata,
                     write_dataset_config=write_dataset_config,
+                    **_overrides,
                     replace=replace,
                 )
             except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
@@ -2904,6 +2963,13 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
         st.caption("Preview first — this writes to the shared Knowledge Bank, so "
                    "it never commits without showing you the numbers.")
         return
+
+    resolved, sources = report.get("resolved") or {}, report.get("sources") or {}
+    if resolved:
+        st.caption("Reading from — an override is a chance to register the wrong "
+                   "directory, so this is what will actually be opened:")
+        st.table([{"input": k, "value": v or "—", "from": sources.get(k, "")}
+                  for k, v in resolved.items()])
 
     cols = st.columns(4)
     cols[0].metric("Slides", f"{report.get('slides', 0):,}")
@@ -2990,6 +3056,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
                 slide_names=registration_slide_names,
                 slide_metadata=slide_metadata,
                 write_dataset_config=write_dataset_config,
+                **_overrides,
                 replace=replace,
             )
             written = result.get("written") or {}

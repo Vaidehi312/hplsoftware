@@ -4601,6 +4601,22 @@ class RegistrationRequest(BaseModel):
     kb_target: str = KB_PRODUCTION
     scope: str = "full"
     slide_names: list[str] | None = None
+    # --- overrides for what the run record does not hold ---------------------
+    #
+    # Registration reads these four off slurm_dataset_runs, which is right when
+    # the run was driven through this UI. Runs that predate a column, or work
+    # done on the cluster before the pipeline existed, have no dataset_name and
+    # sometimes no h5_output_path — and the only advice the endpoint could give
+    # was to leave the UI and use the CLI.
+    #
+    # None means "take it from the run", which is what every existing caller
+    # sends. Supplied values are used as given and are still checked to exist,
+    # so an override can be wrong in ways that are noticed, not in ways that
+    # register the wrong cohort quietly.
+    dataset_name: str | None = None
+    raw_dir: str | None = None
+    tile_dir: str | None = None
+    h5_path: str | None = None
     # Opens every slide file, so it is opt-in for the same reason as the CLI
     # flag: 14,044 headers is minutes, not seconds.
     slide_metadata: bool = False
@@ -4613,23 +4629,54 @@ class RegistrationRequest(BaseModel):
 
 
 def _registration_plan(row, req: "RegistrationRequest"):
-    """Build register_dataset.py's plan from what the run already recorded."""
-    packaged = row.get("h5_output_path")
+    """Build register_dataset.py's plan, from the run record or the overrides.
+
+    Returns the plan plus a `sources` map saying, per input, whether the value
+    came from the run or was supplied. The preview shows it: an override is a
+    chance to register the wrong directory, so the resolved values have to be
+    visible before anything is written rather than inferable afterwards.
+    """
+    sources = {}
+
+    def _resolve(name, override, recorded):
+        value = (override or "").strip() if isinstance(override, str) else override
+        if value:
+            sources[name] = "supplied"
+            return value
+        sources[name] = "run record"
+        return recorded
+
+    packaged = _resolve("h5_path", req.h5_path, row.get("h5_output_path"))
     if not packaged:
-        raise HTTPException(400, "This run has no packaged .h5 yet — registration "
-                                 "reads tile identity out of it. Finish Stage 2 first.")
+        raise HTTPException(400,
+            "This run has no packaged .h5 recorded. Finish Stage 2, or give the "
+            "path to an .h5 packaged elsewhere in 'Packaged .h5' below.")
     h5_path = Path(packaged)
     if not h5_path.is_file():
-        raise HTTPException(400, f"The recorded .h5 is not on disk: {h5_path}")
+        raise HTTPException(400, f"No .h5 at {h5_path} ({sources['h5_path']}).")
 
-    tile_dir = Path(row.get("tile_dir") or PROCESSED_TILES_DIR)
-    dataset_name = row.get("dataset_name")
+    tile_dir = Path(_resolve("tile_dir", req.tile_dir,
+                             row.get("tile_dir") or str(PROCESSED_TILES_DIR)))
+    if not tile_dir.is_dir():
+        raise HTTPException(400, f"No such directory: {tile_dir} ({sources['tile_dir']}).")
+
+    dataset_name = _resolve("dataset_name", req.dataset_name, row.get("dataset_name"))
     if not dataset_name:
-        raise HTTPException(400, "This run predates the dataset_name column, so the "
-                                 "folder its tiles live under cannot be determined. "
-                                 "Register it with the CLI instead.")
+        raise HTTPException(400,
+            "This run predates the dataset_name column, so the folder its tiles "
+            "live under is not recorded. Enter it in 'Tile folder name' below — "
+            "it is the directory under the tile root that holds one folder per "
+            "slide, e.g. 'Radiogenomics'.")
+    # The tiles have to actually be there. Checked here rather than surfacing as
+    # "0 slides had usable metadata", which is what a wrong folder name looks
+    # like once it reaches read_tile_coordinates.
+    if not (tile_dir / dataset_name).is_dir():
+        raise HTTPException(400,
+            f"{tile_dir / dataset_name} does not exist. 'Tile folder name' is a "
+            f"directory under the tile root, not a path — the two are joined.")
 
-    raw_dir = Path(row["raw_dir"]) if row.get("raw_dir") else None
+    raw_override = _resolve("raw_dir", req.raw_dir, row.get("raw_dir"))
+    raw_dir = Path(raw_override) if raw_override else None
     if raw_dir is not None and not raw_dir.is_dir():
         # Reported rather than fatal: the tile tables are still registerable,
         # and saying so is more useful than refusing everything because the
@@ -4674,6 +4721,13 @@ def _registration_plan(row, req: "RegistrationRequest"):
         scope=scope,
         slide_names=slide_names,
     )
+    plan["sources"] = sources
+    plan["resolved"] = {
+        "h5_path": str(h5_path),
+        "tile_dir": str(tile_dir),
+        "dataset_name": dataset_name,
+        "raw_dir": str(raw_dir) if raw_dir else None,
+    }
     return plan, dataset_id, raw_dir
 
 
@@ -4698,6 +4752,9 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
         "submission_id": submission_id,
         "kb_target": _resolve_kb_target(req.kb_target),
         "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
+        # What will actually be read, and where each value came from.
+        "resolved": plan.get("resolved"),
+        "sources": plan.get("sources"),
         "raw_dir": str(raw_dir) if raw_dir else None,
         "missing_tables": [t for t, v in report["existing"].items() if v.get("missing")],
         # The two states the UI has to gate its button on, computed here so the

@@ -157,6 +157,25 @@ rather than through the API.
    slide-naming problem, not a missing step.
 5. **Load.** Then open one of those slides in the viewer and ask the chatbot about it.
 
+If step 5 says **"this run predates the dataset_name column"**, the run record does not hold the
+paths — which is normal for work tiled and packaged on the cluster before the pipeline UI existed.
+Open **"Where the data is"** on that step and fill in what is missing. For Radiogenomics:
+
+| field | value |
+|---|---|
+| Tile folder name | `Radiogenomics` — a folder name, not a path |
+| Tile root | `/mnt/cephfs-lts/long-term-scratch/users/vpandya/processed_tiles` |
+| Packaged .h5 | `.../Work/model_input/Radiogenomics/hdf5_Radiogenomics_he_train.h5` |
+| Raw slide directory | `/mnt/cephfs-lts/long-term-scratch/users/vpandya/Radiogenomics` |
+
+Tile root and Tile folder name are **joined** — `<tile root>/<folder name>` has to be the directory
+holding one subfolder per slide, and the preview refuses if it is not. Anything left blank uses the
+run's own value, so a run with three of the four recorded needs only the fourth.
+
+The preview then shows a "Reading from" table: each of the four, the value that will actually be
+opened, and whether it came from the run record or from you. Check that before committing — an
+override is the one way to register a directory nobody meant.
+
 Every path except the assignment CSV comes off the pipeline run — `raw_dir`, `tile_dir`,
 `h5_output_path`, `dataset_name` — and the viewer resolves slide files from that KB's own
 `wsi_registry`. Nothing is hardcoded to Radiogenomics.

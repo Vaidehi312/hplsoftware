@@ -234,6 +234,100 @@ def test_the_selector_is_resolved_before_the_client_and_engine(_tmp=None):
     assert selector < source.index("DB_NAME = KB_DATABASES[kb_target]")
 
 
+# --- path overrides for runs the record cannot describe -------------------
+
+
+def test_the_override_fields_default_to_none(_tmp=None):
+    """None means "take it from the run". Any other default would make every
+    existing caller start overriding something."""
+    import tile_server_v2_ as srv
+    for name in ("dataset_name", "raw_dir", "tile_dir", "h5_path"):
+        field = srv.RegistrationRequest.model_fields.get(name)
+        assert field is not None, f"RegistrationRequest has no {name}"
+        assert field.default is None, f"{name} defaults to {field.default!r}"
+
+
+def test_the_client_sends_the_overrides_on_both_methods(_tmp=None):
+    """Preview accepting an override that commit drops is how a previewed
+    directory becomes a different registered one — the same shape as the
+    scope/slide_names bug."""
+    source = CLIENT.read_text()
+    for method in ("preview_registration", "commit_registration"):
+        start = source.index(f"def {method}(")
+        body = source[start:source.index("\n    def ", start + 1)]
+        for field in ("dataset_name", "raw_dir", "tile_dir", "h5_path"):
+            assert f'"{field}": {field}' in body, f"{method} drops {field}"
+
+
+def test_the_app_sends_the_same_overrides_to_preview_and_commit(_tmp=None):
+    source = APP.read_text()
+    assert source.count("**_overrides,") == 2, (
+        "preview and commit must send the same overrides, or the preview "
+        "describes a registration that is not the one performed")
+
+
+def test_the_overrides_dict_is_actually_built(_tmp=None):
+    """Counting the uses is not enough: an edit added both `**_overrides` call
+    sites while the block that builds it failed to apply, so the app parsed
+    cleanly and raised NameError the moment anyone opened step 5. Streamlit
+    files are not imported by this suite, so nothing else would have caught it.
+    """
+    source = APP.read_text()
+    assert "_overrides = dict(" in source, "_overrides is used but never assigned"
+    assert source.index("_overrides = dict(") < source.index("**_overrides,"), (
+        "_overrides is built after the call that uses it")
+    for field in ("dataset_name=", "tile_dir=", "h5_path=", "raw_dir="):
+        assert field in source[source.index("_overrides = dict("):][:400], (
+            f"_overrides does not carry {field}")
+
+
+def test_the_registration_step_has_no_undefined_local_names(_tmp=None):
+    """The general version of the check above, over the whole render function:
+    every name it reads is either assigned in it, a parameter, or a module-level
+    import. app_v28 cannot be imported here (it runs Streamlit at module scope),
+    so this is the only way to catch a name that does not exist."""
+    import ast
+
+    source = APP.read_text()
+    tree = ast.parse(source)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "_render_registration_step")
+
+    assigned = {t.id for node in ast.walk(fn) for t in ast.walk(node)
+                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)}
+    assigned |= {a.arg for a in fn.args.args}
+    # `except X as e` binds through handler.name, a plain string, not a Name
+    # node — so without this the collector reports every caught exception as
+    # undefined. Same for `with ... as` targets already covered by Name/Store.
+    assigned |= {h.name for h in ast.walk(fn)
+                 if isinstance(h, ast.ExceptHandler) and h.name}
+    module_level = {t.id for node in tree.body for t in ast.walk(node)
+                    if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)}
+    module_level |= {a.asname or a.name.split(".")[0]
+                     for node in ast.walk(tree)
+                     if isinstance(node, (ast.Import, ast.ImportFrom))
+                     for a in node.names}
+    module_level |= {n.name for n in tree.body
+                     if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+
+    import builtins
+    known = assigned | module_level | set(dir(builtins))
+    unknown = sorted({t.id for t in ast.walk(fn)
+                      if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Load)
+                      and t.id not in known})
+    assert not unknown, f"names used but never defined: {unknown}"
+
+
+def test_the_preview_reports_what_it_resolved(_tmp=None):
+    """An override is a chance to register the wrong directory. The resolved
+    values and where each came from have to be visible before the write."""
+    server = SERVER_SOURCE
+    assert '"resolved": plan.get("resolved")' in server
+    assert '"sources": plan.get("sources")' in server
+    assert 'st.table(' in APP.read_text()
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

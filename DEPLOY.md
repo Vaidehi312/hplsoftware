@@ -54,19 +54,57 @@ What it does to production, rehearsed: row counts unchanged, constraints unchang
 ## 3. Create and migrate the Test KB
 
 ```bash
-createdb -h $SOCK hpl_kb_test
+createdb -h $SOCK hpl_kb_test                              # skip if it exists
 psql -h $SOCK -d hpl_kb_test -f backend/migrate_all.sql
 ```
 
-Then copy the four cluster reference tables across. `migrate_all.sql` does not create them — their
-`\d` has never been captured (§7) — and the chatbot, the tile overlay and the HPC panels all read
-them, so a test KB without them answers with blanks:
+Run `migrate_all.sql` even if you built the database with the schema already — it is idempotent, so
+it no-ops where the schema is right and fills in anything missing.
+
+Then check what is actually there:
 
 ```bash
-pg_dump -h $SOCK -d hpl_kb -Fc \
+psql -h $SOCK -d hpl_kb_test -f backend/check_kb_ready.sql
+```
+
+Read-only. It answers the question "I already have the schema" leaves open, which is not whether
+the tables exist but whether the **cluster reference tables have data**. A schema-only copy of
+production passes every table check and still answers every clinical question with blanks, because
+`hpc_dictionary` is empty.
+
+### Copy the reference data — and only that
+
+`migrate_all.sql` does not create those four tables (their `\d` has never been captured, §7), and
+the tile overlay, the HPC panels and the chatbot all read them. They are the **only** thing a test
+KB needs that registration does not create for itself:
+
+```bash
+pg_dump -h $SOCK -d hpl_kb --data-only \
   -t hpc_dictionary -t hpc_malignant_details \
-  -t hpc_non_malignant_details -t hpc_survival_analysis -f hpc_ref.dump
-pg_restore -h $SOCK -d hpl_kb_test hpc_ref.dump
+  -t hpc_non_malignant_details -t hpc_survival_analysis \
+  -f hpc_ref_data.sql
+
+psql -h $SOCK -d hpl_kb_test -v ON_ERROR_STOP=1 -f hpc_ref_data.sql
+```
+
+`--data-only` because the tables are already there; sequences come across with it. **Not
+idempotent** — a second run fails on duplicate keys. To redo it, `TRUNCATE` those four first.
+
+Re-run `check_kb_ready.sql` afterwards: the four row counts should read 71 / 27 / 44 / 71.
+
+### Do not clone the whole production database into test
+
+The test KB is useful because what you register is exactly what you see. A full copy puts TCGA's
+~500,000 tiles in there too, so the slide list, the HPC panels and the chatbot all answer from a
+cohort you did not put there — and it makes "production untouched" harder to verify, not easier.
+It is also 4.4 GB of `h_latent_vectors` that nothing reads.
+
+If you ever do want a full clone — to exercise the cross-cohort collision guards against real
+neighbours — that is a different exercise from §6:
+
+```bash
+pg_dump -h $SOCK -d hpl_kb -Fc --exclude-table-data=h_latent_vectors -f full.dump
+pg_restore -h $SOCK -d hpl_kb_test --clean --if-exists full.dump
 ```
 
 `DB_NAME_TEST` (server) and `HPL_DB_NAME_TEST` (Streamlit) both default to `hpl_kb_test`. Set them

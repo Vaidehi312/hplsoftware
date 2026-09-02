@@ -1332,8 +1332,10 @@ def _h5_has_legacy_tile_names(path: Path) -> bool:
 
     Treating it as invalid blocked packaging, extraction and assignment for a
     defect none of them are affected by. So it is reported as an advisory the UI
-    can show, and the refusal lives at the one boundary where a wrong key
-    produces a wrong result.
+    can show. Registration and the KB load no longer refuse over it either —
+    they append the suffix themselves and report the count — so this is now
+    purely informational: it says the artifact on disk still holds the short
+    form, which migrate_tile_names.py is what fixes.
     """
     try:
         with h5py.File(path, "r") as f:
@@ -4785,6 +4787,7 @@ def commit_registration(submission_id: str, req: RegistrationRequest):
         "submission_id": submission_id,
         "dataset_id": dataset_id,
         "tile_dataset_name": plan["tile_dataset_name"],
+        "tile_names_normalized": plan["tile_names_normalized"],
         "kb_target": _resolve_kb_target(req.kb_target),
         "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
         "written": written,

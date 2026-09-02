@@ -166,6 +166,19 @@ before encoding, and its "output already exists" path crashes on an unbound loca
 attempt makes every retry fail in seconds with an error pointing nowhere near the cause — which is why
 `validate_extraction_output()` exists and stale outputs are cleared before resubmission.
 
+**Short tile names are repaired on read, not refused — except when mixed.** A `.h5` or
+assignments CSV packaged before make_hpl_hdf5.py stored the suffix holds `18_15`, which joins
+nothing in a KB keyed on `..._18_15.JPEG`. `register_dataset.py` and `load_hpc_assignments.py`
+append `.jpeg` themselves (`slide_naming.normalize_tile_names`) and report the count, because
+`auto_tile_from_mask.py:150` writes every tile as `{col}_{row}.jpeg`, which makes the mapping a
+bijection rather than a guess. Both sides must be normalised — the `.h5` *and* Stage 1's
+metadata CSVs — or the refusal just becomes `tiles_with_coordinates: 0`. A **mixed** file (some
+names suffixed, some not) is still refused: that is a resume that straddled the fix, the two
+sides are indistinguishable by name, and appending would attach correct cluster IDs to the wrong
+tiles. Note `tiles_missing_suffix()` cannot see that case — it samples 100 names and needs them
+all short — which is why `tile_name_verdict()` reads every name. `migrate_tile_names.py` still
+exists and is still the only fix for the artifacts on disk, and for mixed.
+
 **Reference `.npz` keys are `reference, components, codes, categories, n_neighbors, meta` (+ optional
 `mean`).** There is no `labels` key. `build_hpc_reference.save()` is the authority;
 `test_reference_keys_match_the_builder` round-trips through it so readers cannot drift.

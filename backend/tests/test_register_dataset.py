@@ -146,15 +146,58 @@ def test_slide_with_no_metadata_is_reported_not_dropped_silently(tmp_path):
     assert any("OTHER SLIDE" in m for m in plan["missing_slides"])
 
 
-def test_legacy_h5_is_refused_with_the_migration_command(tmp_path):
+def test_legacy_h5_has_the_suffix_appended_rather_than_being_refused(tmp_path):
+    """A .h5 packaged before the tile-name fix used to be refused here and sent
+    to migrate_tile_names.py. The mapping "24_10" -> "24_10.jpeg" is total and
+    lossless (auto_tile_from_mask.py writes nothing else), so it is applied on
+    the way in — and counted, because a silent correction to identity is the
+    thing this codebase is written against."""
     h5_path = tmp_path / "legacy.h5"
     _write_h5(h5_path, [("S1", SLIDE, "24_10")])  # no suffix
+
+    frame = rd.read_h5_identity(h5_path)
+
+    assert frame["tiles"].tolist() == ["24_10.jpeg"]
+    assert frame["slide_tile"].tolist() == [f"{SLIDE.upper()}_24_10.JPEG"]
+    assert frame.attrs["tile_names_normalized"] == 1
+
+
+def test_a_half_migrated_h5_is_still_refused(tmp_path):
+    """Mixed is the one state that cannot be repaired: the rows on either side
+    of a resume that straddled the fix are indistinguishable by name, so
+    appending would attach real cluster IDs to the wrong tiles. Note the old
+    guard could not even see this case — tiles_missing_suffix() samples and
+    requires ALL names to be short — so this is a refusal that did not exist."""
+    h5_path = tmp_path / "half.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "24_10"), ("S1", SLIDE, "25_10.jpeg")])
     try:
         rd.read_h5_identity(h5_path)
     except SystemExit as e:
-        assert "migrate_tile_names.py" in str(e), str(e)
+        assert "Repackage" in str(e), str(e)
     else:
-        raise AssertionError("legacy tile names must be refused")
+        raise AssertionError("a half-migrated .h5 must be refused")
+
+
+def test_short_stage1_metadata_still_joins_the_normalised_h5(tmp_path):
+    """Both sides have to be normalised or neither. Fixing only the .h5 turns
+    the old loud refusal into tiles_with_coordinates: 0 — the same bug, now
+    silent and shaped exactly like a successful registration."""
+    h5_path = tmp_path / "legacy.h5"
+    _write_h5(h5_path, [("S1", SLIDE, "24_10")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", SLIDE, [(24, 10)])
+    # Rewrite Stage 1's CSV into the pre-fix short form.
+    csv = tile_dir / "Radiogenomics" / SLIDE / f"{SLIDE}_tile_metadata.csv"
+    frame = pd.read_csv(csv)
+    frame["tiles"] = frame["tiles"].str.replace(".jpeg", "", regex=False)
+    frame["slide_tile"] = frame["slide_tile"].str.replace(".jpeg", "", regex=False)
+    frame.to_csv(csv, index=False)
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics", str(h5_path),
+                                 "RADIOGENOMICS")
+
+    assert len(plan["coordinates"]) == 1, "the short-named coordinates must still join"
+    assert plan["tile_names_normalized"] == {"h5": 1, "coordinates": 1}
 
 
 def test_first_registration_writes_both_tables_in_one_transaction(tmp_path):

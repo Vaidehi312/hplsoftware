@@ -43,7 +43,11 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from slide_naming import make_slide_tile_series, tiles_missing_suffix  # noqa: E402
+from slide_naming import (  # noqa: E402
+    make_slide_tile_series,
+    normalize_tile_names,
+    tile_name_verdict,
+)
 
 # Same defaults and env names as tile_server_v2_.py, so a shell configured for
 # the server needs no extra setup here. Duplicated rather than imported: that
@@ -103,28 +107,34 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     if frame.empty:
         raise SystemExit(f"{csv_path} holds no assignments.")
 
-    # Refuse a CSV produced from a .h5 packaged before make_hpl_hdf5.py started
-    # storing the ".jpeg" suffix. Such a file is wrong in three places at once —
-    # it cannot join tile_registry, it cannot join tile_coordinates, and
-    # assign_hpc_clusters.py --validate-against merges zero rows against Kai's
-    # reference CSV — so the useful thing is to name the cause here rather than
-    # let it surface as an unexplained 0% match rate.
-    if tiles_missing_suffix(frame["tiles"]):
+    # A CSV produced from a .h5 packaged before make_hpl_hdf5.py started storing
+    # the ".jpeg" suffix carries the short form, which joins neither
+    # tile_registry nor tile_coordinates and merges zero rows against Kai's
+    # reference CSV. Nothing about it needs recomputing — the cluster IDs and
+    # margins are correct, only the label is short — so the suffix is appended
+    # here and the count reported, rather than the load being refused.
+    #
+    # Mixed still refuses: some names suffixed and some not is what a resume
+    # straddling the fix leaves behind, the two sides are indistinguishable by
+    # name, and guessing would attach correct cluster IDs to the wrong tiles.
+    verdict = tile_name_verdict(frame["tiles"])
+    if verdict == "mixed":
         raise SystemExit(
-            f"{csv_path} has tile names without a file extension "
-            f"(e.g. {frame['tiles'].iloc[0]!r}). Kai's reference CSVs and the "
-            f"Knowledge Bank both use '18_15.jpeg', so this CSV would match "
-            f"nothing.\n\n"
-            f"Nothing needs recomputing — the cluster IDs and margins here are "
-            f"correct, only the label is short. Convert it with:\n\n"
-            f"    python migrate_tile_names.py --csv {csv_path} --commit\n\n"
-            f"then load the '_tilenames.csv' it writes beside this one."
+            f"{csv_path} has SOME tile names with a file extension and some "
+            f"without (e.g. {frame['tiles'].iloc[0]!r}). That is what an "
+            f"assignment built from a half-migrated .h5 looks like, and the two "
+            f"forms cannot be told apart by name. Repackage and re-assign the "
+            f"dataset rather than loading this."
         )
+    frame["tiles"], renamed = normalize_tile_names(frame["tiles"])
 
     # tile_coordinates.slide_tile is "<slides>_<tiles>" upper-cased, e.g.
     # TCGA-55-7574-01Z-00-DX1_18_15.JPEG. Built by the shared helper so this and
     # the dataset-registration step cannot drift apart on the key they join on.
     frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
+    # On the frame rather than in the return tuple, which every caller and test
+    # already unpacks as exactly (frame, cluster_column).
+    frame.attrs["tile_names_normalized"] = renamed
     return frame, cluster_columns[0]
 
 
@@ -190,6 +200,10 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float 
         "reference": str(frame["hpc_reference"].iloc[0]),
         "min_margin": min_margin,
         "excluded_from_aggregates": int((frame["vote_margin"] < min_margin).sum()) if min_margin > 0 else 0,
+        # How many tile names had ".jpeg" appended on the way in. Zero for a CSV
+        # written after the packaging fix; non-zero says the match rate below
+        # was only reachable because of that correction.
+        "tile_names_normalized": int(frame.attrs.get("tile_names_normalized", 0)),
     }
 
 
@@ -557,6 +571,11 @@ def main() -> None:
     print(f"CSV            : {args.csv}")
     print(f"  rows         {report['rows']:,}   cluster column '{cluster_column}'")
     print(f"  reference    {report['reference']}")
+    if report.get("tile_names_normalized"):
+        print(f"  tile names   .jpeg appended to "
+              f"{report['tile_names_normalized']:,} name(s) so they match the "
+              f"Knowledge Bank's '18_15.jpeg' form; the CSV on disk still holds "
+              f"the short form")
     print(f"  matched      {report['matched']:,} of {report['rows']:,} "
           f"({report['matched'] / report['rows'] * 100:.1f}%) in tile_registry")
     if report["unmatched"]:

@@ -78,8 +78,9 @@ from load_hpc_assignments import _LOOKUP_CHUNK, make_engine  # noqa: E402
 from slide_naming import (  # noqa: E402
     file_uuid_from_raw_path,
     make_slide_tile_series,
+    normalize_tile_names,
     slide_id_from_raw_path,
-    tiles_missing_suffix,
+    tile_name_verdict,
 )
 from tile_metadata import read_tile_metadata, tile_metadata_path  # noqa: E402
 
@@ -136,19 +137,35 @@ def read_h5_identity(h5_path: Path) -> pd.DataFrame:
         slides = [v.decode("utf-8", "replace") for v in f["slides"][:]]
         tiles_raw = f["tiles"][:]
 
-    if tiles_missing_suffix(tiles_raw):
+    # A .h5 packaged before make_hpl_hdf5.py started storing "18_15.jpeg" holds
+    # "18_15", which joins nothing in the KB. That used to be refused here and
+    # sent to migrate_tile_names.py; the suffix is appended instead, because the
+    # mapping is total and lossless (auto_tile_from_mask.py:150 writes every
+    # tile as f"{col}_{row}.jpeg") and the count is reported rather than the
+    # correction being made silently.
+    #
+    # Mixed is the exception and is still refused. It is what a resume that
+    # straddled the fix leaves behind, the two sides cannot be told apart by
+    # name, and appending to one of them would attach real cluster IDs to the
+    # wrong tiles — the exact failure this codebase is written against.
+    verdict = tile_name_verdict(tiles_raw)
+    if verdict == "mixed":
         raise SystemExit(
-            f"{h5_path} has tile names without a file extension (e.g. "
-            f"{tiles_raw[0]!r}). This .h5 was packaged before the tile-name fix. "
-            f"Migrate it first: python migrate_tile_names.py --h5 {h5_path} --commit"
+            f"{h5_path} has SOME tile names with a file extension and some "
+            f"without. That is what a packaging resume straddling the tile-name "
+            f"fix leaves behind, and the two cannot be told apart by name, so "
+            f"the suffix cannot be filled in. Repackage this dataset."
         )
-    tiles = [v.decode("utf-8", "replace") for v in tiles_raw]
+    tiles, renamed = normalize_tile_names(tiles_raw)
 
     frame = pd.DataFrame({
         "samples": samples, "slides": slides, "tiles": tiles,
         "image_index": np.arange(n, dtype=np.int64),
     })
     frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
+    # Carried on the frame rather than returned alongside it: read_h5_identity's
+    # single return value is what every caller and test already expects.
+    frame.attrs["tile_names_normalized"] = renamed
     return frame
 
 
@@ -177,7 +194,20 @@ def read_tile_coordinates(tile_dir: Path, tile_dataset_name: str,
                                      "y_5x", "x_native", "y_native", "slide_tile"]), missing
 
     coords = pd.concat(frames, ignore_index=True)
+    # Stage 1 metadata written before the same fix carries short names too, and
+    # normalising only the .h5 would leave this side short — which does not
+    # fail, it comes back as tiles_with_coordinates: 0, the silent version of
+    # the bug the .h5 guard used to catch loudly.
+    verdict = tile_name_verdict(coords["tiles"])
+    if verdict == "mixed":
+        raise SystemExit(
+            f"Stage 1 metadata under {tile_dir / tile_dataset_name} has some "
+            f"tile names with a file extension and some without, so the suffix "
+            f"cannot be filled in. Re-tile the slides this covers."
+        )
+    coords["tiles"], renamed = normalize_tile_names(coords["tiles"])
     coords["slide_tile"] = make_slide_tile_series(coords["slides"], coords["tiles"])
+    coords.attrs["tile_names_normalized"] = renamed
     return coords, missing
 
 
@@ -473,6 +503,14 @@ def build_registration(h5_path: Path, tile_dir: Path, tile_dataset_name: str,
         "ambiguous_slides": ambiguous_slides,
         "unreadable_slides": unreadable_slides,
         "conflicting_samples": conflicting_samples,
+        # How many tile names on each side had ".jpeg" appended to make the join
+        # key. Reported rather than silent: this is a correction to identity,
+        # and the whole argument for making it automatically is that it is
+        # visible when it happens.
+        "tile_names_normalized": {
+            "h5": int(identity.attrs.get("tile_names_normalized", 0)),
+            "coordinates": int(coords.attrs.get("tile_names_normalized", 0)),
+        },
     }
 
 
@@ -588,6 +626,7 @@ def preview(engine, plan: dict, dataset_id: str) -> dict:
         "ambiguous_slides": plan["ambiguous_slides"],
         "unreadable_slides": plan["unreadable_slides"],
         "conflicting_samples": plan["conflicting_samples"],
+        "tile_names_normalized": plan["tile_names_normalized"],
         "existing": existing,
         "foreign_collisions": foreign,
     }
@@ -724,6 +763,15 @@ def report(result: dict, commit_mode: bool) -> None:
     print(f"slides in wsi_registry  {result['slides_registered']:,}")
     print(f"slides with metadata    {result['slides_with_metadata']:,}")
     print(f"dataset_config rows     {result['dataset_config_rows']:,}")
+
+    renamed = result.get("tile_names_normalized") or {}
+    if any(renamed.values()):
+        print(f"\ntile names            .jpeg appended to "
+              f"{renamed.get('h5', 0):,} name(s) from the .h5 and "
+              f"{renamed.get('coordinates', 0):,} from Stage 1's metadata, so "
+              f"they match the '18_15.jpeg' form the Knowledge Bank joins on. "
+              f"The artifacts on disk still hold the short form — "
+              f"migrate_tile_names.py fixes them there.")
 
     if not result["slides_registered"]:
         print("\nNo wsi_registry rows: --raw-dir was not given. The tiles will "

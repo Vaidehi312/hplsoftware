@@ -1327,10 +1327,11 @@ def _pipeline_steps(status: dict) -> list[dict]:
     h5_state = status.get("h5_slurm_state")
     if status.get("h5_ready"):
         # Legacy tile names are noted, not treated as a failure: the .h5 is
-        # usable and every stage between here and the KB load reads it happily.
-        # Only the Knowledge Bank join needs the suffix, and migrating the
-        # assignments CSV at that point fixes it without recomputing anything.
-        packaging = ("done", ".h5 ready (tile names need migrating before KB load)"
+        # usable and every stage that reads it — including registration and the
+        # KB load, which append the suffix themselves — handles it. Worth saying
+        # anyway, because the file on disk still holds the short form and
+        # anything reading it outside this pipeline will see that.
+        packaging = ("done", ".h5 ready (legacy tile names; handled on load)"
                              if status.get("h5_legacy_tile_names") else ".h5 ready")
     elif status.get("h5_job_id"):
         if h5_state in _SLURM_IN_FLIGHT:
@@ -2988,6 +2989,18 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
     if report.get("tile_dataset_name"):
         st.caption(f"Tile metadata read from tile folder `{report['tile_dataset_name']}`.")
 
+    # A correction to tile identity, so it is stated rather than left to be
+    # inferred from the fact that the numbers came out right.
+    renamed = report.get("tile_names_normalized") or {}
+    if any(renamed.values()):
+        st.info(
+            f"`.jpeg` was appended to {renamed.get('h5', 0):,} tile name(s) from "
+            f"the packaged .h5 and {renamed.get('coordinates', 0):,} from Stage 1's "
+            f"metadata, so they match the `18_15.jpeg` form the Knowledge Bank "
+            f"joins on. The rows written here are correct; the files on disk still "
+            f"hold the short form, which `migrate_tile_names.py` fixes there."
+        )
+
     if not report.get("slides_registered"):
         st.warning(
             "No wsi_registry rows would be written — the run's raw slide "
@@ -3172,6 +3185,13 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
         f"Matched **{report['matched']:,}/{report['rows']:,}** "
         f"({report['match_rate'] * 100:.1f}%) tiles in `tile_registry`"
     )
+    if report.get("tile_names_normalized"):
+        st.info(
+            f"`.jpeg` was appended to {report['tile_names_normalized']:,} tile "
+            f"name(s) from this CSV so they match the Knowledge Bank's "
+            f"`18_15.jpeg` form — the match rate above depends on that "
+            f"correction. The CSV on disk still holds the short form."
+        )
     if report["unmatched"]:
         st.warning(f"{report['unmatched']:,} unmatched, e.g. {report['unmatched_examples']}")
     if report["overwriting"]:

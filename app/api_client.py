@@ -21,6 +21,19 @@ from PIL import Image
 from local_cache import LocalImageCache
 
 
+#: Read timeout for the four Knowledge Bank endpoints, which run their whole
+#: job in-process inside the request rather than handing it to Slurm. On a real
+#: cohort that is minutes to hours: registration opens the packaged .h5, reads a
+#: per-slide metadata CSV for every slide, and queries the KB for collisions,
+#: and with "Also read slide headers" ticked it opens every slide file as well.
+#: The 30s default turned that into a read timeout that looks like a failure
+#: while the server is still working — and, worse, on /register and /kb-load the
+#: work carries on and commits after the client has given up. Three hours is a
+#: deliberate over-estimate: nothing here should hit it, and a job that does has
+#: a real problem rather than a slow one.
+KB_REQUEST_TIMEOUT = 3 * 60 * 60
+
+
 class TileServerClient:
     #: Knowledge Bank the server should read and write. "production" is hpl_kb,
     #: "test" is hpl_kb_test.
@@ -479,6 +492,7 @@ class TileServerClient:
             f"/dataset-jobs/{submission_id}/kb-load-preview",
             {"min_margin": min_margin, "csv_path": csv_path,
              "kb_target": self.kb_target},
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
     def commit_kb_load(
@@ -508,6 +522,7 @@ class TileServerClient:
                 "min_margin": min_margin,
                 "kb_target": self.kb_target,
             },
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
     def preview_registration(self, submission_id: str,
@@ -545,6 +560,7 @@ class TileServerClient:
             "write_dataset_config": write_dataset_config,
             "replace": replace,
             },
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
     def commit_registration(self, submission_id: str,
@@ -584,6 +600,7 @@ class TileServerClient:
             "write_dataset_config": write_dataset_config,
             "replace": replace,
             },
+            timeout=KB_REQUEST_TIMEOUT,
         )
 
 

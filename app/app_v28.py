@@ -2957,16 +2957,22 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
 
         else:
             try:
-                st.session_state[preview_key] = client.preview_registration(
-                    submission_id,
-                    dataset_id=dataset_id.strip(),
-                    tile_dataset_name=tile_dataset_name.strip(),
-                    scope="subset" if registration_scope == "Subset" else "full",
-                    slide_names=registration_slide_names,
-                    slide_metadata=slide_metadata,
-                    write_dataset_config=write_dataset_config,
-                    replace=replace,
-                )
+                # Spinner because this runs the whole scan inside the request —
+                # the .h5, a metadata CSV per slide, and the collision queries.
+                # On a real cohort that is minutes, and an unexplained frozen
+                # page is what a 30s read timeout used to look like.
+                with st.spinner("Scanning the .h5, Stage 1 metadata and the "
+                                "Knowledge Bank — minutes on a large cohort."):
+                    st.session_state[preview_key] = client.preview_registration(
+                        submission_id,
+                        dataset_id=dataset_id.strip(),
+                        tile_dataset_name=tile_dataset_name.strip(),
+                        scope="subset" if registration_scope == "Subset" else "full",
+                        slide_names=registration_slide_names,
+                        slide_metadata=slide_metadata,
+                        write_dataset_config=write_dataset_config,
+                        replace=replace,
+                    )
             except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
                 st.session_state.pop(preview_key, None)
                 st.error(f"Preview failed: {e}")
@@ -3069,16 +3075,18 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             return
 
         try:
-            result = client.commit_registration(
-                submission_id,
-                dataset_id=dataset_id.strip(),
-                tile_dataset_name=tile_dataset_name.strip(),
-                scope="subset" if registration_scope == "Subset" else "full",
-                slide_names=registration_slide_names,
-                slide_metadata=slide_metadata,
-                write_dataset_config=write_dataset_config,
-                replace=replace,
-            )
+            with st.spinner("Writing this cohort's identity rows — minutes on a "
+                            "large cohort. Don't reload the page."):
+                result = client.commit_registration(
+                    submission_id,
+                    dataset_id=dataset_id.strip(),
+                    tile_dataset_name=tile_dataset_name.strip(),
+                    scope="subset" if registration_scope == "Subset" else "full",
+                    slide_names=registration_slide_names,
+                    slide_metadata=slide_metadata,
+                    write_dataset_config=write_dataset_config,
+                    replace=replace,
+                )
             written = result.get("written") or {}
             st.success("Registered: " + ", ".join(
                 f"{t} +{n:,}" for t, n in written.items()))
@@ -3162,10 +3170,12 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
             st.error("Enter the assignment CSV path.")
         else:
             try:
-                st.session_state[preview_key] = client.preview_kb_load(
-                    submission_id, min_margin=min_margin,
-                    csv_path=manual_csv_path.strip() or None,
-                )
+                with st.spinner("Reading the assignment CSV and matching it "
+                                "against tile_registry — minutes on a large cohort."):
+                    st.session_state[preview_key] = client.preview_kb_load(
+                        submission_id, min_margin=min_margin,
+                        csv_path=manual_csv_path.strip() or None,
+                    )
             except requests.exceptions.HTTPError as e:
                 st.error(f"Preview failed: {_error_detail(e)[1]}")
                 st.session_state.pop(preview_key, None)
@@ -3248,14 +3258,17 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
         disabled=report["would_refuse_low_match"],
     ):
         try:
-            result = client.commit_kb_load(
-                submission_id,
-                cancer_type=cancer_type.strip() or None,
-                allow_unknown_clusters=allow_unknown,
-                skip_profiles=skip_profiles,
-                min_margin=min_margin,
-                csv_path=manual_csv_path.strip() or None,
-            )
+            with st.spinner("Writing tile_registry and refreshing the per-slide "
+                            "aggregates — minutes on a large cohort. Don't reload "
+                            "the page."):
+                result = client.commit_kb_load(
+                    submission_id,
+                    cancer_type=cancer_type.strip() or None,
+                    allow_unknown_clusters=allow_unknown,
+                    skip_profiles=skip_profiles,
+                    min_margin=min_margin,
+                    csv_path=manual_csv_path.strip() or None,
+                )
             msg = f"Committed {result['updated_rows']:,} tile(s) to the Knowledge Bank."
             if result.get("excluded_from_aggregates"):
                 msg += (f" {result['excluded_from_aggregates']:,} tile(s) below "

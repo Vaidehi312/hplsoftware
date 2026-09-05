@@ -28,10 +28,15 @@ from local_cache import LocalImageCache
 #: and with "Also read slide headers" ticked it opens every slide file as well.
 #: The 30s default turned that into a read timeout that looks like a failure
 #: while the server is still working — and, worse, on /register and /kb-load the
-#: work carries on and commits after the client has given up. Three hours is a
-#: deliberate over-estimate: nothing here should hit it, and a job that does has
-#: a real problem rather than a slow one.
-KB_REQUEST_TIMEOUT = 3 * 60 * 60
+#: work carries on and commits after the client has given up, so the UI reports
+#: an error over rows that are now in the KB. A day is a deliberate ceiling
+#: rather than an estimate: nothing here should come close, and the cost of
+#: setting it too low is a false failure on a real write, while the cost of
+#: setting it too high is only that a genuinely wedged request has to be killed
+#: by restarting the client. Note requests treats this as a *read* timeout —
+#: time waiting for bytes, not total duration — and these endpoints send nothing
+#: until they finish, so for them the two are the same thing.
+KB_REQUEST_TIMEOUT = 24 * 60 * 60
 
 
 class TileServerClient:

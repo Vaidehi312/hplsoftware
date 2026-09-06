@@ -609,6 +609,62 @@ class TileServerClient:
         )
 
 
+    def submit_registration(self, submission_id: str,
+                            dataset_id: str | None = None,
+                            tile_dataset_name: str | None = None,
+                            scope: str = "full",
+                            slide_names: list[str] | None = None,
+                            slide_metadata: bool = False,
+                            write_dataset_config: bool = True,
+                            replace: bool = False) -> dict:
+        """Queue Stage 5 on Slurm instead of writing inside the request.
+
+        Returns as soon as sbatch has taken the job, so the write outlives this
+        client and the server both. Poll get_dataset_job_status() for
+        registration_slurm_state and registration_done — the job sets done
+        itself, so it still means committed.
+
+        Same arguments as commit_registration, and the job runs the same
+        functions with the same guards; the difference is only where."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/register-submit",
+            {
+                "dataset_id": dataset_id,
+                "tile_dataset_name": tile_dataset_name,
+                "kb_target": self.kb_target,
+                "scope": scope,
+                "slide_names": slide_names,
+                "slide_metadata": slide_metadata,
+                "write_dataset_config": write_dataset_config,
+                "replace": replace,
+            },
+        )
+
+    def submit_kb_load(self, submission_id: str,
+                       cancer_type: str | None = None,
+                       allow_unknown_clusters: bool = False,
+                       skip_profiles: bool = False,
+                       min_margin: float = 0.0,
+                       csv_path: str | None = None) -> dict:
+        """Queue Stage 6 on Slurm. See submit_registration."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/kb-load-submit",
+            {
+                "cancer_type": cancer_type,
+                "allow_unknown_clusters": allow_unknown_clusters,
+                "skip_profiles": skip_profiles,
+                "csv_path": csv_path,
+                "min_margin": min_margin,
+                "kb_target": self.kb_target,
+            },
+        )
+
+    def check_kb_job_db(self) -> dict:
+        """Can a compute node reach Postgres? Queues a one-second srun, so it is
+        slow — minutes if the queue is busy — and is only worth calling when a
+        Slurm-backed KB write has been refused or has failed to connect."""
+        return self._get_json("/kb-job-db-check", timeout=300)
+
     def start_test_packaging(
         self,
         submission_id: str,

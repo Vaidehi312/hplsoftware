@@ -57,12 +57,22 @@ dedicated `submit_*.py` modules that build and run their own `sbatch`. Stage 1 a
 wrapper, `submit_dataset_tiling.sh`, which expects a `mask_and_tile_array.sbatch` alongside it that is
 not in this repo — it lives on the cluster. Stage 2's submission is
 driven by the server's `/package` endpoint, and `make_hpl_hdf5.package_slides_to_h5` is additionally
-imported and called in-process on the single-slide upload path. Stages 5 and 6 submit no Slurm job at
-all — `register_dataset.py`'s and `load_hpc_assignments.py`'s functions run in-process inside
-`tile_server_v2_.py` (`/register-preview`, `/register`, `/kb-load-preview`, `/kb-load`), so
-`registration_done` and `kb_load_done` are the only state tracked for them
-(`migrate_dataset_runs_registration.sql`, `migrate_dataset_runs_kb_load.sql`), with no
-job_id/slurm_state pair.
+imported and called in-process on the single-slide upload path. Stages 5 and 6 can run **either**
+way: `register_dataset.py`'s and `load_hpc_assignments.py`'s functions run in-process inside
+`tile_server_v2_.py` (`/register-preview`, `/register`, `/kb-load-preview`, `/kb-load`), and the same
+two CLIs are submitted to Slurm by `submit_kb_write.py` via `/register-submit` and `/kb-load-submit`
+(`migrate_dataset_runs_kb_slurm.sql` adds their job_id/state pair). The in-process path was never
+lost to a closed browser — FastAPI runs a sync endpoint in a threadpool and uvicorn does not cancel it
+on client disconnect — but it dies with the server, which is why the Slurm path exists. `registration_done`
+and `kb_load_done` mean *committed* on both paths: on the Slurm path the **job** sets them, through
+`--record-run` and `run_record.py`, because the job is the only process that knows.
+
+**A Slurm-backed KB write needs Postgres reachable from a compute node,** and nothing about the
+server's own connection tells you whether it is. `DB_HOST=127.0.0.1` means the compute node itself,
+and a unix socket path is local to the database's machine however shared the filesystem is — so
+`submit_kb_write.resolve_job_db_host()` refuses both at submit time and demands `HPL_JOB_DB_HOST`.
+Check it once with `python backend/submit_kb_write.py --check-db` (or `GET /kb-job-db-check`), which
+sruns a one-second TCP probe from an actual compute node.
 
 **Stage 5 exists because Stage 6 only ever `UPDATE`s.** `load_hpc_assignments.load()` sets
 `tile_registry.hpc_id` on rows that must already be there, so for a cohort that has never touched the

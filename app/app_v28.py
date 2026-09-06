@@ -1433,6 +1433,12 @@ def _pipeline_steps(status: dict) -> list[dict]:
         else:
             summary = "registered"
         registration = ("done", summary[:70])
+    elif status.get("registration_slurm_state") in _SLURM_IN_FLIGHT:
+        # A Slurm-backed write in flight. Without this the stage reads "ready to
+        # register" while a job is actively writing, which invites a second one.
+        registration = ("running", f"running ({status['registration_slurm_state']})")
+    elif status.get("registration_job_id"):
+        registration = ("attention", "a job ended without committing")
     elif status.get("registration_ready"):
         registration = ("action", "ready to register")
     else:
@@ -1451,6 +1457,10 @@ def _pipeline_steps(status: dict) -> list[dict]:
     if status.get("kb_load_done"):
         rows = status.get("kb_load_rows")
         kb_load = ("done", f"{rows:,} tiles in the KB" if rows is not None else "loaded")
+    elif status.get("kb_load_slurm_state") in _SLURM_IN_FLIGHT:
+        kb_load = ("running", f"running ({status['kb_load_slurm_state']})")
+    elif status.get("kb_load_job_id"):
+        kb_load = ("attention", "a job ended without committing")
     elif not status.get("assignment_ready"):
         kb_load = ("blocked", "waiting on cluster classification")
     elif not status.get("registration_done"):
@@ -2767,6 +2777,61 @@ def _render_assign_clusters_form(status: dict, submission_id: str, key_prefix: s
         st.error(f"Failed to start cluster assignment: {e}")
 
 
+def _render_kb_job_state(status: dict, prefix: str, label: str) -> bool:
+    """Show a Slurm-backed KB write's state. True if one is in flight.
+
+    Stages 5 and 6 can run either in the server or as a Slurm job. The job is
+    the durable one — it outlives this page and the server — so its state has to
+    be visible here, or a queued write looks exactly like nothing having
+    happened, which is the confusion this whole feature exists to end.
+    """
+    job_id = status.get(f"{prefix}_job_id")
+    if not job_id or status.get(f"{prefix}_done"):
+        return False
+
+    job_state = status.get(f"{prefix}_slurm_state")
+    st.caption(f"{label} job:")
+    st.code(job_id, language=None)
+    if job_state in _SLURM_IN_FLIGHT:
+        st.info(
+            f"Running on Slurm (state: {job_state}). This continues whether or "
+            f"not this page is open, and whether or not the tile server is "
+            f"running. The step turns green when the job records that it "
+            f"committed."
+        )
+        if status.get(f"{prefix}_log_path"):
+            st.caption(f"Log: `{status[f'{prefix}_log_path']}`")
+        return True
+
+    # Not in flight and not done: it ended without committing. The job's own
+    # error is worth more than the Slurm state, since every refusal this stage
+    # makes is a sentence rather than an exit code.
+    st.warning(f"The last {label.lower()} job ended as: "
+               f"{job_state or 'no Slurm record'}, without recording a commit.")
+    if status.get(f"{prefix}_error"):
+        st.error(status[f"{prefix}_error"])
+    if status.get(f"{prefix}_log_path"):
+        st.caption(f"Log: `{status[f'{prefix}_log_path']}` — a refusal inside the "
+                   f"job is printed there in full.")
+    return False
+
+
+def _render_write_mode(submission_id: str, key_prefix: str, name: str) -> str:
+    """Where the write runs. Returns "slurm" or "server"."""
+    choice = st.radio(
+        "Run the write",
+        ["On Slurm (survives closing this page)", "In the server (waits here)"],
+        horizontal=True,
+        key=f"{key_prefix}{name}_write_mode_{submission_id}",
+        help="Slurm is the durable one: the job keeps writing if you close the "
+             "browser or the tile server dies, and records the outcome on the "
+             "run itself. Running it in the server keeps the numbers in front of "
+             "you, but a killed server takes the write with it. Both run exactly "
+             "the same code with the same guards.",
+    )
+    return "slurm" if choice.startswith("On Slurm") else "server"
+
+
 def _render_registration_step(status: dict, submission_id: str, key_prefix: str, state: str):
     """Stage 5: create this cohort's identity rows in the Knowledge Bank.
 
@@ -2791,6 +2856,11 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             st.caption(" · ".join(f"{t}: {n:,}" for t, n in rows.items()))
         if status.get("registration_at"):
             st.caption(f"Last registered: {status['registration_at']}")
+
+    if _render_kb_job_state(status, "registration", "Registration"):
+        # A queued or running job owns this stage; offering the form under it
+        # would invite a second write against the same cohort.
+        return
 
     if state == "blocked":
         st.info(
@@ -3053,6 +3123,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
     blocked = bool(report.get("would_refuse_collision")
                    or report.get("needs_replace")
                    or report.get("missing_tables"))
+    write_mode = _render_write_mode(submission_id, key_prefix, "reg")
     if st.button(
         "Register subset in the Knowledge Bank"
         if registration_scope == "Subset"
@@ -3074,24 +3145,36 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             )
             return
 
+        kwargs = dict(
+            dataset_id=dataset_id.strip(),
+            tile_dataset_name=tile_dataset_name.strip(),
+            scope="subset" if registration_scope == "Subset" else "full",
+            slide_names=registration_slide_names,
+            slide_metadata=slide_metadata,
+            write_dataset_config=write_dataset_config,
+            replace=replace,
+        )
         try:
-            with st.spinner("Writing this cohort's identity rows — minutes on a "
-                            "large cohort. Don't reload the page."):
-                result = client.commit_registration(
-                    submission_id,
-                    dataset_id=dataset_id.strip(),
-                    tile_dataset_name=tile_dataset_name.strip(),
-                    scope="subset" if registration_scope == "Subset" else "full",
-                    slide_names=registration_slide_names,
-                    slide_metadata=slide_metadata,
-                    write_dataset_config=write_dataset_config,
-                    replace=replace,
+            if write_mode == "slurm":
+                result = client.submit_registration(submission_id, **kwargs)
+                st.success(
+                    f"Queued as Slurm job {result.get('registration_job_id')}. "
+                    f"It writes to {result.get('database')} whether or not this "
+                    f"page stays open."
                 )
-            written = result.get("written") or {}
-            st.success("Registered: " + ", ".join(
-                f"{t} +{n:,}" for t, n in written.items()))
+                if result.get("registration_log_path"):
+                    st.caption(f"Log: `{result['registration_log_path']}`")
+            else:
+                with st.spinner("Writing this cohort's identity rows — minutes on "
+                                "a large cohort. Don't reload the page."):
+                    result = client.commit_registration(submission_id, **kwargs)
+                written = result.get("written") or {}
+                st.success("Registered: " + ", ".join(
+                    f"{t} +{n:,}" for t, n in written.items()))
             st.session_state.pop(preview_key, None)
             st.rerun()
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Registration refused: {_error_detail(e)[1]}")
         except Exception as e:  # noqa: BLE001
             st.error(f"Registration refused: {e}")
 
@@ -3116,6 +3199,9 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
         if status.get("kb_load_at"):
             st.caption(f"Last loaded: {status['kb_load_at']}")
         st.caption("If Stage 4 has been re-run since, preview below and reload.")
+
+    if _render_kb_job_state(status, "kb_load", "Knowledge Bank load"):
+        return
 
     # "blocked" only means *this run's* tracked assignment (Stage 4's "Full
     # dataset" mode) has not produced a usable output. Loading from an
@@ -3252,23 +3338,35 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
                  "tile_registry values. Off unless you have a specific reason.",
         )
 
+    write_mode = _render_write_mode(submission_id, key_prefix, "kb_load")
     if st.button(
         "Commit to Knowledge Bank",
         key=f"{key_prefix}kb_load_commit_{submission_id}",
         disabled=report["would_refuse_low_match"],
     ):
+        kwargs = dict(
+            cancer_type=cancer_type.strip() or None,
+            allow_unknown_clusters=allow_unknown,
+            skip_profiles=skip_profiles,
+            min_margin=min_margin,
+            csv_path=manual_csv_path.strip() or None,
+        )
         try:
+            if write_mode == "slurm":
+                result = client.submit_kb_load(submission_id, **kwargs)
+                st.success(
+                    f"Queued as Slurm job {result.get('kb_load_job_id')}. It "
+                    f"writes to {result.get('database')} whether or not this page "
+                    f"stays open."
+                )
+                if result.get("kb_load_log_path"):
+                    st.caption(f"Log: `{result['kb_load_log_path']}`")
+                st.session_state.pop(preview_key, None)
+                st.rerun()
             with st.spinner("Writing tile_registry and refreshing the per-slide "
                             "aggregates — minutes on a large cohort. Don't reload "
                             "the page."):
-                result = client.commit_kb_load(
-                    submission_id,
-                    cancer_type=cancer_type.strip() or None,
-                    allow_unknown_clusters=allow_unknown,
-                    skip_profiles=skip_profiles,
-                    min_margin=min_margin,
-                    csv_path=manual_csv_path.strip() or None,
-                )
+                result = client.commit_kb_load(submission_id, **kwargs)
             msg = f"Committed {result['updated_rows']:,} tile(s) to the Knowledge Bank."
             if result.get("excluded_from_aggregates"):
                 msg += (f" {result['excluded_from_aggregates']:,} tile(s) below "

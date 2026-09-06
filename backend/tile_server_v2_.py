@@ -96,6 +96,14 @@ from submit_cluster_assignment import (
     vote_flags,
 )
 
+from submit_kb_write import (
+    JOB_DB_HOST_ENV,
+    check_db_from_compute_node,
+    resolve_job_db_host,
+    submit_kb_load_job,
+    submit_registration_job,
+)
+
 from load_hpc_assignments import (
     read_assignments as _read_kb_assignments,
     inspect as _inspect_kb_load,
@@ -4800,6 +4808,171 @@ def commit_registration(submission_id: str, req: RegistrationRequest):
     }
 
 
+# --- Stages 5 and 6 as Slurm jobs -------------------------------------------
+#
+# The same two writes, handed to Slurm instead of run inside the request. The
+# endpoints above still exist and still work; these are for a cohort big enough
+# that the write outliving the server matters. What the job runs is the CLI, so
+# every guard is the same code — a low match rate, a cohort collision, an
+# existing registration without replace are all refused inside the job exactly
+# as they are refused inline.
+#
+# Preview first, the same as before. These endpoints deliberately do not run the
+# plan: building it is most of the work, and doing it twice would put the cost
+# back in the request that this exists to get it out of.
+
+
+def _refuse_if_job_in_flight(row, job_column: str, label: str) -> None:
+    job_id = row.get(job_column)
+    if not job_id:
+        return
+    state = _get_slurm_job_state(job_id)
+    if state in _SLURM_IN_FLIGHT:
+        raise HTTPException(
+            400,
+            f"{label} is already queued or running for this run (job {job_id}, "
+            f"state {state}). Cancel it first if you mean to replace it.",
+        )
+
+
+@app.post("/dataset-jobs/{submission_id}/register-submit")
+def submit_registration(submission_id: str, req: RegistrationRequest):
+    """Queue Stage 5 on Slurm. Returns immediately with a job id."""
+    row = _get_dataset_run_row(submission_id)
+    target = _resolve_kb_target(req.kb_target)
+
+    packaged = row.get("h5_output_path")
+    if not packaged or not Path(packaged).is_file():
+        raise HTTPException(400, "This run has no packaged .h5 on disk — "
+                                 "registration reads tile identity out of it.")
+    tile_dir = Path(row.get("tile_dir") or PROCESSED_TILES_DIR)
+    supplied = (req.tile_dataset_name or "").strip()
+    dataset_name = supplied or row.get("dataset_name")
+    if not dataset_name:
+        raise HTTPException(400, "No tile dataset name for this run — send "
+                                 "tile_dataset_name.")
+    try:
+        dataset_name = _sanitize_dataset_name(dataset_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    raw_dir = Path(row["raw_dir"]) if row.get("raw_dir") else None
+    if raw_dir is not None and not raw_dir.is_dir():
+        raw_dir = None
+    params = _row_tiling_params(row) or {} if req.write_dataset_config else {}
+
+    with _slurm_submission_lock():
+        _refuse_if_job_in_flight(row, "registration_job_id", "Registration")
+        try:
+            result = submit_registration_job(
+                submission_id=submission_id,
+                h5=Path(packaged),
+                tile_dir=tile_dir,
+                tile_dataset_name=dataset_name,
+                dataset_id=(req.dataset_id or dataset_name).strip().upper(),
+                db_name=KB_TARGETS[target],
+                run_db_name=KB_TARGETS[KB_PRODUCTION],
+                raw_dir=raw_dir,
+                slide_metadata=req.slide_metadata,
+                target_mpp=params.get("target_mpp"),
+                tile_size_5x_px=params.get("target_tile_px"),
+                scope=(req.scope or "full").strip().lower(),
+                slide_names=req.slide_names,
+                replace=req.replace,
+                notify_email=row.get("notify_email"),
+            )
+        except ValueError as e:
+            # resolve_job_db_host's refusal, which is the one worth reading in
+            # full — it names the variable to set and how to test it.
+            raise HTTPException(400, str(e))
+        except FileNotFoundError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Failed to submit registration job: {e}")
+
+        _update_dataset_run_best_effort(
+            submission_id,
+            registration_job_id=result.get("registration_job_id"),
+            registration_submitted_at=datetime.now(timezone.utc),
+            registration_log_path=result.get("registration_log_path"),
+            registration_error=None,
+            registration_kb_target=target,
+        )
+        _record_run_job(submission_id, "registration",
+                        result.get("registration_job_id"),
+                        params={"dataset_id": req.dataset_id,
+                                "tile_dataset_name": dataset_name,
+                                "kb_target": target})
+    return {"submission_id": submission_id, "kb_target": target,
+            "database": KB_TARGETS[target], **result}
+
+
+@app.post("/dataset-jobs/{submission_id}/kb-load-submit")
+def submit_kb_load(submission_id: str, req: KbLoadRequest):
+    """Queue Stage 6 on Slurm. Returns immediately with a job id."""
+    row = _get_dataset_run_row(submission_id)
+    target = _resolve_kb_target(req.kb_target)
+    csv_path = _kb_load_source_csv(row, override_path=req.csv_path)
+
+    with _slurm_submission_lock():
+        _refuse_if_job_in_flight(row, "kb_load_job_id", "The Knowledge Bank load")
+        try:
+            result = submit_kb_load_job(
+                submission_id=submission_id,
+                csv_path=Path(csv_path),
+                db_name=KB_TARGETS[target],
+                run_db_name=KB_TARGETS[KB_PRODUCTION],
+                cancer_type=req.cancer_type,
+                allow_unknown_clusters=req.allow_unknown_clusters,
+                skip_profiles=req.skip_profiles,
+                min_margin=req.min_margin,
+                notify_email=row.get("notify_email"),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except FileNotFoundError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(500, f"Failed to submit Knowledge Bank load job: {e}")
+
+        _update_dataset_run_best_effort(
+            submission_id,
+            kb_load_job_id=result.get("kb_load_job_id"),
+            kb_load_submitted_at=datetime.now(timezone.utc),
+            kb_load_log_path=result.get("kb_load_log_path"),
+            kb_load_error=None,
+            kb_load_kb_target=target,
+        )
+        _record_run_job(submission_id, "kb_load", result.get("kb_load_job_id"),
+                        params={"csv_path": str(csv_path), "kb_target": target,
+                                "min_margin": req.min_margin})
+    return {"submission_id": submission_id, "kb_target": target,
+            "database": KB_TARGETS[target], "csv_path": str(csv_path), **result}
+
+
+@app.get("/kb-job-db-check")
+def kb_job_db_check():
+    """Can a compute node reach Postgres? The whole feature rests on it.
+
+    Read-only and slow (it queues a one-second srun), so the UI asks only when
+    the operator clicks — but it is here rather than in a runbook because the
+    answer is cluster configuration nobody can infer from the server, which
+    reaches the database over a socket or localhost quite happily.
+    """
+    try:
+        return check_db_from_compute_node()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            504, "The probe job did not run within 5 minutes — the queue is busy "
+                 "rather than the database unreachable. Try again, or run "
+                 "`python submit_kb_write.py --check-db` yourself.")
+    except FileNotFoundError:
+        raise HTTPException(400, "srun is not on this machine's PATH, so there "
+                                 "is no Slurm to submit to.")
+
+
 @app.post("/dataset-jobs/{submission_id}/cancel")
 def cancel_dataset_job(submission_id: str):
     """Cancel every Slurm job (all tiling batches + the packaging job, if
@@ -5259,20 +5432,37 @@ def dataset_job_status(submission_id: str):
     # is what they did.
     base["registration_kb_target"] = row.get("registration_kb_target") or KB_PRODUCTION
     base["registration_rows"] = row.get("registration_rows")
+    # Since this stage can be submitted to Slurm, "done" is no longer the whole
+    # state: a job can be queued, running, or finished-without-committing. The
+    # boolean still means committed — the job sets it — and these say what is
+    # happening when it is not set yet.
+    base["registration_job_id"] = row.get("registration_job_id")
+    base["registration_log_path"] = row.get("registration_log_path")
+    base["registration_error"] = row.get("registration_error")
+    base["registration_slurm_state"] = (
+        _get_slurm_job_state(row["registration_job_id"])
+        if row.get("registration_job_id") else None
+    )
     # Registration reads tile identity out of the packaged .h5, so it is gated
     # on Stage 2 rather than on Stage 4 — it does not need an assignment, and
     # making it wait for one would keep Stage 5 blocked behind a step it could
     # have finished hours earlier.
     base["registration_ready"] = bool(base.get("h5_ready"))
 
-    # Stage 5. No job_id/slurm_state pair here — the load runs in-process and
-    # either commits in one transaction or doesn't, so kb_load_done is the
-    # single fact worth tracking (see migrate_dataset_runs_kb_load.sql).
+    # Stage 6. kb_load_done still means committed and nothing else — whichever
+    # way the load ran, in-process or as the Slurm job below.
     base["kb_load_done"] = bool(row.get("kb_load_done"))
     base["kb_load_at"] = row["kb_load_at"].isoformat() if row.get("kb_load_at") else None
     base["kb_load_rows"] = row.get("kb_load_rows")
     base["kb_load_reference"] = row.get("kb_load_reference")
     base["kb_load_kb_target"] = row.get("kb_load_kb_target") or KB_PRODUCTION
+    base["kb_load_job_id"] = row.get("kb_load_job_id")
+    base["kb_load_log_path"] = row.get("kb_load_log_path")
+    base["kb_load_error"] = row.get("kb_load_error")
+    base["kb_load_slurm_state"] = (
+        _get_slurm_job_state(row["kb_load_job_id"])
+        if row.get("kb_load_job_id") else None
+    )
     base["kb_targets"] = sorted(KB_TARGETS)
 
     if not row["job_id"] or not row["manifest_path"]:

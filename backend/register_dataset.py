@@ -82,6 +82,7 @@ from slide_naming import (  # noqa: E402
     slide_id_from_raw_path,
     tile_name_verdict,
 )
+from run_record import record_run  # noqa: E402
 from tile_metadata import read_tile_metadata, tile_metadata_path  # noqa: E402
 
 _TILE_COORDINATES_COLUMNS = (
@@ -894,6 +895,19 @@ def main() -> None:
         help="Slide ID to register when --scope subset is used. "
              "Repeat for multiple slides.",
     )
+    # Used when this runs as the Slurm job the server submits: the job is the
+    # process that knows whether the write committed, so it is the one that
+    # records it. Harmless and inert on a hand-run CLI invocation.
+    parser.add_argument("--record-run", default=None, metavar="SUBMISSION_ID",
+                        help="Record the outcome against this run in "
+                             "slurm_dataset_runs.")
+    parser.add_argument("--record-run-db", default=None, metavar="DBNAME",
+                        help="Database holding slurm_dataset_runs. Run tracking "
+                             "stays in production whichever Knowledge Bank the "
+                             "rows go to, so this is separate from DB_NAME.")
+    parser.add_argument("--record-kb-target", default=None,
+                        help="Recorded as registration_kb_target, so the run "
+                             "says which Knowledge Bank it filled.")
     args = parser.parse_args()
 
     if not args.h5.is_file():
@@ -934,8 +948,29 @@ def main() -> None:
         return
 
     result = preview(engine, plan, args.dataset_id)  # for the report's numbers
-    written = commit(engine, plan, args.dataset_id, args.replace)
+    try:
+        written = commit(engine, plan, args.dataset_id, args.replace)
+    except BaseException as e:
+        # Recorded before re-raising so a refusal or a crash leaves a reason on
+        # the run rather than a stage that simply stopped saying anything. The
+        # job's log has the traceback; this is what the UI can show.
+        if args.record_run and args.record_run_db:
+            record_run(args.record_run_db, args.record_run,
+                       registration_error=f"{type(e).__name__}: {e}"[:2000])
+        raise
     report(result, commit_mode=True)
+    if args.record_run and args.record_run_db:
+        record_run(
+            args.record_run_db, args.record_run,
+            registration_done=True,
+            registration_at=datetime.now(timezone.utc),
+            registration_dataset_id=args.dataset_id,
+            registration_raw_dir=str(args.raw_dir) if args.raw_dir else None,
+            registration_rows=json.dumps(written),
+            registration_error=None,
+            **({"registration_kb_target": args.record_kb_target}
+               if args.record_kb_target else {}),
+        )
     print("\nwritten        " + ", ".join(f"{t} +{n:,}" for t, n in written.items()))
     print("\nNext: run load_hpc_assignments.py to fill in hpc_id and the "
           "per-slide aggregates.")

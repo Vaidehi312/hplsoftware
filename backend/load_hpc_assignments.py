@@ -43,6 +43,7 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from run_record import record_run  # noqa: E402
 from slide_naming import (  # noqa: E402
     make_slide_tile_series,
     normalize_tile_names,
@@ -553,6 +554,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-unknown-clusters", action="store_true",
                         help="Load cluster IDs that have no hpc_dictionary row. They "
                              "will show in the viewer with no annotations.")
+    # See the same flags on register_dataset.py: when this runs as the Slurm
+    # job the server submits, the job is what knows whether the write committed.
+    parser.add_argument("--record-run", default=None, metavar="SUBMISSION_ID",
+                        help="Record the outcome against this run in "
+                             "slurm_dataset_runs.")
+    parser.add_argument("--record-run-db", default=None, metavar="DBNAME",
+                        help="Database holding slurm_dataset_runs. Run tracking "
+                             "stays in production whichever Knowledge Bank the "
+                             "rows go to, so this is separate from DB_NAME.")
+    parser.add_argument("--record-kb-target", default=None,
+                        help="Recorded as kb_load_kb_target, so the run says "
+                             "which Knowledge Bank it filled.")
     parser.add_argument("--min-margin", type=float, default=0.0,
                         help="Exclude tiles below this vote_margin from "
                              "hpl_profile_proportion/summary. tile_registry keeps every "
@@ -630,8 +643,25 @@ def main() -> None:
         return
 
     print(f"\nLoading into {DB_NAME}.tile_registry ...")
-    updated = load(engine, frame, cluster_column, profiles=profiles)
+    try:
+        updated = load(engine, frame, cluster_column, profiles=profiles)
+    except BaseException as e:
+        if args.record_run and args.record_run_db:
+            record_run(args.record_run_db, args.record_run,
+                       kb_load_error=f"{type(e).__name__}: {e}"[:2000])
+        raise
     print(f"Updated {updated:,} rows.")
+    if args.record_run and args.record_run_db:
+        record_run(
+            args.record_run_db, args.record_run,
+            kb_load_done=True,
+            kb_load_at=datetime.now(timezone.utc),
+            kb_load_rows=int(updated),
+            kb_load_reference=str(frame["hpc_reference"].iloc[0]),
+            kb_load_error=None,
+            **({"kb_load_kb_target": args.record_kb_target}
+               if args.record_kb_target else {}),
+        )
     if updated != report["matched"]:
         print(
             f"WARNING: updated {updated:,} but expected {report['matched']:,}. The "

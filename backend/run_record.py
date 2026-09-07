@@ -27,6 +27,7 @@ import os
 import sys
 
 from sqlalchemy import create_engine, text
+from sqlalchemy import inspect as sqlalchemy_inspect
 
 
 def run_engine(run_db_name: str):
@@ -40,18 +41,50 @@ def run_engine(run_db_name: str):
     )
 
 
+def _existing_columns(conn) -> set[str]:
+    """Columns slurm_dataset_runs actually has, via the inspector rather than
+    information_schema — the same helper register_dataset.py uses, and the one
+    that does not tie this to Postgres for the tests' sake."""
+    return {c["name"] for c in
+            sqlalchemy_inspect(conn).get_columns("slurm_dataset_runs")}
+
+
 def record_run(run_db_name: str, submission_id: str, **fields) -> bool:
-    """UPDATE slurm_dataset_runs for one run. True if it took, False if not."""
+    """UPDATE slurm_dataset_runs for one run. True if it took, False if not.
+
+    Writes only the columns the database actually has. One unapplied migration
+    used to cost the whole record: an 18-million-row registration committed, and
+    the run still said "not done" because a single new column
+    (registration_error) was missing from the UPDATE's target. The columns that
+    matter — done, at, rows — predate it by months. Dropping what the schema
+    lacks and writing the rest is strictly better than writing nothing, and the
+    skipped names are printed so the missing migration is findable rather than
+    inferred.
+    """
     if not fields:
         return True
     try:
         engine = run_engine(run_db_name)
-        set_clause = ", ".join(f"{k} = :{k}" for k in fields)
         with engine.begin() as conn:
+            available = _existing_columns(conn)
+            skipped = sorted(set(fields) - available)
+            writable = {k: v for k, v in fields.items() if k in available}
+            if skipped:
+                print(
+                    f"NOTE: {run_db_name}.slurm_dataset_runs has no column(s) "
+                    f"{', '.join(skipped)}; not recording them. Apply "
+                    f"backend/migrate_dataset_runs_kb_slurm.sql to get them.",
+                    file=sys.stderr,
+                )
+            if not writable:
+                print("NOTE: none of this stage's columns exist, so nothing was "
+                      "recorded on the run.", file=sys.stderr)
+                return False
+            set_clause = ", ".join(f"{k} = :{k}" for k in writable)
             conn.execute(
                 text(f"UPDATE slurm_dataset_runs SET {set_clause} "
                      f"WHERE submission_id = :submission_id"),
-                {**fields, "submission_id": submission_id},
+                {**writable, "submission_id": submission_id},
             )
         return True
     except Exception as e:  # noqa: BLE001 — reported, never fatal; see docstring

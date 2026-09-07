@@ -263,6 +263,91 @@ def test_the_endpoints_exist_and_report_the_job_state(_tmp=None):
     assert "/kb-job-db-check" in paths
 
 
+# --- recording the outcome on a database that is behind ------------------
+#
+# The Radiogenomics registration committed 18,485,499 tiles and then failed to
+# record it, because migrate_dataset_runs_kb_slurm.sql had not been applied and
+# one new column (registration_error) was missing from the UPDATE. The run said
+# "not done" over a write that had happened — the single most misleading state
+# this stage can be in, and the reason the record now writes what it can.
+
+
+def _runs_table(tmp_path: Path, columns: str):
+    from sqlalchemy import create_engine, text
+    engine = create_engine(f"sqlite:///{tmp_path / 'runs.sqlite'}")
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE TABLE slurm_dataset_runs ({columns})"))
+        conn.execute(text("INSERT INTO slurm_dataset_runs (submission_id) "
+                          "VALUES ('d0010a4f')"))
+    return engine
+
+
+_PRE_MIGRATION = ("submission_id TEXT PRIMARY KEY, registration_done BOOLEAN, "
+                  "registration_at TIMESTAMP, registration_dataset_id TEXT, "
+                  "registration_raw_dir TEXT, registration_rows TEXT")
+
+
+def test_a_missing_column_does_not_cost_the_whole_record(tmp_path):
+    from datetime import datetime, timezone
+    from sqlalchemy import text
+
+    import run_record
+    engine = _runs_table(tmp_path, _PRE_MIGRATION)
+    original = run_record.run_engine
+    run_record.run_engine = lambda name: engine
+    try:
+        recorded = run_record.record_run(
+            "hpl_kb", "d0010a4f",
+            registration_done=True,
+            registration_at=datetime.now(timezone.utc),
+            registration_dataset_id="RADIOGENOMICS",
+            registration_rows='{"tile_registry": 18485499}',
+            registration_error=None,          # only this column is missing
+        )
+    finally:
+        run_record.run_engine = original
+
+    assert recorded is True
+    with engine.connect() as conn:
+        done, dataset_id = conn.execute(text(
+            "SELECT registration_done, registration_dataset_id "
+            "FROM slurm_dataset_runs")).fetchone()
+    assert done, "the stage must read as done — the rows are in the KB"
+    assert dataset_id == "RADIOGENOMICS"
+
+
+def test_it_reports_false_when_nothing_could_be_recorded(tmp_path):
+    """The guard has to be able to fail: a table with none of these columns is a
+    database nobody has migrated, and claiming success there would put the run
+    back to looking committed when nothing said so."""
+    import run_record
+    engine = _runs_table(tmp_path, "submission_id TEXT PRIMARY KEY")
+    original = run_record.run_engine
+    run_record.run_engine = lambda name: engine
+    try:
+        assert run_record.record_run("hpl_kb", "d0010a4f",
+                                     registration_done=True) is False
+    finally:
+        run_record.run_engine = original
+
+
+def test_recording_never_raises_into_the_jobs_exit_status(tmp_path):
+    """Reached only after a committed Knowledge Bank transaction. Failing the
+    job here would report a write that happened as one that did not."""
+    import run_record
+    original = run_record.run_engine
+
+    def _explode(_name):
+        raise RuntimeError("database is on fire")
+
+    run_record.run_engine = _explode
+    try:
+        assert run_record.record_run("hpl_kb", "d0010a4f",
+                                     registration_done=True) is False
+    finally:
+        run_record.run_engine = original
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

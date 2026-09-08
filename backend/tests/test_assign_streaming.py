@@ -1687,17 +1687,25 @@ def _submit_with_mean(tmp_path, mean_path, shards=4):
          sca.jobs_in_flight_named) = saved
 
 
-def _dims(tmp_path) -> int:
+def _mean_width(tmp_path) -> int:
+    """The width a query mean must have: the PCA basis's *input* dimension.
+
+    Not the component count. The basis is (input dims, components) — DIM=32 and
+    NCOMP=16 in this fixture, 128 and 127 in production — and project()
+    subtracts the mean from raw embeddings before multiplying. Checking a mean
+    against the component count rejects the correct file, which is exactly what
+    the first version of this guard did to a real 128-wide mean.
+    """
     reference = tmp_path / "ref.npz"
     if not reference.is_file():
         _write_reference(reference)
-    return int(np.load(reference)["reference"].shape[1])
+    return int(np.load(reference)["components"].shape[0])
 
 
 def test_a_reused_mean_submits_no_mean_job(tmp_path):
     _write_reference(tmp_path / "ref.npz")
     mean = tmp_path / "mean.npy"
-    np.save(mean, np.zeros(_dims(tmp_path), dtype=np.float32))
+    np.save(mean, np.zeros(_mean_width(tmp_path), dtype=np.float32))
 
     info, submitted = _submit_with_mean(tmp_path, mean)
 
@@ -1715,12 +1723,18 @@ def test_a_mean_of_the_wrong_width_is_refused_before_sbatch(tmp_path):
     so a wrong width silently reprojects the whole cohort."""
     _write_reference(tmp_path / "ref.npz")
     mean = tmp_path / "mean.npy"
-    np.save(mean, np.zeros(_dims(tmp_path) + 5, dtype=np.float32))
+    # The component count rather than the embedding width — 127 against 128 in
+    # production. This is the near-miss, not an arbitrary wrong number: a mean
+    # this wide is what someone gets by reading the reference's own shape, and
+    # it is the case the first version of this guard got backwards.
+    components = int(np.load(tmp_path / "ref.npz")["reference"].shape[1])
+    np.save(mean, np.zeros(components, dtype=np.float32))
+    assert components != _mean_width(tmp_path), "the fixture must distinguish them"
 
     try:
         _submit_with_mean(tmp_path, mean)
     except ValueError as e:
-        assert "dimensions" in str(e), str(e)
+        assert "embeddings" in str(e), str(e)
         assert "wrong cluster IDs" in str(e)
     else:
         raise AssertionError("a wrong-width mean was accepted")
@@ -1730,7 +1744,7 @@ def test_a_non_finite_mean_is_refused(tmp_path):
     """What an interrupted --precompute-mean leaves behind."""
     _write_reference(tmp_path / "ref.npz")
     mean = tmp_path / "mean.npy"
-    values = np.zeros(_dims(tmp_path), dtype=np.float32)
+    values = np.zeros(_mean_width(tmp_path), dtype=np.float32)
     values[3] = np.nan
     np.save(mean, values)
 

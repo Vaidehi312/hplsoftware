@@ -178,6 +178,12 @@ def check_reference(reference: Path) -> dict:
                 "reference_path": str(reference),
                 "reference_rows": int(npz["reference"].shape[0]),
                 "reference_dims": int(npz["reference"].shape[1]),
+                # The PCA basis is (input dims, components), so this is the
+                # width of a raw embedding — 128 where reference_dims is 127.
+                # A query mean is subtracted from raw embeddings *before*
+                # projection, so it is this number a mean must match, not the
+                # component count.
+                "embedding_dims": int(npz["components"].shape[0]),
                 "n_clusters": int(len(npz["categories"])),
                 "groupby": meta.get("groupby"),
                 "k": int(npz["n_neighbors"]),
@@ -833,11 +839,20 @@ def submit_cluster_assignment_job(
                 loaded = np.load(mean_path)
             except Exception as e:  # noqa: BLE001
                 raise ValueError(f"{mean_path} is not a readable .npy: {e}") from e
-            expected = int(reference_info["reference_dims"])
+            # The raw-embedding width, not the component count. project()
+            # subtracts this mean from the embeddings and *then* multiplies by
+            # the (input dims, components) basis, so a correct mean for a
+            # 2.5M x 127 reference is 128 wide. Checking against 127 rejected
+            # the right file.
+            expected = int(reference_info["embedding_dims"])
             if loaded.shape != (expected,):
                 raise ValueError(
-                    f"{mean_path} holds shape {loaded.shape}, but this reference "
-                    f"has {expected} dimensions. A mean of the wrong width "
+                    f"{mean_path} holds shape {loaded.shape}, but this "
+                    f"reference's PCA basis takes {expected}-dimensional "
+                    f"embeddings (and produces "
+                    f"{reference_info['reference_dims']} components). A query "
+                    f"mean is subtracted from raw embeddings before projection, "
+                    f"so it must be {expected} wide. A mean of the wrong width "
                     f"projects every tile into a different space and produces a "
                     f"complete CSV of wrong cluster IDs."
                 )
@@ -845,7 +860,7 @@ def submit_cluster_assignment_job(
                 raise ValueError(
                     f"{mean_path} contains non-finite values — it was probably "
                     f"written by an interrupted job. Delete it and recompute.")
-            print(f"Query mean:       {mean_path} (reused, {expected} dims)")
+            print(f"Query mean:       {mean_path} (reused, {expected}-d embeddings)")
         elif centering == "query":
             mean_command = _build_simple_command(
                 singularity_bin=singularity_bin, singularity_image=singularity_image,

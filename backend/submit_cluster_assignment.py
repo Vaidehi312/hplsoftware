@@ -42,6 +42,7 @@ from pathlib import Path
 import h5py
 
 from submit_feature_extraction import (
+    CONTAINER_EXTRAS_GPU,
     CONTAINER_EXTRAS,
     shard_ranges,
     MERGE_PARTITION,
@@ -425,11 +426,15 @@ def _build_assignment_command(
     shard_bounds: list[tuple[int, int]] | None = None,
     vote: list[str] | None = None,
     threads: int = 1,
+    device: str = "cpu",
 ) -> str:
     """Shell command the Slurm --wrap runs.
 
-    No --nv: this is CPU work, and requesting the GPU runtime for it would put
-    the job behind every GPU job in the queue for no benefit.
+    --nv only for device="gpu". The search is CPU work by default, and asking
+    for the GPU runtime then would queue the job behind every real GPU job for
+    no benefit. With device="gpu" it is the opposite: without --nv the container
+    sees no driver, and faiss would refuse at startup (Searcher verifies the GPU
+    index against the CPU one rather than falling back silently).
     """
     paths = [assign_script.parent, reference.parent, projections_h5, out_csv.parent,
              singularity_image, extras_dir]
@@ -447,6 +452,7 @@ def _build_assignment_command(
         # Progress every N tiles, so a long run is visibly alive in the log
         # rather than silent until it finishes.
         "--progress 50000",
+        f"--device {device}",
     ]
     if k is not None:
         args.append(f"--k {k}")
@@ -496,11 +502,12 @@ def _build_assignment_command(
         "echo '=== Container packages ==='; "
         f"python -c {shlex.quote(_import_check_python(real(reference)))}; "
         f"{shard_preamble}"
-        "echo '=== Cluster assignment ==='; "
+        f"echo '=== Cluster assignment ({device}) ==='; "
         f"python {shlex.quote(real(assign_script))} {' '.join(args)}"
     )
     return " ".join([
-        shlex.quote(singularity_bin), "exec", "--cleanenv", *binds,
+        shlex.quote(singularity_bin), "exec", "--cleanenv",
+        *(["--nv"] if device == "gpu" else []), *binds,
         shlex.quote(str(singularity_image)), "bash", "-lc", shlex.quote(inner),
     ])
 
@@ -577,7 +584,8 @@ def submit_cluster_assignment_job(
     notify_email: str | None = None,
     singularity_image: Path = SINGULARITY_IMAGE,
     singularity_bin: str = SINGULARITY_BIN,
-    extras_dir: Path = CONTAINER_EXTRAS,
+    extras_dir: Path | None = None,
+    device: str = "cpu",
     overwrite: bool = False,
 ) -> dict:
     """Submit Stage 3 for one projections file.
@@ -624,6 +632,12 @@ def submit_cluster_assignment_job(
         )
 
     _check_singularity_image(singularity_image, singularity_bin)
+    if device not in ("cpu", "gpu"):
+        raise ValueError(f"Unknown device: {device!r}. Use 'cpu' or 'gpu'.")
+    # The GPU search reads a different extras directory, because faiss-cpu and
+    # a GPU faiss are both imported as `faiss` and cannot share a PYTHONPATH.
+    if extras_dir is None:
+        extras_dir = CONTAINER_EXTRAS_GPU if device == "gpu" else CONTAINER_EXTRAS
     _check_container_extras(extras_dir, singularity_image, singularity_bin)
 
     if shards > 1 and depends_on_job_id is not None:
@@ -719,6 +733,7 @@ def submit_cluster_assignment_job(
         query_mean=mean_path,
         shard_bounds=shard_bounds,
         threads=cpus,
+        device=device,
     )
 
     sbatch_command = [
@@ -728,6 +743,10 @@ def submit_cluster_assignment_job(
         f"--cpus-per-task={cpus}",
         f"--mem={memory}",
         f"--time={time_limit}",
+        # One device per task. The search holds the whole reference in device
+        # memory — 2.5M x 127 float32 is about 1.3 GB, so any of this cluster's
+        # cards is ample — and a shard array asks for one each.
+        *(["--gres=gpu:1"] if device == "gpu" else []),
         *([f"--array=0-{shards - 1}"] if shard_bounds else []),
         # afterok on the mean job when sharding: a shard that ran before the mean
         # file existed would fail on a missing --query-mean, and one that somehow
@@ -896,6 +915,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Walltime for the shard-merge job. Default "
                              f"{MERGE_TIME_LIMIT}.")
     parser.add_argument("--notify-email", type=str, default=None)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
+                        help="Where the exact flat search runs. 'gpu' is the "
+                             "same exhaustive scan on faster hardware, not an "
+                             "approximation, and the job verifies its GPU index "
+                             "against a CPU one at startup rather than trusting "
+                             "it. Needs the GPU extras "
+                             "(--bootstrap-extras-gpu on "
+                             "submit_feature_extraction.py) and puts the job in "
+                             "the GPU partition, where it can be preempted — so "
+                             "pair it with --shards, which is what makes a "
+                             "preemption cost one task instead of the run.")
     parser.add_argument("--shards", type=int, default=1,
                         help="Split the assignment across N array tasks. A mean job "
                              "runs first so every shard centres identically, then a "
@@ -920,6 +950,7 @@ def main() -> None:
             batch_size=args.batch_size,
             validate_against=args.validate_against,
             shards=args.shards,
+            device=args.device,
             centering=args.centering,
             vote_preset=args.vote_preset,
             distance_weighted=args.distance_weighted,

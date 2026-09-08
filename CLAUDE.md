@@ -204,6 +204,19 @@ exists and is still the only fix for the artifacts on disk, and for mixed.
 `mean`).** There is no `labels` key. `build_hpc_reference.save()` is the authority;
 `test_reference_keys_match_the_builder` round-trips through it so readers cannot drift.
 
+**The GPU search is the same exact scan, and it is verified rather than trusted.** `--device gpu`
+moves the flat index to GPU 0 (`GpuIndexFlat` compares every query against every reference vector,
+exactly as `IndexFlat` does), which is why it is admissible where faiss-ivf was not. It needs a
+*separate* extras directory — `HPL_CONTAINER_EXTRAS_GPU`, populated by
+`submit_feature_extraction.py --bootstrap-extras-gpu` — because faiss-cpu and GPU faiss both import
+as `faiss` and PYTHONPATH cannot hold both. `Searcher._verify_matches_cpu` searches a sample of the
+reference against both indexes at startup and refuses on disagreement: a build can expose
+`StandardGpuResources`, report `get_num_gpus() == 1`, accept `index_cpu_to_gpu`, and still be a stub
+that returns well-formed nonsense. Measured on a working build, CPU and GPU agree 100% on the nearest
+neighbour and ~99.99% across k=25, with near-ties reordering inside the list. `--device gpu` also
+means the GPU partition, so pair it with `--shards`: a shard is the checkpoint that makes preemption
+cost one task rather than the run.
+
 **k-NN search is faiss-only, exact, with no backend choice.** `Searcher` in `assign_hpc_clusters.py`
 requires `faiss` and always builds an exact flat index (`IndexFlatL2`) — there is no numpy fallback and
 no approximate (`faiss-ivf`) option anymore. An approximate index was tried and measured against the

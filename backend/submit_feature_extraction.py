@@ -178,6 +178,24 @@ _CONTAINER_EXTRA_PACKAGES = (
     "faiss-cpu",
 )
 
+# Stage 4 can run its exact flat search on a GPU instead, which is the same
+# exhaustive scan on faster hardware (see Searcher._verify_matches_cpu, which
+# refuses a build that disagrees with the CPU index). It lives in a SEPARATE
+# extras directory on purpose: faiss-cpu and a GPU faiss both install as the
+# module `faiss`, and with PYTHONPATH taking precedence over the image's
+# site-packages, having both on one path means whichever sorts first wins —
+# silently, and differently depending on the directory listing.
+CONTAINER_EXTRAS_GPU = Path(
+    os.getenv("HPL_CONTAINER_EXTRAS_GPU",
+              str(SINGULARITY_IMAGE.parent / "extras-py38-gpu"))
+)
+# cu12 to match the image's CUDA 12. Not pinned: which wheel still builds for
+# the image's Python 3.8 is exactly the thing to let pip decide, and
+# --bootstrap-extras-gpu fails loudly if there is none.
+_CONTAINER_EXTRA_PACKAGES_GPU = (
+    "faiss-gpu-cu12",
+)
+
 # Import-checked in the job before encoding. Module name, not package name:
 # scikit-image installs as `skimage`, and the point is to check the thing the
 # repo actually imports.
@@ -586,6 +604,8 @@ def bootstrap_container_extras(
     *,
     singularity_image: Path = SINGULARITY_IMAGE,
     singularity_bin: str = SINGULARITY_BIN,
+    packages: tuple[str, ...] | None = None,
+    verify: str | None = None,
 ) -> None:
     """One-time install of the packages the NGC image lacks into extras_dir.
 
@@ -609,7 +629,7 @@ def bootstrap_container_extras(
         "--no-deps",
         "--target",
         target,
-        *_CONTAINER_EXTRA_PACKAGES,
+        *(packages if packages is not None else _CONTAINER_EXTRA_PACKAGES),
     ]
     print(f"Installing into {extras_dir}:\n  {shlex.join(command)}", flush=True)
     result = subprocess.run(command, text=True)
@@ -619,9 +639,10 @@ def bootstrap_container_extras(
             f"PyPI, run this on a login node rather than a compute node, or "
             f"download the wheels and pip install them from a local directory."
         )
-    if not (extras_dir / "skimage").is_dir():
+    expected = verify if verify is not None else "skimage"
+    if not (extras_dir / expected).is_dir():
         raise RuntimeError(
-            f"pip reported success but {extras_dir / 'skimage'} is not there. "
+            f"pip reported success but {extras_dir / expected} is not there. "
             f"Check whether --target landed somewhere else."
         )
     print(f"Container extras ready: {extras_dir}")
@@ -1285,6 +1306,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install the missing packages into --extras-dir and exit without "
              "submitting. Run once, on a login node (needs PyPI access).",
     )
+    parser.add_argument(
+        "--bootstrap-extras-gpu",
+        action="store_true",
+        help="Install a GPU faiss into a SEPARATE extras directory "
+             "(HPL_CONTAINER_EXTRAS_GPU) for Stage 4's --device gpu, and exit. "
+             "Separate because faiss-cpu and GPU faiss are both imported as "
+             "`faiss`, so one path cannot hold both. Login node, needs PyPI.",
+    )
     parser.add_argument("--model", type=str, default="BarlowTwins_3")
     parser.add_argument("--marker", type=str, default="he")
     parser.add_argument("--z-dim", type=int, default=128)
@@ -1331,6 +1360,23 @@ def main() -> None:
         except (FileNotFoundError, RuntimeError) as e:
             print(f"Bootstrap failed: {e}", file=sys.stderr)
             raise SystemExit(1)
+        return
+
+    if args.bootstrap_extras_gpu:
+        try:
+            bootstrap_container_extras(
+                CONTAINER_EXTRAS_GPU,
+                singularity_image=args.singularity_image,
+                singularity_bin=args.singularity_bin,
+                packages=_CONTAINER_EXTRA_PACKAGES_GPU,
+                verify="faiss",
+            )
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"GPU bootstrap failed: {e}", file=sys.stderr)
+            print("Stage 4 still runs on CPU without this; --device gpu is what "
+                  "needs it.", file=sys.stderr)
+            raise SystemExit(1)
+        print("Now submit with: --device gpu")
         return
 
     missing = [

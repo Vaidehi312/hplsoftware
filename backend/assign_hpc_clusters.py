@@ -274,10 +274,14 @@ class Searcher:
     this is a different metric on the same flat index, not an approximation.
     """
 
-    def __init__(self, reference: np.ndarray, metric: str = "l2"):
+    def __init__(self, reference: np.ndarray, metric: str = "l2",
+                 device: str = "cpu"):
         if metric not in ("l2", "cosine"):
             raise ValueError(f"Unknown metric: {metric!r}. Use 'l2' or 'cosine'.")
+        if device not in ("cpu", "gpu"):
+            raise ValueError(f"Unknown device: {device!r}. Use 'cpu' or 'gpu'.")
         self.metric = metric
+        self.device = device
         self.reference = np.ascontiguousarray(reference, dtype=np.float32)
         try:
             import faiss
@@ -294,8 +298,92 @@ class Searcher:
         else:
             index = faiss.IndexFlatL2(self.reference.shape[1])
             index.add(self.reference)
-        self.index = index
+
         self.backend = "faiss-flat" if metric == "l2" else "faiss-flat-cosine"
+        if device == "gpu":
+            # Still the same exhaustive scan — GpuIndexFlat compares every query
+            # against every reference vector, exactly as IndexFlat does. That is
+            # what makes this admissible where faiss-ivf was not: ivf changed
+            # which neighbour came back (33% agreement), and this changes only
+            # the hardware doing the arithmetic.
+            #
+            # Refused rather than quietly falling back to CPU. A silent fallback
+            # here is a ~30x slowdown that shows up as nothing but wall clock,
+            # which is the same class of bug as the --cleanenv thread count.
+            if not hasattr(faiss, "StandardGpuResources"):
+                raise SystemExit(
+                    "--device gpu needs a faiss build with GPU support, and this "
+                    "one has none (faiss.StandardGpuResources is missing). The "
+                    "container's extras hold faiss-cpu; install the GPU extras "
+                    "with `python submit_feature_extraction.py "
+                    "--bootstrap-extras-gpu` and submit with --device gpu, or "
+                    "drop the flag to search on CPU."
+                )
+            try:
+                self._gpu_resources = faiss.StandardGpuResources()
+                gpu_index = faiss.index_cpu_to_gpu(self._gpu_resources, 0, index)
+            except Exception as e:  # noqa: BLE001 — surfaced, never downgraded
+                raise SystemExit(
+                    f"--device gpu was asked for and the index could not be "
+                    f"moved to GPU 0: {type(e).__name__}: {e}. Refusing rather "
+                    f"than searching on CPU at a thirtieth of the speed without "
+                    f"saying so."
+                ) from e
+            self._verify_matches_cpu(index, gpu_index)
+            index = gpu_index
+            self.backend += "-gpu"
+        self.index = index
+
+    def _verify_matches_cpu(self, cpu_index, gpu_index, sample: int = 2048) -> None:
+        """Refuse a GPU index that does not agree with the CPU one.
+
+        Not defensive programming — a measured necessity. A faiss build can
+        expose StandardGpuResources, accept index_cpu_to_gpu without error, and
+        then return entirely different neighbours: on faiss 1.15.0 with
+        get_num_gpus() reporting 1 and no usable device, this returned the right
+        *shape* of answer with 18% of the top-1 neighbours correct and distances
+        wrong by three orders of magnitude.
+
+        Nothing downstream could catch that. Every tile would get a cluster ID,
+        every margin would look plausible, the CSV would have no missing values,
+        and the labels would be noise. So the capability is tested by doing the
+        search rather than by asking whether it is available — one second on a
+        sample of the reference, against the CPU index that is already built.
+
+        Queries are reference rows, which makes the answer checkable on its own
+        terms as well: a vector's nearest neighbour is itself, at distance zero.
+        """
+        rows = min(sample, self.reference.shape[0])
+        if not rows:
+            return
+        probe = self.reference[:rows]
+        if self.metric == "cosine":
+            probe = self._normalize(probe)
+        k = min(10, self.reference.shape[0])
+
+        cpu_distances, cpu_indices = cpu_index.search(probe, k)
+        gpu_distances, gpu_indices = gpu_index.search(probe, k)
+
+        top1 = float((cpu_indices[:, 0] == gpu_indices[:, 0]).mean())
+        # Absolute tolerance rather than relative: these are squared distances
+        # whose scale is set by the embedding, and float32 accumulation order
+        # differs legitimately between the two implementations.
+        worst = float(np.abs(cpu_distances - gpu_distances).max())
+        scale = max(float(np.abs(cpu_distances).max()), 1.0)
+
+        if top1 < 0.999 or worst > 1e-2 * scale:
+            raise SystemExit(
+                f"REFUSING --device gpu: the GPU index disagrees with the CPU "
+                f"index on this machine. Of {rows:,} reference vectors searched "
+                f"against the index they came from, {top1 * 100:.1f}% returned "
+                f"themselves as the nearest neighbour (must be ~100%), and the "
+                f"largest distance difference was {worst:.3g} against a scale of "
+                f"{scale:.3g}.\n\n"
+                f"This is a broken or stub GPU faiss build, not a precision "
+                f"difference. Every cluster ID it produced would be wrong while "
+                f"looking entirely well-formed. Search on CPU (--device cpu) "
+                f"until the container's GPU faiss is fixed."
+            )
 
     @staticmethod
     def _normalize(vectors: np.ndarray) -> np.ndarray:
@@ -620,7 +708,7 @@ def assign(args) -> dict:
     with h5py.File(args.h5, "r") as content:
         _, meta_keys = _resolve_datasets(content, args.rep_key)
 
-    searcher = Searcher(reference, metric=args.metric)
+    searcher = Searcher(reference, metric=args.metric, device=args.device)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
 
     # A property of the reference, so computed once here rather than per chunk.
@@ -855,6 +943,14 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
+                        help="Where the exact flat search runs. GPU is the same "
+                             "exhaustive scan on faster hardware — not an "
+                             "approximation — but it needs a faiss build with "
+                             "GPU support (see --bootstrap-extras-gpu). Defaults "
+                             "to cpu so no existing submission changes hardware, "
+                             "and refuses rather than falling back if the GPU is "
+                             "unavailable.")
     parser.add_argument("--metric", default="l2", choices=["l2", "cosine"],
                         help="l2 (default): Euclidean distance, what ingest uses. "
                              "cosine: direction only, ignoring magnitude — validate "

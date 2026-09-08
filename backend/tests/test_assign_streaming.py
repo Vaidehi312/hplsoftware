@@ -1210,6 +1210,155 @@ def test_the_threads_asked_for_match_the_cpus_requested(tmp_path):
     assert "threads=cpus," in source
 
 
+# --- the GPU search ------------------------------------------------------
+#
+# GpuIndexFlat is the same exhaustive scan as IndexFlat: every query is compared
+# against every reference vector. That is what makes it admissible where
+# faiss-ivf was not — ivf changed which neighbour came back (33% agreement on
+# this reference), and this changes only the hardware.
+#
+# What cannot be assumed is that a given faiss build's GPU path works. One does
+# expose StandardGpuResources, report get_num_gpus() == 1, accept
+# index_cpu_to_gpu without error, and still be a stub. So the Searcher verifies
+# its GPU index against the CPU index at startup, and these tests are about that
+# refusal — the search itself needs no test beyond the equivalence one below,
+# which runs only where a GPU is actually present.
+
+
+def _has_working_gpu_faiss() -> bool:
+    import faiss
+    if not hasattr(faiss, "StandardGpuResources"):
+        return False
+    try:
+        return faiss.get_num_gpus() > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def test_an_unknown_device_is_refused(tmp_path):
+    from assign_hpc_clusters import Searcher
+
+    try:
+        Searcher(np.zeros((4, 3), dtype=np.float32), device="cuda")
+    except ValueError as e:
+        assert "device" in str(e)
+    else:
+        raise AssertionError("'cuda' was accepted; the choices are cpu and gpu")
+
+
+def test_the_cpu_default_is_unchanged(tmp_path):
+    """No existing submission changes hardware by being upgraded."""
+    from assign_hpc_clusters import Searcher
+
+    searcher = Searcher(np.eye(8, dtype=np.float32))
+    assert searcher.device == "cpu"
+    assert searcher.backend == "faiss-flat"
+
+
+def test_a_gpu_index_that_disagrees_with_cpu_is_refused(tmp_path):
+    """The stub-build case, forced: a GPU index that answers differently must
+    stop the run, because nothing downstream can see the difference. Every tile
+    would still get a cluster ID and a plausible margin."""
+    import faiss
+
+    from assign_hpc_clusters import Searcher
+
+    reference = np.random.default_rng(0).standard_normal((256, 16), dtype=np.float32)
+
+    real_move = getattr(faiss, "index_cpu_to_gpu", None)
+    real_resources = getattr(faiss, "StandardGpuResources", None)
+
+    class _WrongIndex:
+        """Answers with the right shapes and the wrong content."""
+
+        def search(self, queries, k):
+            rows = queries.shape[0]
+            return (np.full((rows, k), 7.0, dtype=np.float32),
+                    np.zeros((rows, k), dtype=np.int64))
+
+    faiss.StandardGpuResources = lambda: object()
+    faiss.index_cpu_to_gpu = lambda *a, **k: _WrongIndex()
+    try:
+        try:
+            Searcher(reference, device="gpu")
+        except SystemExit as e:
+            assert "REFUSING --device gpu" in str(e), str(e)
+            assert "nearest neighbour" in str(e)
+        else:
+            raise AssertionError("a disagreeing GPU index was accepted")
+    finally:
+        if real_move is not None:
+            faiss.index_cpu_to_gpu = real_move
+        if real_resources is not None:
+            faiss.StandardGpuResources = real_resources
+
+
+def test_a_faiss_without_gpu_support_says_what_to_install(tmp_path):
+    import faiss
+
+    from assign_hpc_clusters import Searcher
+
+    real_resources = getattr(faiss, "StandardGpuResources", None)
+    if real_resources is not None:
+        del faiss.StandardGpuResources
+    try:
+        try:
+            Searcher(np.eye(8, dtype=np.float32), device="gpu")
+        except SystemExit as e:
+            assert "--bootstrap-extras-gpu" in str(e), str(e)
+        else:
+            raise AssertionError("device=gpu was accepted without GPU support")
+    finally:
+        if real_resources is not None:
+            faiss.StandardGpuResources = real_resources
+
+
+def test_gpu_and_cpu_agree_on_the_same_reference(tmp_path):
+    """The equivalence claim itself, where there is a GPU to check it on.
+
+    Measured here: 100% agreement on the nearest neighbour, 99.99% across all
+    25, distances differing by ~1e-4 from float accumulation order. Near-ties
+    can reorder inside the k-list, which is why the assertion is on the top-1
+    and on distance closeness rather than on identical arrays.
+    """
+    if not _has_working_gpu_faiss():
+        print("    (skipped: no GPU faiss on this machine)")
+        return
+
+    from assign_hpc_clusters import Searcher
+
+    rng = np.random.default_rng(0)
+    reference = rng.standard_normal((4000, 64), dtype=np.float32)
+    queries = rng.standard_normal((500, 64), dtype=np.float32)
+
+    cpu_i, cpu_d = Searcher(reference, device="cpu").search(queries, 25)
+    gpu_i, gpu_d = Searcher(reference, device="gpu").search(queries, 25)
+
+    assert (cpu_i[:, 0] == gpu_i[:, 0]).all(), "the nearest neighbour must match"
+    assert np.abs(cpu_d - gpu_d).max() < 1e-2, "distances must agree"
+
+
+def test_the_gpu_job_asks_for_a_gpu_and_the_cpu_job_does_not(tmp_path):
+    """--nv and --gres go together: without the runtime the container sees no
+    driver, and without the allocation Slurm gives it no card."""
+    import submit_cluster_assignment as sca
+
+    source = (BACKEND / "submit_cluster_assignment.py").read_text()
+    assert '"--gres=gpu:1"' in source
+
+    for device, expected in (("cpu", False), ("gpu", True)):
+        command = sca._build_assignment_command(
+            singularity_bin="singularity", singularity_image=Path("/img.sif"),
+            extras_dir=Path("/extras"),
+            assign_script=BACKEND / "assign_hpc_clusters.py",
+            reference=Path("/ref/r.npz"), projections_h5=Path("/p/x.h5"),
+            out_csv=Path("/o/x.csv"), rep_key="z_latent", k=None,
+            batch_size=16384, validate_against=None, threads=16, device=device,
+        )
+        assert ("--nv" in command) is expected, f"{device}: --nv wrong"
+        assert f"--device {device}" in command
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

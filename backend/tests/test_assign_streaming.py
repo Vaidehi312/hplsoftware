@@ -1128,6 +1128,88 @@ def test_every_default_is_a_walltime_slurm_accepts(tmp_path):
         assert pattern.match(limit), f"{limit!r} is not a Slurm walltime"
 
 
+# --- the threads the job actually gets ------------------------------------
+#
+# `singularity exec --cleanenv` wipes the environment before the inner shell
+# runs, so a thread count written as "${SLURM_CPUS_PER_TASK:-1}" and expanded
+# in there cannot see Slurm's value: the fallback wins and every assignment
+# runs on one core. Nothing fails, nothing warns; a 2.5M-row reference at 127
+# dimensions came to 49 tiles/s, which is one core's fp32 rate, and an
+# 18.5M-tile cohort took three days instead of hours.
+#
+# The number therefore has to be baked in at submit time, and these check it is
+# — including that it agrees with what the sbatch asks Slurm for, since the two
+# now live in different strings and drift silently.
+
+
+def _assignment_command(cpus=16, shards=1):
+    """The --wrap payload for a submission, without submitting anything."""
+    import submit_cluster_assignment as sca
+
+    return sca._build_assignment_command(
+        singularity_bin="singularity",
+        singularity_image=Path("/img.sif"),
+        extras_dir=Path("/extras"),
+        assign_script=BACKEND / "assign_hpc_clusters.py",
+        reference=Path("/ref/hpc_reference.npz"),
+        projections_h5=Path("/proj/hdf5_x_he_train.h5"),
+        out_csv=Path("/out/x_hpc_assignments.csv"),
+        rep_key="z_latent",
+        k=None,
+        batch_size=16384,
+        validate_against=None,
+        threads=cpus,
+    )
+
+
+def test_the_thread_count_survives_cleanenv(tmp_path):
+    """A literal number, because the variable it used to read is gone by then."""
+    command = _assignment_command(cpus=32)
+
+    assert "export OMP_NUM_THREADS=32;" in command
+    assert "SLURM_CPUS_PER_TASK" not in command, (
+        "the thread count is read from a variable --cleanenv has already wiped")
+
+
+def test_every_container_step_pins_its_threads(tmp_path):
+    """The mean and merge steps run through a different builder, which had the
+    same bug."""
+    import submit_cluster_assignment as sca
+
+    command = sca._build_simple_command(
+        singularity_bin="singularity", singularity_image=Path("/img.sif"),
+        extras_dir=Path("/extras"), script=BACKEND / "assign_hpc_clusters.py",
+        args=["--precompute-mean /out/mean.npy"],
+        extra_binds=[Path("/proj")], banner="Query mean", threads=4,
+    )
+
+    assert "export OMP_NUM_THREADS=4;" in command
+    assert "SLURM_CPUS_PER_TASK" not in command
+
+
+def test_no_container_command_expands_slurms_cpu_variable(tmp_path):
+    """The whole file, so a third builder cannot reintroduce it. Naming the
+    variable in a comment is fine — what does not work is *expanding* it, which
+    only happens inside the container where --cleanenv has already run."""
+    source = (BACKEND / "submit_cluster_assignment.py").read_text()
+    offenders = [line.strip() for line in source.splitlines()
+                 if "${SLURM_CPUS_PER_TASK" in line]
+
+    assert not offenders, f"expanded inside --cleanenv: {offenders}"
+
+
+def test_the_threads_asked_for_match_the_cpus_requested(tmp_path):
+    """The two numbers are in different strings now — the export in the wrapped
+    command, and --cpus-per-task in the sbatch argv. Asking Slurm for 32 cores
+    and pinning faiss to 1 is exactly the bug this replaced, in reverse."""
+    source = (BACKEND / "submit_cluster_assignment.py").read_text()
+    # The mean and merge steps hardcode both numbers; they must agree.
+    assert 'threads=4,' in source and '"--cpus-per-task=4"' in source
+    assert 'threads=2,' in source and '"--cpus-per-task=2"' in source
+    # And the array job passes through whatever was requested.
+    assert "threads=cpus," in source
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

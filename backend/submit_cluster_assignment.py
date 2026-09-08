@@ -424,6 +424,7 @@ def _build_assignment_command(
     query_mean: Path | None = None,
     shard_bounds: list[tuple[int, int]] | None = None,
     vote: list[str] | None = None,
+    threads: int = 1,
 ) -> str:
     """Shell command the Slurm --wrap runs.
 
@@ -478,10 +479,18 @@ def _build_assignment_command(
         "set -euo pipefail; "
         f"export PYTHONPATH={shlex.quote(real(extras_dir))}${{PYTHONPATH:+:$PYTHONPATH}}; "
         'export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplconfig-$$"; mkdir -p "$MPLCONFIGDIR"; '
-        # Single-threaded BLAS. faiss and numpy both spawn threads sized to the
-        # machine, not to the cpuset Slurm gave us, and oversubscribing a
-        # shared node is slower than the serial path as well as antisocial.
-        'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"; '
+        # Thread count baked in at submit time rather than read from
+        # SLURM_CPUS_PER_TASK here. This string is expanded INSIDE the
+        # container, and `singularity exec --cleanenv` has already wiped the
+        # environment by then, so the Slurm variable does not exist and the
+        # fallback silently won: every assignment ran on one core. A 2.5M-row
+        # reference at 127 dims came to 49 tiles/s, which is ~31 GFLOP/s — a
+        # single core's fp32 rate — turning a few hours into three days.
+        #
+        # Still pinned rather than left to faiss, which sizes its pool to the
+        # machine rather than to the cpuset Slurm gave us; oversubscribing a
+        # shared node is slower than running serially, as well as antisocial.
+        f"export OMP_NUM_THREADS={int(threads)}; "
         'export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"; '
         'export MKL_NUM_THREADS="$OMP_NUM_THREADS"; '
         "echo '=== Container packages ==='; "
@@ -505,6 +514,7 @@ def _build_simple_command(
     args: list[str],
     extra_binds: list[Path],
     banner: str,
+    threads: int = 1,
 ) -> str:
     """One-liner container invocation, shared by the mean and merge jobs.
 
@@ -516,7 +526,10 @@ def _build_simple_command(
     inner = (
         "set -euo pipefail; "
         f"export PYTHONPATH={shlex.quote(real(extras_dir))}${{PYTHONPATH:+:$PYTHONPATH}}; "
-        'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"; '
+        # See _build_assignment_command: --cleanenv means SLURM_CPUS_PER_TASK
+        # is not readable from in here.
+        f"export OMP_NUM_THREADS={int(threads)}; "
+        'export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"; '
         f"echo '=== {banner} ==='; "
         f"python {shlex.quote(real(script))} {' '.join(args)}"
     )
@@ -657,6 +670,10 @@ def submit_cluster_assignment_job(
                 ],
                 extra_binds=[projections_h5, reference.parent, out_csv.parent],
                 banner="Query mean",
+                # Matches --cpus-per-task=4 on the mean sbatch below. The two
+                # numbers have to be written together: the container cannot
+                # read the Slurm one.
+                threads=4,
             )
             mean_sbatch = [
                 "sbatch", f"--job-name={job_name}_mean",
@@ -701,6 +718,7 @@ def submit_cluster_assignment_job(
         validate_against=validate_against,
         query_mean=mean_path,
         shard_bounds=shard_bounds,
+        threads=cpus,
     )
 
     sbatch_command = [
@@ -775,6 +793,7 @@ def submit_cluster_assignment_job(
             ],
             extra_binds=[out_csv.parent],
             banner="Merging shards",
+            threads=2,          # matches --cpus-per-task=2 below
         )
         merge_sbatch = [
             "sbatch", f"--job-name={job_name}_merge",

@@ -161,6 +161,17 @@ raising `--batch-size` buys almost nothing; h5py serialises HDF5 calls on a glob
 threads do not parallelise decode (separate processes do — hence `--shards`); and falling back from an
 H200 to an H100/A100 costs almost nothing in wall clock.
 
+**`--cleanenv` means the container cannot read Slurm's variables.** Stages 3 and 4 run their
+work inside `singularity exec --cleanenv`, which wipes the environment before the inner shell
+starts — so a thread count written as `${SLURM_CPUS_PER_TASK:-1}` and expanded in there always
+took the fallback, and every cluster assignment ran on one core while Slurm held 16. Nothing
+failed and nothing warned: a 2.5M-row reference at 127 dims came to 49 tiles/s, and 18.5M tiles
+took three days instead of hours. Thread counts are baked in at submit time now
+(`_build_assignment_command(threads=...)`), which means the number and the sbatch's
+`--cpus-per-task` live in different strings and must be changed together —
+`test_assign_streaming.py` pins both. Anything else the job needs from the submitting
+environment has the same problem.
+
 **GPU type names are cluster-specific and matching is exact.** This cluster has `nvidia_h200`,
 `nvidia_h100_80gb_hbm3`, `nvidia_h100_pcie`, `nvidia_a100_80gb_pcie`. A preference list naming types
 that do not exist is inert, not approximate — it silently falls through to queueing for the first one.

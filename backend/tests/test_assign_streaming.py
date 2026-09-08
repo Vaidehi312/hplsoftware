@@ -15,6 +15,7 @@ So the tests here are equivalence tests, not smoke tests: chunked must equal
 unchunked, and sharded must equal unsharded, bit for bit.
 """
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -2068,6 +2069,98 @@ def test_the_gpu_bootstrap_is_offered_by_the_stage_that_uses_it(tmp_path):
 
     assert "--bootstrap-gpu-faiss" in result.stdout
     assert "no feature extraction" in result.stdout
+
+
+# --- the benchmark ---------------------------------------------------------
+#
+# Every estimate of this stage has been wrong so far, in both directions: FLOP
+# counting said the search would be ~99% of the time, a real run's CPU
+# accounting said nearer 30%, and a thread count that read correctly in the
+# submitter ran on one core. So the shape of a run gets chosen from a measured
+# slice, and the thing doing the measuring has to be trustworthy itself.
+
+
+def _bench(args, timeout=1800):
+    return subprocess.run([sys.executable, str(BACKEND / "benchmark_assignment.py"),
+                           *args], capture_output=True, text=True, timeout=timeout)
+
+
+def test_a_slice_without_a_shared_mean_is_refused(tmp_path):
+    """--centering query centres on the mean of every query, so a slice that
+    computed its own would time a different computation from the real run and
+    label the same tiles differently. Refused with the command that fixes it."""
+    reference, queries = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=600)
+
+    result = _bench(["--projections-h5", str(queries), "--reference", str(reference),
+                     "--rows", "300"], timeout=300)
+
+    assert result.returncode == 1
+    assert "--precompute-mean" in result.stderr, result.stderr
+    assert "different cluster IDs" in result.stderr
+
+
+def test_a_slice_too_short_to_time_is_not_extrapolated(tmp_path):
+    """The first version reported 2e12 tiles/s: the assigner prints elapsed to
+    one decimal, a sub-second slice reads as 0.0s, and the division exploded.
+    Projecting a full cohort off that would have been worse than no number."""
+    reference, queries, mean = tmp_path / "ref.npz", tmp_path / "q.h5", tmp_path / "m.npy"
+    _write_reference(reference)
+    _write_queries(queries, rows=900)
+    subprocess.run([sys.executable, str(ASSIGN), "--reference", str(reference),
+                    "--h5", str(queries), "--precompute-mean", str(mean)],
+                   check=True, capture_output=True, timeout=300)
+
+    result = _bench(["--projections-h5", str(queries), "--reference", str(reference),
+                     "--query-mean", str(mean), "--rows", "400",
+                     "--threads", "1", "--device", "cpu"], timeout=600)
+
+    assert result.returncode == 0, result.stderr[-500:]
+    assert "too fast to time" in result.stdout
+    assert "Raise --rows" in result.stdout
+    # And no projection table, because it would be extrapolated from noise.
+    assert "Projected wall clock" not in result.stdout
+
+
+def test_the_benchmark_reports_the_rate_the_assigner_measured(tmp_path):
+    """It parses the assigner's own printed rate rather than recomputing one,
+    and carries the phase split through, because which phase dominates is the
+    decision the benchmark exists to inform."""
+    import json
+
+    reference, queries, mean = tmp_path / "ref.npz", tmp_path / "q.h5", tmp_path / "m.npy"
+    rng = np.random.default_rng(0)
+    # A reference large enough for the search to take measurable time.
+    ref_rows, dim, ncomp, nclust = 60_000, 32, 24, 12
+    np.savez(reference,
+             reference=rng.standard_normal((ref_rows, ncomp)).astype(np.float32),
+             components=rng.standard_normal((dim, ncomp)).astype(np.float32),
+             codes=rng.integers(0, nclust, ref_rows).astype(np.int64),
+             categories=np.array([str(i) for i in range(nclust)]),
+             n_neighbors=np.int64(10), meta=json.dumps({"groupby": "leiden_2.5"}))
+    rows = 30_000
+    with h5py.File(queries, "w") as f:
+        f.create_dataset("z_latent",
+                         data=(rng.standard_normal((rows, dim)) + 3).astype(np.float32))
+        for name in ("samples", "slides", "tiles"):
+            f.create_dataset(name, data=np.array(
+                [f"{name[0]}{i % 53:04d}".encode() for i in range(rows)]))
+    subprocess.run([sys.executable, str(ASSIGN), "--reference", str(reference),
+                    "--h5", str(queries), "--precompute-mean", str(mean)],
+                   check=True, capture_output=True, timeout=600)
+
+    result = _bench(["--projections-h5", str(queries), "--reference", str(reference),
+                     "--query-mean", str(mean), "--rows", str(rows),
+                     "--threads", "1", "--device", "cpu", "--shards", "1", "8"])
+
+    assert result.returncode == 0, result.stderr[-800:]
+    # A plausible rate, not 2e12 and not zero.
+    rates = [int(m.replace(",", "")) for m in
+             re.findall(r"([\d,]+) tiles/s", result.stdout)]
+    assert rates, result.stdout
+    assert all(1 <= rate < 10_000_000 for rate in rates), rates
+    assert "search" in result.stdout, "the phase split did not carry through"
 
 
 # --- standalone runner ---------------------------------------------------

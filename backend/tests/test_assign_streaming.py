@@ -2229,6 +2229,93 @@ def test_a_plain_job_still_names_its_log_by_job_id(tmp_path):
          sca.jobs_in_flight_named, sca.partition_has_gpus) = saved
 
 
+# --- which GPU a shard gets ----------------------------------------------
+#
+# The third thing --cleanenv takes, after the thread count and the array index:
+# CUDA_VISIBLE_DEVICES, which is how Slurm tells each task with --gres=gpu:1
+# which physical card is its own. Stripped, every task on a node sees all the
+# cards and index_cpu_to_gpu(res, 0, ...) puts them all on GPU 0 — N shards
+# contending for one device while the rest idle, and at no point failing.
+#
+# Tested by running the generated shell against a stand-in that strips the
+# environment the way --cleanenv does, because this is precisely the class a
+# string assertion cannot catch.
+
+
+def test_each_gpu_shard_sees_the_card_slurm_gave_it(tmp_path):
+    import os
+
+    import submit_cluster_assignment as sca
+
+    command = sca._build_assignment_command(
+        singularity_bin=str(_fake_singularity(tmp_path)),
+        singularity_image=Path("/img.sif"), extras_dir=Path("/extras"),
+        assign_script=Path("/bin/echo"), reference=Path("/ref/r.npz"),
+        projections_h5=Path("/p/x.h5"), out_csv=Path("/o/x.csv"),
+        rep_key="z_latent", k=None, batch_size=16384, validate_against=None,
+        threads=4, device="gpu", shard_bounds=[(0, 100), (100, 200), (200, 300)])
+    command = (command.replace("python -c ", "true ")
+                      .replace("python /bin/echo",
+                               'echo "GPU_INSIDE=$CUDA_VISIBLE_DEVICES"; echo ARGS:'))
+
+    for task, gpu in (("0", "3"), ("2", "5")):
+        result = subprocess.run(
+            ["bash", "-lc", command], capture_output=True, text=True, timeout=120,
+            env={**os.environ, "SLURM_ARRAY_TASK_ID": task,
+                 "CUDA_VISIBLE_DEVICES": gpu})
+
+        assert result.returncode == 0, result.stderr[-400:]
+        assert f"GPU_INSIDE={gpu}" in result.stdout, (
+            f"task {task} did not receive GPU {gpu}:\n{result.stdout}")
+
+
+def test_a_gpu_run_outside_slurm_still_picks_a_device(tmp_path):
+    """CUDA_VISIBLE_DEVICES is legitimately unset for a hand-run job, where
+    device 0 is the only sensible answer — and an unset variable must not abort
+    under `set -u`."""
+    import os
+
+    import submit_cluster_assignment as sca
+
+    command = sca._build_assignment_command(
+        singularity_bin=str(_fake_singularity(tmp_path)),
+        singularity_image=Path("/img.sif"), extras_dir=Path("/extras"),
+        assign_script=Path("/bin/echo"), reference=Path("/ref/r.npz"),
+        projections_h5=Path("/p/x.h5"), out_csv=Path("/o/x.csv"),
+        rep_key="z_latent", k=None, batch_size=16384, validate_against=None,
+        threads=2, device="gpu")
+    command = (command.replace("python -c ", "true ")
+                      .replace("python /bin/echo",
+                               'echo "GPU_INSIDE=$CUDA_VISIBLE_DEVICES"; echo ARGS:'))
+    env = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+
+    result = subprocess.run(["bash", "-lc", command], capture_output=True,
+                            text=True, timeout=120, env=env)
+
+    assert result.returncode == 0, result.stderr[-400:]
+    assert "GPU_INSIDE=0" in result.stdout, result.stdout
+
+
+def test_a_cpu_run_does_not_pin_a_gpu(tmp_path):
+    """Nothing GPU-related should appear in a CPU submission — including the
+    passthrough, which would otherwise pin device 0 for a job that never asked
+    for one."""
+    import submit_cluster_assignment as sca
+
+    command = sca._build_assignment_command(
+        singularity_bin="singularity", singularity_image=Path("/img.sif"),
+        extras_dir=Path("/extras"), assign_script=Path("/b/assign.py"),
+        reference=Path("/ref/r.npz"), projections_h5=Path("/p/x.h5"),
+        out_csv=Path("/o/x.csv"), rep_key="z_latent", k=None, batch_size=16384,
+        validate_against=None, threads=2, device="cpu",
+        shard_bounds=[(0, 10), (10, 20)])
+
+    assert "CUDA_VISIBLE_DEVICES" not in command
+    assert "--nv" not in command
+    # The shard passthrough is still there — the two are independent.
+    assert "SINGULARITYENV_ROW_START" in command
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

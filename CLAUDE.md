@@ -181,8 +181,14 @@ stopped. The bounds are resolved outside the container now and passed in via
 submitted as a plain job. **`submit_feature_extraction.py` still has the original pattern**
 (`shard_preamble` inside `inner`), so extraction sharding has the same latent bug.
 
+And a third: `CUDA_VISIBLE_DEVICES`, which is how Slurm tells each `--gres=gpu:1` task which
+physical card is its own. Stripped, every task on a node sees all of them and
+`index_cpu_to_gpu(res, 0, ...)` puts them all on GPU 0 — N shards contending for one device
+while the rest idle, failing at no point. Passed through the same way, defaulting to 0 so a
+hand-run job outside Slurm still works.
+
 Assume nothing the job needs from the submitting environment survives, and note that a string
-assertion cannot catch this class — the broken version looked correct. The test runs the
+assertion cannot catch this class — every broken version looked correct. The tests run the
 generated shell against a stand-in that strips the environment the way `--cleanenv` does.
 
 **GPU type names are cluster-specific and matching is exact.** This cluster has `nvidia_h200`,

@@ -663,7 +663,22 @@ def _build_assignment_command(
     # SINGULARITYENV_/APPTAINERENV_ are the documented way through --cleanenv,
     # and both prefixes are set because the binary may be either.
     outer_preamble = ""
-    env_prefix = ""
+    env_parts: list[str] = []
+    if device == "gpu":
+        # Slurm tells each task which physical GPU is its own through
+        # CUDA_VISIBLE_DEVICES, and --cleanenv deletes it like everything else.
+        # Without this, every task on a node sees all the cards and
+        # index_cpu_to_gpu(res, 0, ...) puts them all on GPU 0: N shards
+        # contending for one device while the rest idle, at no point failing.
+        # Third instance of this class, after the thread count and the array
+        # index.
+        #
+        # ":-0" so a hand-run job outside Slurm still works, where the variable
+        # is legitimately unset and device 0 is the only sensible default.
+        env_parts += [
+            'SINGULARITYENV_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"',
+            'APPTAINERENV_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"',
+        ]
     if query_mean is not None:
         args.append(f"--query-mean {shlex.quote(real(query_mean))}")
     if shard_bounds is not None:
@@ -680,12 +695,12 @@ def _build_assignment_command(
             'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
             'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
         )
-        env_prefix = (
-            'SINGULARITYENV_ROW_START="$ROW_START" '
-            'SINGULARITYENV_ROW_STOP="$ROW_STOP" '
-            'APPTAINERENV_ROW_START="$ROW_START" '
-            'APPTAINERENV_ROW_STOP="$ROW_STOP" '
-        )
+        env_parts += [
+            'SINGULARITYENV_ROW_START="$ROW_START"',
+            'SINGULARITYENV_ROW_STOP="$ROW_STOP"',
+            'APPTAINERENV_ROW_START="$ROW_START"',
+            'APPTAINERENV_ROW_STOP="$ROW_STOP"',
+        ]
         args.append('--row-start "$ROW_START" --row-stop "$ROW_STOP"')
 
     inner = (
@@ -711,6 +726,7 @@ def _build_assignment_command(
         f"echo '=== Cluster assignment ({device}) ==='; "
         f"python {shlex.quote(real(assign_script))} {' '.join(args)}"
     )
+    env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
     return outer_preamble + env_prefix + " ".join([
         shlex.quote(singularity_bin), "exec", "--cleanenv",
         *(["--nv"] if device == "gpu" else []), *binds,

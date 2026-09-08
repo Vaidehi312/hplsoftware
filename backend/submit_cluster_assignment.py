@@ -492,6 +492,58 @@ def check_time_limit(partition: str, requested: str) -> None:
     )
 
 
+def jobs_in_flight_named(job_name: str) -> list[str]:
+    """Ids of this user's queued or running jobs whose name starts with
+    job_name. Empty when squeue cannot be reached — see refuse_if_already_queued.
+    """
+    try:
+        result = subprocess.run(
+            ["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    found = []
+    for line in (result.stdout or "").splitlines():
+        job_id, _, name = line.partition("|")
+        # The mean and merge steps are named <job_name>_mean / _merge, so a
+        # prefix match catches a whole pipeline rather than only its array.
+        if name.strip().startswith(job_name):
+            found.append(job_id.strip())
+    return found
+
+
+def refuse_if_already_queued(job_name: str, *, force: bool = False) -> None:
+    """Refuse a second identical pipeline while the first is still in flight.
+
+    Two runs of the same submission collide on every path they use: one
+    query_mean.npy, one set of 32 shard part files, one output CSV — and the
+    second pipeline's merge runs --cleanup, deleting parts the first one's tasks
+    are still writing. Two processes writing one part file is the shape of
+    failure this codebase is written against: the row count can come out right
+    while the contents interleave.
+
+    A retype of the same command is how this happens, so the guard is on the job
+    name rather than on any flag. squeue being unreachable is not a refusal:
+    this prevents an accident, and must not become a new way to be blocked.
+    """
+    if force:
+        return
+    existing = jobs_in_flight_named(job_name)
+    if not existing:
+        return
+    raise ValueError(
+        f"{len(existing)} job(s) named {job_name!r} are already queued or "
+        f"running: {', '.join(existing)}. A second pipeline would write the "
+        f"same query_mean.npy, the same shard parts and the same output CSV, "
+        f"and its merge would delete parts the first one is still writing.\n\n"
+        f"Cancel those first (scancel {' '.join(existing)}), or pass "
+        f"--force-duplicate if you genuinely intend two runs — in which case "
+        f"give the second one a different --out."
+    )
+
+
 def _build_assignment_command(
     *,
     singularity_bin: str,
@@ -670,6 +722,7 @@ def submit_cluster_assignment_job(
     extras_dir: Path | None = None,
     device: str = "cpu",
     overwrite: bool = False,
+    force_duplicate: bool = False,
 ) -> dict:
     """Submit Stage 3 for one projections file.
 
@@ -725,6 +778,7 @@ def submit_cluster_assignment_job(
     # Before the mean job, so a bad walltime does not leave an orphan queued
     # against a dependency that never appears.
     check_time_limit(partition, time_limit)
+    refuse_if_already_queued(job_name, force=force_duplicate)
 
     if shards > 1 and depends_on_job_id is not None:
         # The array size has to be known at sbatch time, and it comes from the
@@ -1020,6 +1074,11 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["query", "reference", "none"])
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace an existing output CSV.")
+    parser.add_argument("--force-duplicate", action="store_true",
+                        help="Submit even though a pipeline with this job name "
+                             "is already queued or running. Only with a "
+                             "different --out: two runs sharing an output path "
+                             "overwrite each other's shard parts.")
     return parser
 
 
@@ -1037,6 +1096,7 @@ def main() -> None:
             validate_against=args.validate_against,
             shards=args.shards,
             device=args.device,
+            force_duplicate=args.force_duplicate,
             centering=args.centering,
             vote_preset=args.vote_preset,
             distance_weighted=args.distance_weighted,

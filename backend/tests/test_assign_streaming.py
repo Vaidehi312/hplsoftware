@@ -1561,6 +1561,83 @@ def test_the_limit_is_checked_before_anything_is_submitted(tmp_path):
         "the walltime is checked after the mean job is built"
 
 
+# --- a second identical pipeline -----------------------------------------
+#
+# Retyping the submission queued two full pipelines: two mean jobs writing one
+# query_mean.npy, two arrays writing the same 32 part files, and two merges —
+# the second of which runs --cleanup and deletes parts the first one's tasks are
+# still writing. Two processes writing one part file can produce a file whose
+# row count is right and whose contents interleave, which is exactly the failure
+# this codebase exists to refuse.
+
+
+def test_a_second_pipeline_with_the_same_name_is_refused(tmp_path):
+    import submit_cluster_assignment as sca
+
+    original = sca.jobs_in_flight_named
+    sca.jobs_in_flight_named = lambda name: ["1241571", "1241572", "1241573"]
+    try:
+        try:
+            sca.refuse_if_already_queued("hpl_cluster_assign")
+        except ValueError as e:
+            assert "already queued or running" in str(e), str(e)
+            # The message has to carry the ids, or cancelling means hunting.
+            assert "1241572" in str(e)
+            assert "scancel" in str(e)
+        else:
+            raise AssertionError("a duplicate pipeline was accepted")
+    finally:
+        sca.jobs_in_flight_named = original
+
+
+def test_nothing_queued_means_nothing_refused(tmp_path):
+    """The guard has to pass in the normal case, and must not turn an
+    unreachable squeue into a refusal — it prevents an accident, it is not a
+    precondition for submitting."""
+    import submit_cluster_assignment as sca
+
+    original = sca.jobs_in_flight_named
+    sca.jobs_in_flight_named = lambda name: []
+    try:
+        sca.refuse_if_already_queued("hpl_cluster_assign")
+    finally:
+        sca.jobs_in_flight_named = original
+
+
+def test_force_duplicate_overrides_it(tmp_path):
+    import submit_cluster_assignment as sca
+
+    original = sca.jobs_in_flight_named
+    sca.jobs_in_flight_named = lambda name: ["1241571"]
+    try:
+        sca.refuse_if_already_queued("hpl_cluster_assign", force=True)
+    finally:
+        sca.jobs_in_flight_named = original
+
+
+def test_the_whole_pipeline_is_matched_not_just_the_array(tmp_path):
+    """The mean and merge steps are named <job_name>_mean / _merge. A match on
+    the exact name only would miss a pipeline whose array had finished while its
+    merge was still pending."""
+    import submit_cluster_assignment as sca
+
+    class _Result:
+        returncode = 0
+        stdout = ("1241571|hpl_cluster_assign_mean\n"
+                  "1241573|hpl_cluster_assign_merge\n"
+                  "1241999|something_else\n")
+        stderr = ""
+
+    original = sca.subprocess.run
+    sca.subprocess.run = lambda *a, **k: _Result()
+    try:
+        found = sca.jobs_in_flight_named("hpl_cluster_assign")
+    finally:
+        sca.subprocess.run = original
+
+    assert found == ["1241571", "1241573"], found
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

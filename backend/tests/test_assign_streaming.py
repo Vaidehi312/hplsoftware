@@ -1766,6 +1766,109 @@ def test_a_missing_mean_file_is_refused(tmp_path):
         raise AssertionError("a missing mean file was accepted")
 
 
+# --- the shard index has to survive --cleanenv ---------------------------
+#
+# SLURM_ARRAY_TASK_ID is one more thing `singularity exec --cleanenv` wipes, and
+# the shard preamble indexed the bounds arrays with it *inside* the container.
+# Under `set -u` that aborted every task the instant the import check finished:
+# stdout ended at "container packages: ok", the whole 32-task array died, and
+# the merge sat on DependencyNeverSatisfied with nothing in the log but the
+# place it stopped. Twice, because the same mechanism had already been found and
+# fixed for the thread count without anyone asking what else came through the
+# same door.
+#
+# So the bounds are resolved outside the container and passed in through
+# SINGULARITYENV_/APPTAINERENV_, and this test runs the generated shell for real
+# against a stand-in that strips the environment the way --cleanenv does. A
+# string assertion would not have caught the original: it looked correct.
+
+
+def _fake_singularity(tmp_path: Path) -> Path:
+    """A `singularity` that keeps only what the SINGULARITYENV_ prefix passes."""
+    script = tmp_path / "singularity"
+    script.write_text(
+        "#!/bin/bash\n"
+        'inner="${@: -1}"\n'
+        "clean_env=()\n"
+        "while IFS='=' read -r name value; do\n"
+        "  case \"$name\" in\n"
+        "    SINGULARITYENV_*) clean_env+=(\"${name#SINGULARITYENV_}=$value\");;\n"
+        "  esac\n"
+        "done < <(env)\n"
+        'exec env -i PATH="$PATH" HOME="$HOME" "${clean_env[@]}" bash -lc "$inner"\n'
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _runnable_shard_command(tmp_path: Path, bounds):
+    """The real generated command, with the two container-only python calls
+    swapped for shell equivalents — everything about quoting, the preamble and
+    the environment crossing stays exactly as submitted."""
+    import submit_cluster_assignment as sca
+
+    command = sca._build_assignment_command(
+        singularity_bin=str(_fake_singularity(tmp_path)),
+        singularity_image=Path("/img.sif"), extras_dir=Path("/extras"),
+        assign_script=Path("/bin/echo"), reference=Path("/ref/r.npz"),
+        projections_h5=Path("/p/x.h5"), out_csv=Path("/o/x.csv"),
+        rep_key="z_latent", k=None, batch_size=16384, validate_against=None,
+        threads=2, shard_bounds=bounds)
+    return (command.replace("python -c ", "true ")
+                   .replace("python /bin/echo", "echo ASSIGN_ARGS:"))
+
+
+def test_each_shard_gets_its_own_rows_through_cleanenv(tmp_path):
+    import os
+
+    command = _runnable_shard_command(tmp_path, [(0, 100), (100, 200), (200, 300)])
+
+    for task, expected in (("0", ("0", "100")), ("2", ("200", "300"))):
+        result = subprocess.run(
+            ["bash", "-lc", command], capture_output=True, text=True,
+            env={**os.environ, "SLURM_ARRAY_TASK_ID": task}, timeout=120)
+
+        assert result.returncode == 0, (
+            f"task {task} failed: {result.stderr[-400:]}")
+        lo, hi = expected
+        assert f"=== Shard {task}: rows {lo}-{hi} ===" in result.stdout, result.stdout
+        assert f"--row-start {lo} --row-stop {hi}" in result.stdout, result.stdout
+
+
+def test_a_sharded_command_run_as_a_plain_job_still_aborts(tmp_path):
+    """The guard worth keeping. Without an array index there is no correct range,
+    and one task quietly assigning the wrong rows is worse than a failure."""
+    import os
+
+    command = _runnable_shard_command(tmp_path, [(0, 100), (100, 200)])
+    env = {k: v for k, v in os.environ.items() if k != "SLURM_ARRAY_TASK_ID"}
+
+    result = subprocess.run(["bash", "-lc", command], capture_output=True,
+                            text=True, env=env, timeout=120)
+
+    assert result.returncode != 0
+    assert "SLURM_ARRAY_TASK_ID" in result.stderr
+
+
+def test_the_shard_bounds_are_resolved_outside_the_container(tmp_path):
+    """Belt and braces on the mechanism, so a future edit that moves the
+    preamble back inside is caught by reading as well as by running."""
+    import submit_cluster_assignment as sca
+
+    command = sca._build_assignment_command(
+        singularity_bin="singularity", singularity_image=Path("/img.sif"),
+        extras_dir=Path("/extras"), assign_script=Path("/b/assign.py"),
+        reference=Path("/ref/r.npz"), projections_h5=Path("/p/x.h5"),
+        out_csv=Path("/o/x.csv"), rep_key="z_latent", k=None, batch_size=16384,
+        validate_against=None, threads=2, shard_bounds=[(0, 10), (10, 20)])
+
+    # The array index is read before singularity is invoked...
+    assert command.index("SLURM_ARRAY_TASK_ID") < command.index("singularity")
+    # ...and the resolved values cross the boundary by the documented route.
+    assert "SINGULARITYENV_ROW_START" in command
+    assert "APPTAINERENV_ROW_START" in command
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

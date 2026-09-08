@@ -169,8 +169,21 @@ failed and nothing warned: a 2.5M-row reference at 127 dims came to 49 tiles/s, 
 took three days instead of hours. Thread counts are baked in at submit time now
 (`_build_assignment_command(threads=...)`), which means the number and the sbatch's
 `--cpus-per-task` live in different strings and must be changed together —
-`test_assign_streaming.py` pins both. Anything else the job needs from the submitting
-environment has the same problem.
+`test_assign_streaming.py` pins both.
+
+The same door let a second one through: `SLURM_ARRAY_TASK_ID`, which the shard preamble used
+to index its bounds arrays *inside* the container. Under `set -u` that aborted every array task
+the moment the import check finished — stdout ending at "container packages: ok", the array
+purged, and the merge left on `DependencyNeverSatisfied` with nothing in the log but the place it
+stopped. The bounds are resolved outside the container now and passed in via
+`SINGULARITYENV_`/`APPTAINERENV_`, which is the documented route through `--cleanenv`, and the
+`set -u` check stays out there where an unset index really does mean a sharded command was
+submitted as a plain job. **`submit_feature_extraction.py` still has the original pattern**
+(`shard_preamble` inside `inner`), so extraction sharding has the same latent bug.
+
+Assume nothing the job needs from the submitting environment survives, and note that a string
+assertion cannot catch this class — the broken version looked correct. The test runs the
+generated shell against a stand-in that strips the environment the way `--cleanenv` does.
 
 **GPU type names are cluster-specific and matching is exact.** This cluster has `nvidia_h200`,
 `nvidia_h100_80gb_hbm3`, `nvidia_h100_pcie`, `nvidia_a100_80gb_pcie`. A preference list naming types

@@ -609,19 +609,41 @@ def _build_assignment_command(
     # well-formed CSV of different cluster IDs. assign_hpc_clusters.py refuses
     # the combination outright, so this is belt and braces on a guard that
     # already exists.
-    shard_preamble = ""
+    # The shard bounds are resolved OUTSIDE the container and handed in through
+    # the environment, because SLURM_ARRAY_TASK_ID is one more thing
+    # `singularity exec --cleanenv` wipes — the same mechanism that silently
+    # pinned every assignment to one core, except here it is not silent: under
+    # `set -u` the array index aborts the task the instant the import check
+    # finishes, the whole array dies, and the merge is left on
+    # DependencyNeverSatisfied with no clue in the log beyond where it stops.
+    #
+    # SINGULARITYENV_/APPTAINERENV_ are the documented way through --cleanenv,
+    # and both prefixes are set because the binary may be either.
+    outer_preamble = ""
+    env_prefix = ""
     if query_mean is not None:
         args.append(f"--query-mean {shlex.quote(real(query_mean))}")
     if shard_bounds is not None:
         starts = " ".join(str(lo) for lo, _ in shard_bounds)
         stops = " ".join(str(hi) for _, hi in shard_bounds)
-        shard_preamble = (
+        outer_preamble = (
+            "set -euo pipefail; "
             f"SHARD_STARTS=({starts}); SHARD_STOPS=({stops}); "
+            # Still `set -u` on the index, which is the check worth keeping: an
+            # unset SLURM_ARRAY_TASK_ID out here means a sharded command really
+            # was submitted as a plain job, and one task silently encoding the
+            # wrong range is worse than a refusal.
             'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
             'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
             'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
         )
-        args.append("--row-start $ROW_START --row-stop $ROW_STOP")
+        env_prefix = (
+            'SINGULARITYENV_ROW_START="$ROW_START" '
+            'SINGULARITYENV_ROW_STOP="$ROW_STOP" '
+            'APPTAINERENV_ROW_START="$ROW_START" '
+            'APPTAINERENV_ROW_STOP="$ROW_STOP" '
+        )
+        args.append('--row-start "$ROW_START" --row-stop "$ROW_STOP"')
 
     inner = (
         "set -euo pipefail; "
@@ -643,11 +665,10 @@ def _build_assignment_command(
         'export MKL_NUM_THREADS="$OMP_NUM_THREADS"; '
         "echo '=== Container packages ==='; "
         f"python -c {shlex.quote(_import_check_python(real(reference)))}; "
-        f"{shard_preamble}"
         f"echo '=== Cluster assignment ({device}) ==='; "
         f"python {shlex.quote(real(assign_script))} {' '.join(args)}"
     )
-    return " ".join([
+    return outer_preamble + env_prefix + " ".join([
         shlex.quote(singularity_bin), "exec", "--cleanenv",
         *(["--nv"] if device == "gpu" else []), *binds,
         shlex.quote(str(singularity_image)), "bash", "-lc", shlex.quote(inner),

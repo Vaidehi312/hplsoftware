@@ -971,6 +971,18 @@ def test_validate_survives_the_real_label_files_duplicates(tmp_path):
     if not real.is_file():
         return          # not on this machine; the unit tests above still hold
     truth = pd.read_csv(real)
+    # Present but not Kai's file. On the cluster this filename holds a derived
+    # copy whose cluster column has been renamed to hpc_id, and validate() quite
+    # correctly refuses a truth file with no groupby column — which is a finding
+    # about that file, not about the join this test covers. Skipping keeps the
+    # test honest rather than asserting against whatever happens to sit at the
+    # path; the same refusal would meet --validate-against, so it is worth
+    # saying out loud.
+    if "leiden_2.5" not in truth.columns:
+        print(f"    (skipped: {real.name} has no 'leiden_2.5' column — "
+              f"{list(truth.columns)}. --validate-against would refuse this "
+              f"file too.)")
+        return
 
     # An "assignment" that agrees with the truth everywhere it is defined, built
     # from the truth itself so the only thing under test is the join.

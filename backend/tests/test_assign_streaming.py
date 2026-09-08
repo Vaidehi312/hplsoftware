@@ -1443,6 +1443,26 @@ def test_the_run_reports_which_phase_the_time_went_to(tmp_path):
         assert phase in line[0], f"{phase} missing from {line[0]!r}"
 
 
+def test_the_progress_lines_carry_the_split_too(tmp_path):
+    """A run long enough for the split to matter is one nobody wants to wait out
+    before learning which phase to attack. This one was three days."""
+    reference = tmp_path / "ref.npz"
+    queries = tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=1200)
+
+    result = subprocess.run(
+        [sys.executable, str(ASSIGN), "--reference", str(reference),
+         "--h5", str(queries), "--out", str(tmp_path / "a.csv"),
+         "--chunk-size", "128", "--progress", "256"],
+        capture_output=True, text=True, timeout=600)
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    progress = [l for l in result.stdout.splitlines() if "tiles/s [" in l]
+    assert progress, f"no progress line with a split in:\n{result.stdout}"
+    assert "search" in progress[-1], progress[-1]
+
+
 def test_the_thread_count_appears_in_the_log(tmp_path):
     """So "why is this slow" is answerable from the log alone. 16 threads on one
     core and one thread look identical otherwise, and differ 2.4x."""

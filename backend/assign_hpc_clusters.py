@@ -889,7 +889,17 @@ def assign(args) -> dict:
 
             if args.progress and written % max(args.progress, 1) < len(frame):
                 rate = written / max(time.perf_counter() - started, 1e-9)
-                print(f"  {written:,}/{n_assigned:,}  {rate:,.0f} tiles/s", flush=True)
+                # The phase split on every progress line, not just at the end.
+                # A run long enough for the split to matter is a run nobody
+                # wants to wait out before learning which phase to attack —
+                # this one was three days.
+                accounted = sum(phase.values()) or 1e-9
+                split = " ".join(
+                    f"{name} {seconds / accounted * 100:.0f}%"
+                    for name, seconds in sorted(phase.items(), key=lambda kv: -kv[1])
+                    if seconds / accounted >= 0.005)
+                print(f"  {written:,}/{n_assigned:,}  {rate:,.0f} tiles/s "
+                      f"[{split}]", flush=True)
 
         if written != n_assigned:
             raise RuntimeError(f"Wrote {written} rows for a range of {n_assigned}.")

@@ -1359,6 +1359,62 @@ def test_the_gpu_job_asks_for_a_gpu_and_the_cpu_job_does_not(tmp_path):
         assert f"--device {device}" in command
 
 
+# --- threads the process can actually use --------------------------------
+#
+# Baking OMP_NUM_THREADS in at submit time fixed the first half of this: the
+# container could not read Slurm's variable, so it always ran on one core. The
+# second half is that the variable says what Slurm *allocated*, not what the
+# process may touch. Told to use 16 threads on a node whose affinity mask gave
+# it fewer usable CPUs, the assignment ran at 20 tiles/s — against 49 tiles/s
+# for the same work on a single thread. Oversubscription is worse than serial,
+# and nothing about it fails.
+
+
+def test_threads_never_exceed_the_cpus_the_process_may_use(tmp_path):
+    from assign_hpc_clusters import resolve_thread_count
+
+    assert resolve_thread_count(16, 1) == 1, "16 threads on one core is slower than one"
+    assert resolve_thread_count(16, 4) == 4
+    assert resolve_thread_count(16, 16) == 16
+    # Asking for fewer than are available is a deliberate choice, not a mistake.
+    assert resolve_thread_count(4, 16) == 4
+
+
+def test_an_unset_request_takes_what_is_available(tmp_path):
+    from assign_hpc_clusters import resolve_thread_count
+
+    assert resolve_thread_count(None, 8) == 8
+    assert resolve_thread_count(0, 8) == 8
+
+
+def test_a_nonsense_affinity_still_yields_one_thread(tmp_path):
+    """The guard has to survive its own inputs: zero usable CPUs is not a
+    reason to run zero threads."""
+    from assign_hpc_clusters import resolve_thread_count
+
+    assert resolve_thread_count(16, 0) == 1
+    assert resolve_thread_count(0, 0) == 1
+    assert resolve_thread_count(-4, 8) == 8
+
+
+def test_the_thread_count_is_reported(tmp_path, capsys=None):
+    """A job running 16 threads on one core and a job running one thread look
+    identical from outside. The log has to say which."""
+    import io
+    from contextlib import redirect_stdout
+
+    from assign_hpc_clusters import _configure_threads
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        threads = _configure_threads()
+    printed = buffer.getvalue()
+
+    assert threads >= 1
+    assert "Threads" in printed
+    assert "usable by this process" in printed
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

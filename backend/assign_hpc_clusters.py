@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -255,6 +256,71 @@ def project(embeddings: np.ndarray, components: np.ndarray,
 # --------------------------------------------------------------------------- #
 
 _COSINE_EPS = 1e-12  # guards a zero-norm vector, which cosine has no direction for
+
+
+def resolve_thread_count(requested: int | None, allowed: int) -> int:
+    """How many threads to actually run, given what was asked for and what the
+    process is allowed to use.
+
+    Never more than the CPUs in the affinity mask. Asking for more is not
+    merely wasted — it is slower than running single-threaded, because the
+    threads take turns on the cores they do have and pay a context switch each
+    time. Measured on this pipeline: an assignment told to use 16 threads on a
+    node that gave it fewer usable CPUs ran at 20 tiles/s, against 49 tiles/s
+    for the same work on one thread.
+
+    That is why the environment variable alone was never enough.
+    OMP_NUM_THREADS says what Slurm allocated; sched_getaffinity says what this
+    process may touch, and only the second one is binding.
+    """
+    if not allowed or allowed < 1:
+        allowed = 1
+    if not requested or requested < 1:
+        return allowed
+    return max(1, min(requested, allowed))
+
+
+def _configure_threads() -> int:
+    """Pin faiss's thread pool to the cores this process can really use, and
+    say so in the log.
+
+    Printed unconditionally because the number is invisible otherwise: a job
+    running 16 threads on one core and a job running one thread look identical
+    from outside, and differ by 2.4x in throughput.
+    """
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except AttributeError:                      # not Linux
+        allowed = os.cpu_count() or 1
+    try:
+        requested = int(os.environ.get("OMP_NUM_THREADS", "") or 0)
+    except ValueError:
+        requested = 0
+
+    threads = resolve_thread_count(requested, allowed)
+    note = ""
+    try:
+        import faiss
+        faiss.omp_set_num_threads(threads)
+        actual = faiss.omp_get_max_threads()
+        if actual != threads:
+            note = (f"  [faiss reports {actual} — this build may ignore the "
+                    f"thread count]")
+    except Exception as e:                       # noqa: BLE001
+        note = f"  [could not set faiss threads: {type(e).__name__}]"
+
+    print(f"Threads   : {threads} "
+          f"(OMP_NUM_THREADS={requested or 'unset'}, "
+          f"{allowed} CPU(s) usable by this process){note}")
+    if requested and requested > allowed:
+        print(f"  NOTE: asked for {requested} threads but only {allowed} CPU(s) "
+              f"are in this process's affinity mask, which is slower than "
+              f"running single-threaded. Capped to {threads}. The sbatch asked "
+              f"Slurm for more cores than the task can reach — check "
+              f"--cpus-per-task against the site's CPU binding, or shard "
+              f"instead, which gives each process its own allocation.",
+          file=sys.stderr)
+    return threads
 
 
 class Searcher:
@@ -710,6 +776,7 @@ def assign(args) -> dict:
 
     searcher = Searcher(reference, metric=args.metric, device=args.device)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
+    _configure_threads()
 
     # A property of the reference, so computed once here rather than per chunk.
     local_scale = None

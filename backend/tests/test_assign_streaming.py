@@ -1638,6 +1638,120 @@ def test_the_whole_pipeline_is_matched_not_just_the_array(tmp_path):
     assert found == ["1241571", "1241573"], found
 
 
+# --- reusing a query mean ------------------------------------------------
+#
+# The mean is one streamed pass over the projections and needs neither faiss nor
+# the container, so `assign_hpc_clusters.py --precompute-mean` runs it anywhere.
+# When the mean *job* will not start — a dependency that can never be satisfied
+# strands the whole array — that should not block a submission, and a retry
+# should not repeat a pass it already has.
+#
+# Every shard centres on this one file, so it is validated rather than trusted:
+# a truncated or wrong-width mean produces 32 well-formed CSVs of wrong cluster
+# IDs, with nothing downstream able to tell.
+
+
+def _stub_submitter(monkey_target, submitted):
+    import subprocess as sp
+
+    def _fake(argv, *a, **k):
+        submitted.append(argv)
+        return sp.CompletedProcess(argv, 0, stdout="Submitted batch job 1", stderr="")
+    monkey_target._run_sbatch_with_retry = _fake
+    monkey_target._check_singularity_image = lambda *a, **k: None
+    monkey_target._check_container_extras = lambda *a, **k: None
+    monkey_target.partition_time_limit = lambda p: None
+    monkey_target.jobs_in_flight_named = lambda n: []
+
+
+def _submit_with_mean(tmp_path, mean_path, shards=4):
+    import submit_cluster_assignment as sca
+
+    reference, queries = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=900)
+    submitted = []
+    saved = (sca._run_sbatch_with_retry, sca._check_singularity_image,
+             sca._check_container_extras, sca.partition_time_limit,
+             sca.jobs_in_flight_named)
+    _stub_submitter(sca, submitted)
+    try:
+        info = sca.submit_cluster_assignment_job(
+            projections_h5=queries, out_csv=tmp_path / "out.csv",
+            reference=reference, shards=shards, query_mean=mean_path,
+            overwrite=True)
+        return info, submitted
+    finally:
+        (sca._run_sbatch_with_retry, sca._check_singularity_image,
+         sca._check_container_extras, sca.partition_time_limit,
+         sca.jobs_in_flight_named) = saved
+
+
+def _dims(tmp_path) -> int:
+    reference = tmp_path / "ref.npz"
+    if not reference.is_file():
+        _write_reference(reference)
+    return int(np.load(reference)["reference"].shape[1])
+
+
+def test_a_reused_mean_submits_no_mean_job(tmp_path):
+    _write_reference(tmp_path / "ref.npz")
+    mean = tmp_path / "mean.npy"
+    np.save(mean, np.zeros(_dims(tmp_path), dtype=np.float32))
+
+    info, submitted = _submit_with_mean(tmp_path, mean)
+
+    assert info["mean_job_id"] is None, "a mean job was queued anyway"
+    names = [a[a.index("--job-name=hpl_cluster_assign") if False else 1]
+             for a in submitted]
+    assert not any(n.endswith("_mean") for n in names), names
+    # And the array must not depend on a job that was never submitted.
+    array_argv = submitted[0]
+    assert not any(a.startswith("--dependency") for a in array_argv), array_argv
+
+
+def test_a_mean_of_the_wrong_width_is_refused_before_sbatch(tmp_path):
+    """The failure with no downstream check: every shard centres on this file,
+    so a wrong width silently reprojects the whole cohort."""
+    _write_reference(tmp_path / "ref.npz")
+    mean = tmp_path / "mean.npy"
+    np.save(mean, np.zeros(_dims(tmp_path) + 5, dtype=np.float32))
+
+    try:
+        _submit_with_mean(tmp_path, mean)
+    except ValueError as e:
+        assert "dimensions" in str(e), str(e)
+        assert "wrong cluster IDs" in str(e)
+    else:
+        raise AssertionError("a wrong-width mean was accepted")
+
+
+def test_a_non_finite_mean_is_refused(tmp_path):
+    """What an interrupted --precompute-mean leaves behind."""
+    _write_reference(tmp_path / "ref.npz")
+    mean = tmp_path / "mean.npy"
+    values = np.zeros(_dims(tmp_path), dtype=np.float32)
+    values[3] = np.nan
+    np.save(mean, values)
+
+    try:
+        _submit_with_mean(tmp_path, mean)
+    except ValueError as e:
+        assert "non-finite" in str(e), str(e)
+    else:
+        raise AssertionError("a mean containing NaN was accepted")
+
+
+def test_a_missing_mean_file_is_refused(tmp_path):
+    _write_reference(tmp_path / "ref.npz")
+    try:
+        _submit_with_mean(tmp_path, tmp_path / "absent.npy")
+    except FileNotFoundError as e:
+        assert "absent.npy" in str(e)
+    else:
+        raise AssertionError("a missing mean file was accepted")
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

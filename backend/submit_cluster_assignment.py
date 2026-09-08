@@ -40,6 +40,7 @@ import sys
 from pathlib import Path
 
 import h5py
+import numpy as np
 
 from submit_feature_extraction import (
     CONTAINER_EXTRAS_GPU,
@@ -723,6 +724,7 @@ def submit_cluster_assignment_job(
     device: str = "cpu",
     overwrite: bool = False,
     force_duplicate: bool = False,
+    query_mean: Path | None = None,
 ) -> dict:
     """Submit Stage 3 for one projections file.
 
@@ -812,7 +814,39 @@ def submit_cluster_assignment_job(
         shard_bounds = shard_ranges(rows, shards)
         mean_path = out_csv.with_name(f"{out_csv.stem}.query_mean.npy")
 
-        if centering == "query":
+        if centering == "query" and query_mean is not None:
+            # An already-computed mean, so no mean job and no dependency. The
+            # step is one streamed pass over the projections and needs neither
+            # faiss nor the container — `assign_hpc_clusters.py
+            # --precompute-mean` runs it anywhere — so a mean job that will not
+            # start should not hold up an array, and a retry should not repeat a
+            # pass it already has.
+            #
+            # Validated here rather than trusted: every shard centres on this
+            # file, so a truncated or wrong-width one produces 32 well-formed
+            # CSVs of wrong cluster IDs, which is the failure mode with no
+            # downstream check.
+            mean_path = Path(query_mean)
+            if not mean_path.is_file():
+                raise FileNotFoundError(f"No such query-mean file: {mean_path}")
+            try:
+                loaded = np.load(mean_path)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"{mean_path} is not a readable .npy: {e}") from e
+            expected = int(reference_info["reference_dims"])
+            if loaded.shape != (expected,):
+                raise ValueError(
+                    f"{mean_path} holds shape {loaded.shape}, but this reference "
+                    f"has {expected} dimensions. A mean of the wrong width "
+                    f"projects every tile into a different space and produces a "
+                    f"complete CSV of wrong cluster IDs."
+                )
+            if not np.isfinite(loaded).all():
+                raise ValueError(
+                    f"{mean_path} contains non-finite values — it was probably "
+                    f"written by an interrupted job. Delete it and recompute.")
+            print(f"Query mean:       {mean_path} (reused, {expected} dims)")
+        elif centering == "query":
             mean_command = _build_simple_command(
                 singularity_bin=singularity_bin, singularity_image=singularity_image,
                 extras_dir=extras_dir, script=backend_dir / ASSIGN_SCRIPT,
@@ -1074,6 +1108,13 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["query", "reference", "none"])
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace an existing output CSV.")
+    parser.add_argument("--query-mean", type=Path, default=None,
+                        help="Reuse an existing query-mean .npy instead of "
+                             "submitting the mean job. Compute one with "
+                             "`assign_hpc_clusters.py --precompute-mean <path>`, "
+                             "which needs no container and no faiss. Its width "
+                             "is checked against the reference before anything "
+                             "is queued.")
     parser.add_argument("--force-duplicate", action="store_true",
                         help="Submit even though a pipeline with this job name "
                              "is already queued or running. Only with a "
@@ -1097,6 +1138,7 @@ def main() -> None:
             shards=args.shards,
             device=args.device,
             force_duplicate=args.force_duplicate,
+            query_mean=args.query_mean,
             centering=args.centering,
             vote_preset=args.vote_preset,
             distance_weighted=args.distance_weighted,

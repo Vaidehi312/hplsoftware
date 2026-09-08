@@ -86,5 +86,48 @@ BEGIN
     END LOOP;
 END$$;
 
+-- 8. The expressions the previews actually filter on.
+--
+-- Every index above is on the bare column, and every lookup in
+-- load_hpc_assignments.py and register_dataset.py filters on a *function* of it
+-- — `WHERE UPPER(slide_tile) IN :tiles`, `WHERE UPPER(TRIM(slides)) IN :slides`.
+-- Postgres cannot use a plain b-tree for that, so those queries were sequential
+-- scans: Stage 6's preview chunks 18.5M keys 10,000 at a time, which is ~1,850
+-- full scans of an 18.5M-row table for one dry run. That is the whole reason a
+-- preview that writes nothing took longer than the write.
+--
+-- The normalising UPDATEs above mean UPPER(TRIM(x)) = x for every row they
+-- touched, so these indexes are redundant *in content* — and load-bearing in
+-- planning, because the query says UPPER() and the planner matches expressions,
+-- not values. Indexing the expression rather than dropping UPPER() from the
+-- query keeps rows that were written outside this pipeline (the original
+-- notebooks) matching exactly as they do today.
+CREATE INDEX IF NOT EXISTS idx_tr_slide_tile_upper
+    ON tile_registry (UPPER(slide_tile));
+CREATE INDEX IF NOT EXISTS idx_tc_slide_tile_upper
+    ON tile_coordinates (UPPER(slide_tile));
+-- The per-slide variants, used by the delete/replace paths and by Stage 6's
+-- foreign-cohort check.
+CREATE INDEX IF NOT EXISTS idx_tr_slides_upper
+    ON tile_registry (UPPER(TRIM(slides)));
+CREATE INDEX IF NOT EXISTS idx_tc_slides_upper
+    ON tile_coordinates (UPPER(TRIM(slides)));
+CREATE INDEX IF NOT EXISTS idx_wr_slide_id_upper
+    ON wsi_registry (UPPER(slide_id));
+-- wsi_metadata is checked by the same collision guard. Guarded by existence:
+-- it is one of the tables migrate_kb_base_tables.sql adds, and CREATE INDEX
+-- still raises when the table is absent.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema()
+                 AND table_name = 'wsi_metadata') THEN
+        CREATE INDEX IF NOT EXISTS idx_wm_slide_id_upper
+            ON wsi_metadata (UPPER(slide_id));
+    ELSE
+        RAISE NOTICE 'wsi_metadata absent; its index was not created.';
+    END IF;
+END$$;
+
 -- Done. Run `ANALYZE;` after to refresh planner statistics.
 ANALYZE;

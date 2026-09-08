@@ -551,6 +551,49 @@ def refuse_if_already_queued(job_name: str, *, force: bool = False) -> None:
     )
 
 
+def partition_has_gpus(partition: str) -> bool | None:
+    """Whether the partition advertises any generic resources (GPUs).
+
+    None means "could not ask", which never blocks a submission — same posture
+    as partition_time_limit.
+    """
+    try:
+        result = subprocess.run(["sinfo", "-h", "-p", partition, "-o", "%G"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [l.strip() for l in (result.stdout or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    return any(l not in ("(null)", "N/A") for l in lines)
+
+
+def resolve_device(device: str, extras_gpu: Path = CONTAINER_EXTRAS_GPU) -> tuple[str, str]:
+    """(device, why) for a submission. "auto" is decided here, not in the job.
+
+    The job's own "auto" can look at the GPU in front of it; a submission cannot,
+    because the sbatch flags — --nv, --gres, which extras directory to bind —
+    have to be chosen before any node is allocated. The observable that decides
+    it is whether the GPU extras have been bootstrapped: without them the
+    container has faiss-cpu and nothing else, so asking Slurm for a GPU would
+    queue behind every real GPU job to run a CPU search.
+
+    Reported rather than silent, because "why is this on the CPU partition" is a
+    question the answer should already be on screen for.
+    """
+    if device not in ("auto", "cpu", "gpu"):
+        raise ValueError(f"Unknown device: {device!r}. Use 'auto', 'cpu' or 'gpu'.")
+    if device != "auto":
+        return device, "requested explicitly"
+    if extras_gpu.is_dir() and (extras_gpu / "faiss").is_dir():
+        return "gpu", f"GPU extras present at {extras_gpu}"
+    return "cpu", (f"no GPU faiss at {extras_gpu} — run "
+                   f"`submit_feature_extraction.py --bootstrap-extras-gpu` to "
+                   f"use one")
+
+
 def _build_assignment_command(
     *,
     singularity_bin: str,
@@ -748,7 +791,7 @@ def submit_cluster_assignment_job(
     singularity_image: Path = SINGULARITY_IMAGE,
     singularity_bin: str = SINGULARITY_BIN,
     extras_dir: Path | None = None,
-    device: str = "cpu",
+    device: str = "auto",
     overwrite: bool = False,
     force_duplicate: bool = False,
     query_mean: Path | None = None,
@@ -797,8 +840,21 @@ def submit_cluster_assignment_job(
         )
 
     _check_singularity_image(singularity_image, singularity_bin)
-    if device not in ("cpu", "gpu"):
-        raise ValueError(f"Unknown device: {device!r}. Use 'cpu' or 'gpu'.")
+    device, device_reason = resolve_device(device)
+    print(f"Device:           {device}  ({device_reason})")
+    if device == "gpu":
+        # A --gres=gpu:1 on a partition with no GPUs pends forever as
+        # ReqNodeNotAvail, which reads like a busy queue rather than a
+        # misconfiguration. Refuse instead, at submit time.
+        has_gpus = partition_has_gpus(partition)
+        if has_gpus is False:
+            raise ValueError(
+                f"--device gpu asks Slurm for a GPU, but partition "
+                f"{partition!r} advertises none, so the job would pend "
+                f"indefinitely as ReqNodeNotAvail. Submit to a GPU partition "
+                f"(--partition), or use --device cpu. Note a GPU partition is "
+                f"preemptible here, so pair it with --shards."
+            )
     # The GPU search reads a different extras directory, because faiss-cpu and
     # a GPU faiss are both imported as `faiss` and cannot share a PYTHONPATH.
     if extras_dir is None:
@@ -1125,17 +1181,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Walltime for the shard-merge job. Default "
                              f"{MERGE_TIME_LIMIT}.")
     parser.add_argument("--notify-email", type=str, default=None)
-    parser.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
-                        help="Where the exact flat search runs. 'gpu' is the "
-                             "same exhaustive scan on faster hardware, not an "
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cpu", "gpu"],
+                        help="Where the exact flat search runs. GPU is the same "
+                             "exhaustive scan on faster hardware, not an "
                              "approximation, and the job verifies its GPU index "
                              "against a CPU one at startup rather than trusting "
-                             "it. Needs the GPU extras "
-                             "(--bootstrap-extras-gpu on "
-                             "submit_feature_extraction.py) and puts the job in "
-                             "the GPU partition, where it can be preempted — so "
-                             "pair it with --shards, which is what makes a "
-                             "preemption cost one task instead of the run.")
+                             "it. auto (default) uses a GPU when the GPU extras "
+                             "have been bootstrapped and CPU otherwise, printing "
+                             "which and why; gpu requests one and refuses if the "
+                             "partition has none; cpu never asks. A GPU means a "
+                             "GPU partition, which is preemptible here, so pair "
+                             "it with --shards — a shard is the checkpoint that "
+                             "makes a preemption cost one task rather than the "
+                             "run.")
     parser.add_argument("--shards", type=int, default=1,
                         help="Split the assignment across N array tasks. A mean job "
                              "runs first so every shard centres identically, then a "

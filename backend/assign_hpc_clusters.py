@@ -258,6 +258,26 @@ def project(embeddings: np.ndarray, components: np.ndarray,
 _COSINE_EPS = 1e-12  # guards a zero-norm vector, which cosine has no direction for
 
 
+def _gpu_unavailable_reason(faiss) -> str | None:
+    """Why this build cannot search on a GPU, or None if it can try.
+
+    Deliberately not a verification — that happens in Searcher, by searching
+    with both indexes and comparing. This only answers "is there any point
+    trying", which is what "auto" needs and what a capability flag can honestly
+    report. A build can pass every check here and still be a stub.
+    """
+    if not hasattr(faiss, "StandardGpuResources"):
+        return ("this faiss build has no GPU support (no StandardGpuResources); "
+                "install the GPU extras with "
+                "`submit_feature_extraction.py --bootstrap-extras-gpu`")
+    try:
+        if faiss.get_num_gpus() < 1:
+            return "faiss reports no GPU devices visible to this process"
+    except Exception as e:  # noqa: BLE001
+        return f"faiss could not count GPUs ({type(e).__name__})"
+    return None
+
+
 def resolve_thread_count(requested: int | None, allowed: int) -> int:
     """How many threads to actually run, given what was asked for and what the
     process is allowed to use.
@@ -341,11 +361,12 @@ class Searcher:
     """
 
     def __init__(self, reference: np.ndarray, metric: str = "l2",
-                 device: str = "cpu"):
+                 device: str = "auto"):
         if metric not in ("l2", "cosine"):
             raise ValueError(f"Unknown metric: {metric!r}. Use 'l2' or 'cosine'.")
-        if device not in ("cpu", "gpu"):
-            raise ValueError(f"Unknown device: {device!r}. Use 'cpu' or 'gpu'.")
+        if device not in ("cpu", "gpu", "auto"):
+            raise ValueError(
+                f"Unknown device: {device!r}. Use 'auto', 'cpu' or 'gpu'.")
         self.metric = metric
         self.device = device
         self.reference = np.ascontiguousarray(reference, dtype=np.float32)
@@ -366,6 +387,27 @@ class Searcher:
             index.add(self.reference)
 
         self.backend = "faiss-flat" if metric == "l2" else "faiss-flat-cosine"
+
+        # "auto" is the default: use the GPU when there is a working one, and
+        # the CPU otherwise. The fallback is announced rather than silent — the
+        # Backend line below always says which ran — because a GPU quietly
+        # becoming a CPU is a 30x slowdown that looks like nothing at all.
+        #
+        # What "auto" never does is lower the bar on correctness. A GPU index
+        # that disagrees with the CPU index is refused in every mode, not fallen
+        # back from: disagreement means the build is broken, and a broken build
+        # would produce a complete CSV of wrong cluster IDs whichever flag asked
+        # for it.
+        if device == "auto":
+            reason = _gpu_unavailable_reason(faiss)
+            if reason:
+                self.device = "cpu"
+                self._auto_note = reason
+                device = "cpu"
+            else:
+                device = "gpu"
+                self.device = "gpu"
+
         if device == "gpu":
             # Still the same exhaustive scan — GpuIndexFlat compares every query
             # against every reference vector, exactly as IndexFlat does. That is
@@ -776,6 +818,9 @@ def assign(args) -> dict:
 
     searcher = Searcher(reference, metric=args.metric, device=args.device)
     print(f"Backend   : {searcher.backend}, centering={args.centering}")
+    if getattr(searcher, "_auto_note", None):
+        print(f"            (--device auto fell back to CPU: "
+              f"{searcher._auto_note})")
     _configure_threads()
 
     # A property of the reference, so computed once here rather than per chunk.
@@ -1057,14 +1102,16 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=None,
                         help="Neighbours to poll. Defaults to the reference's own "
                              "Leiden n_neighbors, which is what ingest used.")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cpu", "gpu"],
                         help="Where the exact flat search runs. GPU is the same "
-                             "exhaustive scan on faster hardware — not an "
-                             "approximation — but it needs a faiss build with "
-                             "GPU support (see --bootstrap-extras-gpu). Defaults "
-                             "to cpu so no existing submission changes hardware, "
-                             "and refuses rather than falling back if the GPU is "
-                             "unavailable.")
+                             "exhaustive scan on faster hardware, not an "
+                             "approximation, and either way the GPU index is "
+                             "verified against a CPU one at startup and refused "
+                             "on disagreement. auto (default) uses a GPU when "
+                             "there is a working one and says so when it falls "
+                             "back; gpu refuses rather than falling back; cpu "
+                             "never tries.")
     parser.add_argument("--metric", default="l2", choices=["l2", "cosine"],
                         help="l2 (default): Euclidean distance, what ingest uses. "
                              "cosine: direction only, ignoring magnitude — validate "

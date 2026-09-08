@@ -1258,13 +1258,74 @@ def test_an_unknown_device_is_refused(tmp_path):
         raise AssertionError("'cuda' was accepted; the choices are cpu and gpu")
 
 
-def test_the_cpu_default_is_unchanged(tmp_path):
-    """No existing submission changes hardware by being upgraded."""
+def test_cpu_is_honoured_when_asked_for(tmp_path):
+    """The default is "auto" now, so what has to be pinned is that an explicit
+    cpu never tries a GPU — on a host that has one, this is the only way to get
+    the CPU index, and every previously-measured number came from it."""
     from assign_hpc_clusters import Searcher
 
-    searcher = Searcher(np.eye(8, dtype=np.float32))
+    searcher = Searcher(np.eye(8, dtype=np.float32), device="cpu")
     assert searcher.device == "cpu"
     assert searcher.backend == "faiss-flat"
+
+
+def test_auto_falls_back_to_cpu_and_says_why(tmp_path):
+    """auto is the default, so the fallback has to be both correct and visible:
+    a GPU quietly becoming a CPU is a 30x slowdown that looks like nothing."""
+    import faiss
+
+    from assign_hpc_clusters import Searcher
+
+    saved = getattr(faiss, "StandardGpuResources", None)
+    if saved is not None:
+        del faiss.StandardGpuResources
+    try:
+        searcher = Searcher(np.eye(8, dtype=np.float32))      # auto
+        assert searcher.device == "cpu"
+        assert searcher.backend == "faiss-flat"
+        assert "bootstrap-extras-gpu" in searcher._auto_note, searcher._auto_note
+    finally:
+        if saved is not None:
+            faiss.StandardGpuResources = saved
+
+
+def test_auto_still_refuses_a_gpu_that_disagrees(tmp_path):
+    """The one thing auto must never do is lower the bar on correctness. A
+    disagreeing GPU index means a broken build, and a broken build produces a
+    complete CSV of wrong cluster IDs whichever flag asked for it — so it is
+    refused rather than fallen back from."""
+    import faiss
+
+    from assign_hpc_clusters import Searcher
+
+    reference = np.random.default_rng(0).standard_normal((256, 16), dtype=np.float32)
+
+    real_move = getattr(faiss, "index_cpu_to_gpu", None)
+    real_resources = getattr(faiss, "StandardGpuResources", None)
+    real_count = getattr(faiss, "get_num_gpus", None)
+
+    class _WrongIndex:
+        def search(self, queries, k):
+            rows = queries.shape[0]
+            return (np.full((rows, k), 7.0, dtype=np.float32),
+                    np.zeros((rows, k), dtype=np.int64))
+
+    faiss.StandardGpuResources = lambda: object()
+    faiss.get_num_gpus = lambda: 1
+    faiss.index_cpu_to_gpu = lambda *a, **k: _WrongIndex()
+    try:
+        try:
+            Searcher(reference)                                # auto, not "gpu"
+        except SystemExit as e:
+            assert "REFUSING --device gpu" in str(e), str(e)
+        else:
+            raise AssertionError("auto accepted a disagreeing GPU index")
+    finally:
+        for name, value in (("index_cpu_to_gpu", real_move),
+                            ("StandardGpuResources", real_resources),
+                            ("get_num_gpus", real_count)):
+            if value is not None:
+                setattr(faiss, name, value)
 
 
 def test_a_gpu_index_that_disagrees_with_cpu_is_refused(tmp_path):
@@ -1867,6 +1928,115 @@ def test_the_shard_bounds_are_resolved_outside_the_container(tmp_path):
     # ...and the resolved values cross the boundary by the documented route.
     assert "SINGULARITYENV_ROW_START" in command
     assert "APPTAINERENV_ROW_START" in command
+
+
+# --- deciding the device at submit time ----------------------------------
+#
+# The job's own "auto" can look at the GPU in front of it. A submission cannot:
+# --nv, --gres and which extras directory to bind are all chosen before a node
+# is allocated. So the submitter resolves "auto" from the one observable it has
+# — whether the GPU extras were ever bootstrapped — and prints the reason,
+# because "why is this on the CPU partition" should not need investigating.
+
+
+def test_auto_picks_cpu_when_the_gpu_extras_are_absent(tmp_path):
+    from submit_cluster_assignment import resolve_device
+
+    device, why = resolve_device("auto", tmp_path / "nothing-here")
+
+    assert device == "cpu"
+    assert "bootstrap-extras-gpu" in why, why
+
+
+def test_auto_picks_gpu_once_the_extras_exist(tmp_path):
+    """Bootstrapped means a `faiss` package inside the GPU extras directory —
+    the directory alone is not enough, since a failed bootstrap leaves one."""
+    from submit_cluster_assignment import resolve_device
+
+    extras = tmp_path / "extras-py38-gpu"
+    (extras / "faiss").mkdir(parents=True)
+
+    device, why = resolve_device("auto", extras)
+
+    assert device == "gpu"
+    assert str(extras) in why
+
+    # An empty directory is what a failed bootstrap leaves behind.
+    empty = tmp_path / "half-done"
+    empty.mkdir()
+    assert resolve_device("auto", empty)[0] == "cpu"
+
+
+def test_an_explicit_device_is_never_second_guessed(tmp_path):
+    from submit_cluster_assignment import resolve_device
+
+    assert resolve_device("cpu", tmp_path)[0] == "cpu"
+    assert resolve_device("gpu", tmp_path)[0] == "gpu"
+    try:
+        resolve_device("cuda", tmp_path)
+    except ValueError as e:
+        assert "auto" in str(e)
+    else:
+        raise AssertionError("'cuda' was accepted as a device")
+
+
+def test_a_gpu_on_a_partition_with_no_gpus_is_refused(tmp_path):
+    """--gres=gpu:1 on a GPU-less partition pends forever as ReqNodeNotAvail,
+    which reads like a busy queue rather than a misconfiguration."""
+    import submit_cluster_assignment as sca
+
+    reference, queries = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=300)
+
+    submitted = []
+    saved = (sca._run_sbatch_with_retry, sca._check_singularity_image,
+             sca._check_container_extras, sca.partition_time_limit,
+             sca.jobs_in_flight_named, sca.partition_has_gpus)
+    _stub_submitter(sca, submitted)
+    sca.partition_has_gpus = lambda partition: False
+    try:
+        try:
+            sca.submit_cluster_assignment_job(
+                projections_h5=queries, out_csv=tmp_path / "out.csv",
+                reference=reference, device="gpu", partition="compute",
+                overwrite=True)
+        except ValueError as e:
+            assert "advertises none" in str(e), str(e)
+            assert not submitted, "sbatch was called anyway"
+        else:
+            raise AssertionError("a GPU job was submitted to a GPU-less partition")
+    finally:
+        (sca._run_sbatch_with_retry, sca._check_singularity_image,
+         sca._check_container_extras, sca.partition_time_limit,
+         sca.jobs_in_flight_named, sca.partition_has_gpus) = saved
+
+
+def test_an_unknown_partition_gpu_count_does_not_block(tmp_path):
+    """sinfo being unavailable is not a reason to refuse — same posture as the
+    walltime check."""
+    import submit_cluster_assignment as sca
+
+    reference, queries = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=300)
+
+    submitted = []
+    saved = (sca._run_sbatch_with_retry, sca._check_singularity_image,
+             sca._check_container_extras, sca.partition_time_limit,
+             sca.jobs_in_flight_named, sca.partition_has_gpus)
+    _stub_submitter(sca, submitted)
+    sca.partition_has_gpus = lambda partition: None
+    try:
+        sca.submit_cluster_assignment_job(
+            projections_h5=queries, out_csv=tmp_path / "out.csv",
+            reference=reference, device="gpu", partition="gpu", overwrite=True)
+        assert submitted, "nothing was submitted"
+        assert any("--gres=gpu:1" in a for a in submitted[0]), submitted[0]
+    finally:
+        (sca._run_sbatch_with_retry, sca._check_singularity_image,
+         sca._check_container_extras, sca.partition_time_limit,
+         sca.jobs_in_flight_named, sca.partition_has_gpus) = saved
 
 
 # --- standalone runner ---------------------------------------------------

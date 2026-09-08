@@ -217,6 +217,15 @@ exists and is still the only fix for the artifacts on disk, and for mixed.
 `mean`).** There is no `labels` key. `build_hpc_reference.save()` is the authority;
 `test_reference_keys_match_the_builder` round-trips through it so readers cannot drift.
 
+**`--device` defaults to `auto`, and `auto` never lowers the correctness bar.** The submitter
+resolves it before any node exists, from the one observable it has — whether the GPU extras were
+bootstrapped (`resolve_device()`) — and prints the choice with its reason. The job resolves its own
+`auto` against the GPU actually in front of it and prints the fallback. `gpu` refuses rather than
+falling back; `cpu` never tries. What no mode does is accept a GPU index that disagrees with the CPU
+one: that means a broken build, which would produce a complete CSV of wrong cluster IDs whatever
+asked for it. A `--gres=gpu:1` on a partition advertising no GPUs is also refused at submit time,
+because it otherwise pends forever as `ReqNodeNotAvail` and reads like a busy queue.
+
 **The GPU search is the same exact scan, and it is verified rather than trusted.** `--device gpu`
 moves the flat index to GPU 0 (`GpuIndexFlat` compares every query against every reference vector,
 exactly as `IndexFlat` does), which is why it is admissible where faiss-ivf was not. It needs a

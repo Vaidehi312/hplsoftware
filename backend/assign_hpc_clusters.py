@@ -812,16 +812,35 @@ def assign(args) -> dict:
     started = time.perf_counter()
     written = 0
     n_revoted = 0
+    # Where the time actually goes. The loop is read -> project -> search ->
+    # vote -> write, strictly in sequence, so any phase that is not the search
+    # is time the cores spend idle. Guessing which one dominates is how an
+    # optimisation gets aimed at the wrong phase — this measures it, at the cost
+    # of a few perf_counter calls per chunk.
+    phase = {"read": 0.0, "project": 0.0, "search": 0.0, "vote": 0.0,
+             "write": 0.0}
     try:
-        for start, stop, block in iter_embedding_chunks(
-            args.h5, args.rep_key, args.chunk_size, lo, hi
-        ):
+        chunks = iter_embedding_chunks(
+            args.h5, args.rep_key, args.chunk_size, lo, hi)
+        while True:
+            _t = time.perf_counter()
+            try:
+                start, stop, block = next(chunks)
+            except StopIteration:
+                break
+            phase["read"] += time.perf_counter() - _t
+
+            _t = time.perf_counter()
             queries = project(block, components, ref["mean"], args.centering,
                               query_mean=query_mean)
+            phase["project"] += time.perf_counter() - _t
             offset = start - lo
             for bstart in range(0, len(queries), args.batch_size):
                 bstop = min(bstart + args.batch_size, len(queries))
+                _t = time.perf_counter()
                 idx, dist = searcher.search(queries[bstart:bstop], k_search)
+                phase["search"] += time.perf_counter() - _t
+                _t = time.perf_counter()
                 w, m, d = vote(idx[:, :k], dist[:, :k], codes, len(categories),
                                distance_weighted=args.distance_weighted,
                                distance_power=args.distance_power,
@@ -845,6 +864,7 @@ def assign(args) -> dict:
                         w, m, d = w.copy(), m.copy(), d.copy()
                         w[low], m[low], d[low] = w2, m2, d2
                         n_revoted += int(low.sum())
+                phase["vote"] += time.perf_counter() - _t
                 margins[offset + bstart:offset + bstop] = m
                 distances[offset + bstart:offset + bstop] = d
                 np.add.at(cluster_counts, w, 1)
@@ -852,6 +872,7 @@ def assign(args) -> dict:
                     chunk_winners = np.empty(len(queries), dtype=np.int64)
                 chunk_winners[bstart:bstop] = w
 
+            _t = time.perf_counter()
             frame = read_metadata_frame(args.h5, meta_keys, start, stop)
             # Vectorised label lookup, replacing a per-tile list comprehension.
             frame[groupby] = category_lookup[chunk_winners]
@@ -863,6 +884,7 @@ def assign(args) -> dict:
             # nothing to tell assignments from two different references apart.
             frame["hpc_reference"] = args.reference.stem
             frame.to_csv(tmp_path, mode="a", header=(written == 0), index=False)
+            phase["write"] += time.perf_counter() - _t
             written += len(frame)
 
             if args.progress and written % max(args.progress, 1) < len(frame):
@@ -880,6 +902,21 @@ def assign(args) -> dict:
     elapsed = time.perf_counter() - started
     print(f"Assigned  : {written:,} tiles in {elapsed:.1f}s "
           f"({written/max(elapsed, 1e-9):,.0f} tiles/s)")
+    accounted = sum(phase.values())
+    print("Time spent: " + ", ".join(
+        f"{name} {seconds:,.0f}s ({seconds / max(elapsed, 1e-9) * 100:.0f}%)"
+        for name, seconds in sorted(phase.items(), key=lambda kv: -kv[1])))
+    if elapsed - accounted > 0.05 * elapsed:
+        print(f"            unaccounted {elapsed - accounted:,.0f}s "
+              f"({(elapsed - accounted) / elapsed * 100:.0f}%)")
+    # Which phase to attack is only obvious once it is measured: search is the
+    # part faiss threads and a GPU accelerates, and everything else is
+    # sequential Python that more cores do nothing for.
+    if phase["search"] < 0.5 * accounted:
+        print("            NOTE: the search is under half the time, so more "
+              "threads or a GPU can only address the smaller part. Sharding "
+              "splits every phase, including the sequential ones.",
+              file=sys.stderr)
     if adaptive_margin > 0:
         print(f"Re-voted  : {n_revoted:,} tiles ({n_revoted / max(written, 1) * 100:.1f}%) "
               f"at k={adaptive_k}")

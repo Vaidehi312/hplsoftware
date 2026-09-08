@@ -189,11 +189,20 @@ CONTAINER_EXTRAS_GPU = Path(
     os.getenv("HPL_CONTAINER_EXTRAS_GPU",
               str(SINGULARITY_IMAGE.parent / "extras-py38-gpu"))
 )
-# cu12 to match the image's CUDA 12. Not pinned: which wheel still builds for
-# the image's Python 3.8 is exactly the thing to let pip decide, and
-# --bootstrap-extras-gpu fails loudly if there is none.
+# Tried in order, first one that installs wins. The image is CUDA 12, so
+# faiss-gpu-cu12 is the match — but it is a young package and the container's
+# Python is 3.8, so a cp38 wheel may not exist for it. faiss-gpu-cu11 works
+# against a CUDA 12 driver (minor-version compatibility), and the legacy
+# faiss-gpu is the last resort with the widest cp38 coverage.
+#
+# Whichever lands, Searcher._verify_matches_cpu decides whether it can be
+# trusted: it searches a sample of the reference against both the GPU and CPU
+# indexes and refuses on disagreement. So a wheel that installs but does not
+# work costs a startup refusal, not a cohort of wrong cluster IDs.
 _CONTAINER_EXTRA_PACKAGES_GPU = (
     "faiss-gpu-cu12",
+    "faiss-gpu-cu11",
+    "faiss-gpu",
 )
 
 # Import-checked in the job before encoding. Module name, not package name:
@@ -1363,21 +1372,40 @@ def main() -> None:
         return
 
     if args.bootstrap_extras_gpu:
-        try:
-            bootstrap_container_extras(
-                CONTAINER_EXTRAS_GPU,
-                singularity_image=args.singularity_image,
-                singularity_bin=args.singularity_bin,
-                packages=_CONTAINER_EXTRA_PACKAGES_GPU,
-                verify="faiss",
-            )
-        except (FileNotFoundError, RuntimeError) as e:
-            print(f"GPU bootstrap failed: {e}", file=sys.stderr)
-            print("Stage 4 still runs on CPU without this; --device gpu is what "
-                  "needs it.", file=sys.stderr)
-            raise SystemExit(1)
-        print("Now submit with: --device gpu")
-        return
+        # One candidate at a time, because pip given three names installs the
+        # first it resolves and reports success — and which of the three landed
+        # decides whether the job has a GPU faiss at all. Trying them
+        # individually means the failure of the preferred wheel is visible
+        # rather than hidden behind a fallback.
+        errors = []
+        for package in _CONTAINER_EXTRA_PACKAGES_GPU:
+            print(f"\nTrying {package} ...", flush=True)
+            try:
+                bootstrap_container_extras(
+                    CONTAINER_EXTRAS_GPU,
+                    singularity_image=args.singularity_image,
+                    singularity_bin=args.singularity_bin,
+                    packages=(package,),
+                    verify="faiss",
+                )
+            except (FileNotFoundError, RuntimeError) as e:
+                errors.append(f"{package}: {e}")
+                print(f"  {package} did not install: {e}", file=sys.stderr)
+                continue
+            print(f"\nGPU faiss installed from {package}.")
+            print("Submit with --device gpu. The job verifies the GPU index "
+                  "against a CPU one at startup and refuses if they disagree, "
+                  "so a wheel that imports but does not work costs a refusal "
+                  "rather than wrong cluster IDs.")
+            return
+        print("\nNo GPU faiss wheel installed for this container's Python:",
+              file=sys.stderr)
+        for line in errors:
+            print(f"  {line}", file=sys.stderr)
+        print("Stage 4 still runs on CPU; --device gpu is what needs this. "
+              "Sharding (--shards) is the CPU-side alternative and needs "
+              "nothing installed.", file=sys.stderr)
+        raise SystemExit(1)
 
     missing = [
         flag

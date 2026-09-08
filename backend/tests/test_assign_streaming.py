@@ -1415,6 +1415,53 @@ def test_the_thread_count_is_reported(tmp_path, capsys=None):
     assert "usable by this process" in printed
 
 
+# --- where the time goes -------------------------------------------------
+#
+# The loop is read -> project -> search -> vote -> write, strictly in sequence.
+# Only the search is threaded (inside faiss) or GPU-accelerable; the rest is
+# sequential Python that more cores do nothing for. Which one dominates decides
+# whether threads, a GPU, or sharding is the right lever — and the only way that
+# was ever established here was by comparing wall clocks by hand.
+
+
+def test_the_run_reports_which_phase_the_time_went_to(tmp_path):
+    reference = tmp_path / "ref.npz"
+    queries = tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=1200)
+
+    result = subprocess.run(
+        [sys.executable, str(ASSIGN), "--reference", str(reference),
+         "--h5", str(queries), "--out", str(tmp_path / "a.csv"),
+         "--chunk-size", "256"],
+        capture_output=True, text=True, timeout=600)
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    line = [l for l in result.stdout.splitlines() if l.startswith("Time spent:")]
+    assert line, f"no phase breakdown in:\n{result.stdout}"
+    for phase in ("read", "project", "search", "vote", "write"):
+        assert phase in line[0], f"{phase} missing from {line[0]!r}"
+
+
+def test_the_thread_count_appears_in_the_log(tmp_path):
+    """So "why is this slow" is answerable from the log alone. 16 threads on one
+    core and one thread look identical otherwise, and differ 2.4x."""
+    reference = tmp_path / "ref.npz"
+    queries = tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=600)
+
+    result = subprocess.run(
+        [sys.executable, str(ASSIGN), "--reference", str(reference),
+         "--h5", str(queries), "--out", str(tmp_path / "a.csv")],
+        capture_output=True, text=True, timeout=600)
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    threads = [l for l in result.stdout.splitlines() if l.startswith("Threads")]
+    assert threads, f"no thread line in:\n{result.stdout}"
+    assert "usable by this process" in threads[0]
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

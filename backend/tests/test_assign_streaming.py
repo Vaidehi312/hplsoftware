@@ -2163,6 +2163,72 @@ def test_the_benchmark_reports_the_rate_the_assigner_measured(tmp_path):
     assert "search" in result.stdout, "the phase split did not carry through"
 
 
+# --- a shard's log has to be findable -------------------------------------
+#
+# %j in an array task expands to that task's OWN JobId, which appears nowhere in
+# squeue — squeue shows 1241672_0. So the logs existed under unpredictable
+# names, and every attempt to tail a shard's output hit "no such file", for a
+# 32-task array where reading one shard's progress is the whole diagnostic.
+
+
+def test_an_array_names_its_logs_by_array_id_and_task(tmp_path):
+    import submit_cluster_assignment as sca
+
+    reference, queries = tmp_path / "ref.npz", tmp_path / "q.h5"
+    mean = tmp_path / "mean.npy"
+    _write_reference(reference)
+    _write_queries(queries, rows=600)
+    np.save(mean, np.zeros(_mean_width(tmp_path), dtype=np.float32))
+
+    submitted = []
+    saved = (sca._run_sbatch_with_retry, sca._check_singularity_image,
+             sca._check_container_extras, sca.partition_time_limit,
+             sca.jobs_in_flight_named, sca.partition_has_gpus)
+    _stub_submitter(sca, submitted)
+    sca.partition_has_gpus = lambda partition: None
+    try:
+        sca.submit_cluster_assignment_job(
+            projections_h5=queries, out_csv=tmp_path / "out.csv",
+            reference=reference, shards=4, query_mean=mean, device="cpu",
+            overwrite=True)
+        array_argv = submitted[0]
+        outputs = [a for a in array_argv if a.startswith("--output=")]
+        assert outputs, array_argv
+        assert "%A_%a" in outputs[0], outputs[0]
+        assert "%j" not in outputs[0], outputs[0]
+    finally:
+        (sca._run_sbatch_with_retry, sca._check_singularity_image,
+         sca._check_container_extras, sca.partition_time_limit,
+         sca.jobs_in_flight_named, sca.partition_has_gpus) = saved
+
+
+def test_a_plain_job_still_names_its_log_by_job_id(tmp_path):
+    """%A_%a is empty for a non-array job, so the two cases need the two
+    patterns — the same %j that is wrong for an array is right here."""
+    import submit_cluster_assignment as sca
+
+    reference, queries = tmp_path / "ref.npz", tmp_path / "q.h5"
+    _write_reference(reference)
+    _write_queries(queries, rows=600)
+
+    submitted = []
+    saved = (sca._run_sbatch_with_retry, sca._check_singularity_image,
+             sca._check_container_extras, sca.partition_time_limit,
+             sca.jobs_in_flight_named, sca.partition_has_gpus)
+    _stub_submitter(sca, submitted)
+    sca.partition_has_gpus = lambda partition: None
+    try:
+        sca.submit_cluster_assignment_job(
+            projections_h5=queries, out_csv=tmp_path / "out.csv",
+            reference=reference, shards=1, device="cpu", overwrite=True)
+        outputs = [a for a in submitted[0] if a.startswith("--output=")]
+        assert "%j" in outputs[0], outputs[0]
+    finally:
+        (sca._run_sbatch_with_retry, sca._check_singularity_image,
+         sca._check_container_extras, sca.partition_time_limit,
+         sca.jobs_in_flight_named, sca.partition_has_gpus) = saved
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

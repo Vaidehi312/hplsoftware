@@ -1019,8 +1019,14 @@ def submit_cluster_assignment_job(
         # read a stale mean would silently disagree with its siblings.
         *([f"--dependency=afterok:{mean_job_id or depends_on_job_id}"]
           if (mean_job_id or depends_on_job_id) else []),
-        f"--output={log_dir}/hpl_assign_%j.out",
-        f"--error={log_dir}/hpl_assign_%j.err",
+        # %A_%a for an array, %j otherwise. %j in an array task expands to that
+        # task's OWN JobId — a number that appears nowhere in `squeue`, which
+        # shows 1241672_0 — so the logs existed under names nobody could
+        # predict, and every attempt to tail a shard's log hit "no such file".
+        *([f"--output={log_dir}/hpl_assign_%A_%a.out",
+           f"--error={log_dir}/hpl_assign_%A_%a.err"] if shard_bounds else
+          [f"--output={log_dir}/hpl_assign_%j.out",
+           f"--error={log_dir}/hpl_assign_%j.err"]),
         f"--chdir={backend_dir}",
         *([f"--mail-user={notify_email}", "--mail-type=END,FAIL"] if notify_email else []),
         "--wrap", f"bash -lc {shlex.quote(command)}",

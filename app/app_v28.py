@@ -3303,6 +3303,40 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
         )
     if report["low_margin"]:
         st.caption(f"{report['low_margin']:,} tile(s) have vote_margin below 0.1")
+    tradeoff = report.get("margin_tradeoff")
+    if tradeoff:
+        with st.expander(
+            "What a confidence threshold would cost and buy on this cohort",
+            expanded=report["min_margin"] == 0,
+        ):
+            st.caption(
+                "Every tile's `vote_margin` is the winning cluster's share of "
+                "the weighted k-NN vote minus the runner-up's — 1.0 means all "
+                "25 neighbours agreed, 0.0 a dead tie. The threshold below "
+                "decides which tiles count toward the per-slide composition the "
+                "chatbot and HPC panels read. **`tile_registry` keeps every "
+                "tile either way**, with its own cluster and margin."
+            )
+            st.table([
+                {
+                    "min_margin": f"{row['min_margin']:.2f}",
+                    "tiles kept": f"{row['tiles_kept']:,}",
+                    "% kept": f"{row['share_kept'] * 100:.1f}%",
+                    "expected accuracy": f"{row['expected_accuracy'] * 100:.2f}%",
+                }
+                for row in tradeoff
+            ])
+            st.caption(
+                ":grey[Expected accuracy is this cohort's own margin "
+                "distribution weighted by leave-one-out accuracy measured on the "
+                "reference (61.7% below 0.10, 81.2% to 0.25, 95.5% to 0.50, "
+                "99.5% to 0.75, 100% above). That mapping was measured inside "
+                "LATTICeA, so applying it here assumes a margin means the same "
+                "thing on this cohort's scanner and stain — the one thing no "
+                "accuracy number can settle without labels. Treat it as an "
+                "estimate, and read `cohort_shift` alongside it.]"
+            )
+
     if report["min_margin"] > 0:
         st.info(
             f"At the {report['min_margin']} threshold above, "

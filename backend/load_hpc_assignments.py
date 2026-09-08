@@ -37,6 +37,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy import inspect as sqlalchemy_inspect
@@ -118,6 +119,32 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # Mixed still refuses: some names suffixed and some not is what a resume
     # straddling the fix leaves behind, the two sides are indistinguishable by
     # name, and guessing would attach correct cluster IDs to the wrong tiles.
+    # A confidence column that is not numeric. One malformed line in a
+    # 7.8M-row CSV — a header repeated by a concatenation, a torn write — turns
+    # the whole column to object dtype, and every comparison against it
+    # afterwards either raises deep in pandas or silently misbehaves. Refused
+    # with the offending values rather than coerced: a file with a stray row in
+    # it is a file whose row count nobody should trust, and dropping the row
+    # quietly would leave a cohort short by an unknown amount.
+    for column in _CONFIDENCE:
+        if column not in frame.columns:
+            continue
+        coerced = pd.to_numeric(frame[column], errors="coerce")
+        bad = coerced.isna() & frame[column].notna()
+        if bad.any():
+            examples = frame.loc[bad, column].astype(str).head(5).tolist()
+            raise SystemExit(
+                f"{csv_path} has {int(bad.sum()):,} row(s) whose {column} is not "
+                f"a number, e.g. {examples}. That is usually a header repeated "
+                f"mid-file by a concatenation, or a torn write from an "
+                f"interrupted job.\n\n"
+                f"Check the file's row count against the projections .h5 before "
+                f"loading it — if shards were merged by hand, re-merge them with "
+                f"merge_assignment_shards.py, which checks the total against the "
+                f"source rather than believing the parts."
+            )
+        frame[column] = coerced
+
     verdict = tile_name_verdict(frame["tiles"])
     if verdict == "mixed":
         raise SystemExit(
@@ -137,6 +164,60 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # already unpacks as exactly (frame, cluster_column).
     frame.attrs["tile_names_normalized"] = renamed
     return frame, cluster_columns[0]
+
+
+#: Leave-one-out accuracy per vote_margin band, measured on the production
+#: reference (CLASSIFIER_TUNING_2026-08-13.md §7: 20,000 tiles, k=10,
+#: distance-weighted). (upper edge, share correct) — the band is [previous
+#: edge, this edge).
+#:
+#: These are the only numbers that turn a margin into an accuracy, and they were
+#: measured *within LATTICeA*, the cohort the 71 HPCs were defined on. Applying
+#: them to another cohort assumes a margin of 0.3 means there what it means
+#: here, which is exactly the cohort-shift question that cannot be settled
+#: without labels. So anything derived from them is an estimate, and says so.
+_MARGIN_ACCURACY_BANDS = (
+    (0.10, 0.617),
+    (0.25, 0.812),
+    (0.50, 0.955),
+    (0.75, 0.995),
+    (1.01, 1.000),
+)
+
+_MARGIN_CUTS = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50)
+
+
+def margin_tradeoff(frame: pd.DataFrame, cuts=_MARGIN_CUTS) -> list[dict]:
+    """For each candidate min_margin: tiles kept, and their expected accuracy.
+
+    The question this answers is the one actually being decided at Stage 6 — how
+    many tiles a confidence floor costs, and what it buys — and it can only be
+    answered from the cohort's own margin distribution. Everything else about
+    picking a threshold is guesswork against a distribution nobody has looked
+    at.
+
+    Expected accuracy is each kept tile's band accuracy, averaged. It is an
+    estimate under LATTICeA calibration (see _MARGIN_ACCURACY_BANDS), not a
+    measurement of this cohort — which has no labels to measure against.
+    """
+    margins = pd.to_numeric(frame["vote_margin"], errors="coerce").to_numpy(dtype=float)
+    edges = np.array([0.0, *(edge for edge, _ in _MARGIN_ACCURACY_BANDS)])
+    accuracies = np.array([acc for _, acc in _MARGIN_ACCURACY_BANDS])
+    per_tile = accuracies[np.clip(np.digitize(margins, edges) - 1,
+                                  0, len(accuracies) - 1)]
+
+    total = len(margins)
+    rows = []
+    for cut in cuts:
+        kept = margins >= cut
+        n = int(kept.sum())
+        rows.append({
+            "min_margin": float(cut),
+            "tiles_kept": n,
+            "share_kept": (n / total) if total else 0.0,
+            "expected_accuracy": float(per_tile[kept].mean()) if n else 0.0,
+        })
+    return rows
 
 
 def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float = 0.0) -> dict:
@@ -205,6 +286,9 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float 
         # written after the packaging fix; non-zero says the match rate below
         # was only reachable because of that correction.
         "tile_names_normalized": int(frame.attrs.get("tile_names_normalized", 0)),
+        # What each candidate threshold would cost and buy, from this cohort's
+        # own margins. Computed here so the UI and the CLI show the same table.
+        "margin_tradeoff": margin_tradeoff(frame),
     }
 
 
@@ -599,6 +683,19 @@ def main() -> None:
     print(f"  clusters     {report['known_clusters']} in hpc_dictionary; "
           f"largest here: " + ", ".join(f"{k}={v:,}" for k, v in report["distribution"].items()))
     print(f"  low margin   {report['low_margin']:,} tiles below 0.1")
+
+    if report.get("margin_tradeoff"):
+        print("\n  what a --min-margin would cost and buy, on this cohort's own "
+              "margins:")
+        print(f"    {'cut':>5} {'tiles kept':>14} {'%kept':>7} "
+              f"{'expected accuracy':>19}")
+        for row in report["margin_tradeoff"]:
+            print(f"    {row['min_margin']:>5.2f} {row['tiles_kept']:>14,} "
+                  f"{row['share_kept'] * 100:>6.1f}% "
+                  f"{row['expected_accuracy'] * 100:>18.2f}%")
+        print("    (expected accuracy is this cohort's margin distribution "
+              "weighted by leave-one-out accuracy measured on the reference — an "
+              "estimate, not a measurement of this cohort)")
     if args.min_margin > 0:
         print(f"  min margin   {args.min_margin} — excludes "
               f"{report['excluded_from_aggregates']:,} tile(s) from the aggregates below")

@@ -737,6 +737,99 @@ def test_the_cohort_guard_does_not_block_a_reload_of_the_same_cohort(tmp_path):
         assert conn.execute(text("SELECT count(*) FROM hpl_profile_summary")).scalar() == 1
 
 
+# --- the threshold decision, priced in tiles -----------------------------
+#
+# Choosing a min_margin was previously a number typed against a distribution
+# nobody had looked at. The trade-off table answers the question actually being
+# decided — how many tiles a confidence floor costs and what it buys — from the
+# cohort's own margins, so the person running the load can make the call.
+
+
+def test_the_tradeoff_prices_every_cut_in_tiles(tmp_path):
+    import numpy as np
+
+    frame = pd.DataFrame({"vote_margin": np.concatenate([
+        np.full(700, 1.0),          # unanimous
+        np.full(200, 0.05),         # near-ties
+        np.full(100, 0.40),
+    ])})
+
+    rows = loader.margin_tradeoff(frame)
+    by_cut = {r["min_margin"]: r for r in rows}
+
+    assert by_cut[0.0]["tiles_kept"] == 1000
+    assert by_cut[0.0]["share_kept"] == 1.0
+    # The 200 near-ties are exactly what a 0.10 floor removes.
+    assert by_cut[0.10]["tiles_kept"] == 800
+    assert by_cut[0.50]["tiles_kept"] == 700
+
+
+def test_a_higher_cut_never_lowers_the_expected_accuracy(tmp_path):
+    """The whole point of the table: the columns move in opposite directions, and
+    the reader is choosing where to stop."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    frame = pd.DataFrame({"vote_margin": rng.uniform(0, 1, 5000)})
+
+    rows = loader.margin_tradeoff(frame)
+    kept = [r["tiles_kept"] for r in rows]
+    accuracy = [r["expected_accuracy"] for r in rows]
+
+    assert kept == sorted(kept, reverse=True), "tiles kept must fall with the cut"
+    assert accuracy == sorted(accuracy), "expected accuracy must rise with the cut"
+    assert 0.6 < accuracy[0] < 1.0
+
+
+def test_the_tradeoff_reaches_the_preview_report(tmp_path):
+    """It has to be on the report, or neither the UI nor the CLI can show it."""
+    csv = _make_csv(tmp_path, n=20)
+    engine = _make_kb(tmp_path, _registry_tiles(20))
+    frame, column = loader.read_assignments(csv)
+
+    report = loader.inspect(engine, frame, column)
+
+    assert report["margin_tradeoff"], "no trade-off table on the report"
+    assert {"min_margin", "tiles_kept", "share_kept", "expected_accuracy"} <= \
+        set(report["margin_tradeoff"][0])
+
+
+# --- a confidence column that is not a number ----------------------------
+
+
+def test_a_non_numeric_margin_is_refused_with_the_offending_value(tmp_path):
+    """One malformed line in a 7.8M-row CSV — a header repeated by a
+    concatenation, or a torn write — turns the column to object dtype, and every
+    comparison against it afterwards raises deep in pandas. Refused with the
+    value, because a file with a stray row is a file whose row count nobody
+    should trust."""
+    csv = _make_csv(tmp_path, n=20)
+    # Written as text, the way the real file got it: a line from a
+    # concatenation, not a value assigned into a float column.
+    lines = csv.read_text().splitlines()
+    lines.insert(8, lines[0])                        # the header, repeated
+    csv.write_text("\n".join(lines) + "\n")
+
+    try:
+        loader.read_assignments(csv)
+    except SystemExit as e:
+        assert "not a number" in str(e), str(e)
+        assert "vote_margin" in str(e)
+        assert "merge_assignment_shards.py" in str(e)
+    else:
+        raise AssertionError("a non-numeric vote_margin was accepted")
+
+
+def test_a_clean_csv_still_loads(tmp_path):
+    """The guard has to be able to pass, or it is just a broken loader."""
+    csv = _make_csv(tmp_path, n=20)
+
+    frame, _column = loader.read_assignments(csv)
+
+    assert len(frame) == 20
+    assert frame["vote_margin"].dtype.kind == "f"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

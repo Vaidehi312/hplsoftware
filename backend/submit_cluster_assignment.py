@@ -1172,7 +1172,9 @@ def build_parser() -> argparse.ArgumentParser:
                              f"prefer headroom. Not checked against the partition's "
                              f"MaxTime here: sbatch rejects it, or leaves the job "
                              f"pending with reason PartitionTimeLimit. Check with "
-                             f"`sinfo -o \"%P %l\"` before raising it.")
+                             # %% because argparse %-interpolates help text: a literal
+                             # "%P" made --help itself raise ValueError.
+                             f"`sinfo -o \"%%P %%l\"` before raising it.")
     parser.add_argument("--mean-time-limit", type=str, default=MEAN_TIME_LIMIT,
                         help=f"Walltime for the shared query-mean job, submitted "
                              f"only when sharding with --centering query. Default "
@@ -1203,6 +1205,15 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["query", "reference", "none"])
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace an existing output CSV.")
+    parser.add_argument("--bootstrap-gpu-faiss", action="store_true",
+                        help="Install a GPU faiss into the GPU extras directory "
+                             "and exit, so --device gpu has something to use. "
+                             "One-time, on a login node (needs PyPI access). "
+                             "This installs a package for THIS stage: it runs "
+                             "no feature extraction and no GPU job. The same "
+                             "flag exists on submit_feature_extraction.py only "
+                             "because that file owns the container's package "
+                             "list.")
     parser.add_argument("--query-mean", type=Path, default=None,
                         help="Reuse an existing query-mean .npy instead of "
                              "submitting the mean job. Compute one with "
@@ -1220,6 +1231,43 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+
+    if args.bootstrap_gpu_faiss:
+        # Candidates one at a time: given three names pip installs whichever it
+        # resolves first and reports success, hiding which one landed — and that
+        # decides whether the job has a usable GPU faiss at all.
+        errors = []
+        for package in _CONTAINER_EXTRA_PACKAGES_GPU:
+            print(f"\nTrying {package} ...", flush=True)
+            try:
+                bootstrap_container_extras(
+                    CONTAINER_EXTRAS_GPU,
+                    singularity_image=args.singularity_image
+                    if hasattr(args, "singularity_image") else SINGULARITY_IMAGE,
+                    singularity_bin=args.singularity_bin
+                    if hasattr(args, "singularity_bin") else SINGULARITY_BIN,
+                    packages=(package,),
+                    verify="faiss",
+                )
+            except (FileNotFoundError, RuntimeError) as e:
+                errors.append(f"{package}: {e}")
+                print(f"  {package} did not install: {e}", file=sys.stderr)
+                continue
+            print(f"\nGPU faiss installed from {package} into "
+                  f"{CONTAINER_EXTRAS_GPU}.")
+            print("--device now resolves to gpu on its own. The job verifies the "
+                  "GPU index against a CPU one at startup and refuses if they "
+                  "disagree, so a wheel that imports but does not work costs a "
+                  "refusal rather than wrong cluster IDs.")
+            raise SystemExit(0)
+        print("\nNo GPU faiss wheel installed for this container's Python:",
+              file=sys.stderr)
+        for line in errors:
+            print(f"  {line}", file=sys.stderr)
+        print("This stage still runs on CPU; --shards is the CPU-side lever and "
+              "needs nothing installed.", file=sys.stderr)
+        raise SystemExit(1)
+
     try:
         info = submit_cluster_assignment_job(
             projections_h5=args.projections_h5,

@@ -2039,6 +2039,37 @@ def test_an_unknown_partition_gpu_count_does_not_block(tmp_path):
          sca.jobs_in_flight_named, sca.partition_has_gpus) = saved
 
 
+# --- --help has to render -------------------------------------------------
+#
+# argparse %-interpolates help text, so a literal "%P" in a help string — from
+# `sinfo -o "%P %l"`, which is genuinely the command worth quoting there — makes
+# --help itself raise ValueError. Nothing else notices: the module imports, the
+# parser builds, every submission works, and only asking for help fails. Cheap
+# to check, and it covers the whole class.
+
+
+def test_every_submitter_can_print_its_own_help(tmp_path):
+    for module in ("submit_cluster_assignment.py", "submit_feature_extraction.py",
+                   "submit_kb_write.py"):
+        result = subprocess.run([sys.executable, str(BACKEND / module), "--help"],
+                                capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, (
+            f"{module} --help failed:\n{result.stderr[-800:]}")
+        assert "usage" in result.stdout.lower(), module
+
+
+def test_the_gpu_bootstrap_is_offered_by_the_stage_that_uses_it(tmp_path):
+    """The package is for the assignment's search, so the assignment's own CLI
+    installs it. It lived only on submit_feature_extraction.py, which reads as
+    "run feature extraction on the GPU" and is not what it does."""
+    result = subprocess.run(
+        [sys.executable, str(BACKEND / "submit_cluster_assignment.py"), "--help"],
+        capture_output=True, text=True, timeout=120)
+
+    assert "--bootstrap-gpu-faiss" in result.stdout
+    assert "no feature extraction" in result.stdout
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

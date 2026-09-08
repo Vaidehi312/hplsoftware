@@ -2316,6 +2316,157 @@ def test_a_cpu_run_does_not_pin_a_gpu(tmp_path):
     assert "SINGULARITYENV_ROW_START" in command
 
 
+# --- resuming a killed shard ---------------------------------------------
+#
+# A preempted or requeued task used to restart its whole range: the .partial was
+# deleted and the shard began again at row 0. With 32 shards that was minutes,
+# but it is also the only reason a GPU run on a preemptible partition was a bad
+# trade. Chunks are checkpoints now — each written under a .tmp name and
+# renamed, so a chunk file exists only if it is whole — and the identical
+# command line resumes, which matters because a requeued job re-runs exactly
+# what it ran before.
+#
+# The property under test is the one that makes it safe: resumed output must
+# equal uninterrupted output byte for byte. Anything less is two computations
+# concatenated.
+
+
+def _kill_after_first_chunk(command, env):
+    """Start the assigner and SIGKILL it once a chunk has certainly landed.
+
+    Driven by its own progress line rather than a sleep, so the test does not
+    depend on how fast the machine is.
+    """
+    import signal
+
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, env=env)
+    try:
+        for line in proc.stdout:                       # blocks until progress
+            if "tiles/s [" in line:
+                break
+    finally:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=60)
+
+
+def _slow_fixture(tmp_path: Path, ref_rows=40_000, query_rows=6_000):
+    """A reference big enough that chunks take measurable time."""
+    import json
+
+    rng = np.random.default_rng(0)
+    dim, ncomp, nclust = 48, 32, 15
+    reference = tmp_path / "ref.npz"
+    np.savez(reference,
+             reference=rng.standard_normal((ref_rows, ncomp)).astype(np.float32),
+             components=rng.standard_normal((dim, ncomp)).astype(np.float32),
+             codes=rng.integers(0, nclust, ref_rows).astype(np.int64),
+             categories=np.array([str(i) for i in range(nclust)]),
+             n_neighbors=np.int64(10), meta=json.dumps({"groupby": "leiden_2.5"}))
+    queries = tmp_path / "proj.h5"
+    with h5py.File(queries, "w") as f:
+        f.create_dataset("z_latent", data=(
+            rng.standard_normal((query_rows, dim)) + 3).astype(np.float32))
+        for name in ("samples", "slides", "tiles"):
+            f.create_dataset(name, data=np.array(
+                [f"{name[0]}{i % 71:04d}".encode() for i in range(query_rows)]))
+    mean = tmp_path / "mean.npy"
+    subprocess.run([sys.executable, str(ASSIGN), "--reference", str(reference),
+                    "--h5", str(queries), "--precompute-mean", str(mean)],
+                   check=True, capture_output=True, timeout=600)
+    return reference, queries, mean
+
+
+def test_a_killed_shard_resumes_and_matches_an_uninterrupted_run(tmp_path):
+    import os
+
+    reference, queries, mean = _slow_fixture(tmp_path)
+    env = {**os.environ, "OMP_NUM_THREADS": "1"}
+    base = [sys.executable, str(ASSIGN), "--reference", str(reference),
+            "--h5", str(queries), "--query-mean", str(mean),
+            "--chunk-size", "500", "--progress", "500",
+            "--row-start", "0", "--row-stop", "4000", "--device", "cpu"]
+
+    subprocess.run(base + ["--out", str(tmp_path / "whole.csv")],
+                   check=True, capture_output=True, env=env, timeout=900)
+    whole = (tmp_path / "whole.rows0-4000.csv").read_bytes()
+
+    _kill_after_first_chunk(base + ["--out", str(tmp_path / "resumed.csv")], env)
+    chunk_dir = tmp_path / "resumed.rows0-4000.csv.chunks"
+    assert chunk_dir.is_dir(), "the chunk directory did not survive the kill"
+    survived = sorted(chunk_dir.glob("chunk_*.csv"))
+    assert survived, "no complete chunk survived, so there is nothing to resume"
+    # And no output masquerading as finished.
+    assert not (tmp_path / "resumed.rows0-4000.csv").exists()
+
+    result = subprocess.run(base + ["--out", str(tmp_path / "resumed.csv")],
+                            capture_output=True, text=True, env=env, timeout=900)
+    assert result.returncode == 0, result.stderr[-800:]
+    assert "Resuming" in result.stdout, result.stdout
+
+    resumed = (tmp_path / "resumed.rows0-4000.csv").read_bytes()
+    assert resumed == whole, "the resumed output differs from an uninterrupted run"
+    assert not chunk_dir.exists(), "the chunk directory was not cleaned up"
+
+
+def test_a_truncated_chunk_is_recomputed_not_trusted(tmp_path):
+    """A chunk file is only skipped when its row count matches its range, so a
+    short one is redone rather than assembled into the output."""
+    import os
+
+    reference, queries, mean = _slow_fixture(tmp_path)
+    env = {**os.environ, "OMP_NUM_THREADS": "1"}
+    base = [sys.executable, str(ASSIGN), "--reference", str(reference),
+            "--h5", str(queries), "--query-mean", str(mean),
+            "--chunk-size", "500", "--progress", "500",
+            "--row-start", "0", "--row-stop", "2000", "--device", "cpu"]
+
+    subprocess.run(base + ["--out", str(tmp_path / "whole.csv")],
+                   check=True, capture_output=True, env=env, timeout=900)
+    whole = (tmp_path / "whole.rows0-2000.csv").read_bytes()
+
+    _kill_after_first_chunk(base + ["--out", str(tmp_path / "resumed.csv")], env)
+    chunk_dir = tmp_path / "resumed.rows0-2000.csv.chunks"
+    survived = sorted(chunk_dir.glob("chunk_*.csv"))
+    assert survived
+    # Lop the last row off a "complete" chunk.
+    lines = survived[0].read_text().splitlines(keepends=True)
+    survived[0].write_text("".join(lines[:-1]))
+
+    result = subprocess.run(base + ["--out", str(tmp_path / "resumed.csv")],
+                            capture_output=True, text=True, env=env, timeout=900)
+
+    assert result.returncode == 0, result.stderr[-800:]
+    assert (tmp_path / "resumed.rows0-2000.csv").read_bytes() == whole
+
+
+def test_resuming_a_different_configuration_is_refused(tmp_path):
+    """Chunks from two configurations concatenated is a complete CSV where some
+    rows came from each, with nothing to say which. Refused, naming the field
+    that differs and the directory to remove."""
+    import os
+
+    reference, queries, mean = _slow_fixture(tmp_path)
+    env = {**os.environ, "OMP_NUM_THREADS": "1"}
+    base = [sys.executable, str(ASSIGN), "--reference", str(reference),
+            "--h5", str(queries), "--query-mean", str(mean),
+            "--chunk-size", "500", "--progress", "500",
+            "--row-start", "0", "--row-stop", "2000", "--device", "cpu"]
+
+    _kill_after_first_chunk(base + ["--out", str(tmp_path / "out.csv")], env)
+    assert (tmp_path / "out.rows0-2000.csv.chunks").is_dir()
+
+    # Same range, different vote.
+    result = subprocess.run(
+        base + ["--out", str(tmp_path / "out.csv"), "--k", "5"],
+        capture_output=True, text=True, env=env, timeout=900)
+
+    assert result.returncode != 0
+    assert "different configuration" in result.stderr, result.stderr[-600:]
+    assert "vote" in result.stderr
+    assert "rm -rf" in result.stderr
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

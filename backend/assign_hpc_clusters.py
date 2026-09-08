@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -164,6 +165,22 @@ def iter_embedding_chunks(h5_path: Path, rep_key: str, chunk: int,
             yield start, stop, np.asarray(dataset[start:stop], dtype=np.float32)
 
 
+def read_embedding_range(h5_path: Path, rep_key: str, start: int,
+                         stop: int) -> np.ndarray:
+    """One [start, stop) slice of the embeddings.
+
+    A single range rather than a generator, because with chunk-level
+    checkpointing the loop decides which ranges it needs — a resumed shard must
+    not read the chunks it is skipping. Same resolution of rep_key as
+    iter_embedding_chunks, which is still what the mean pass uses.
+    """
+    with h5py.File(h5_path, "r") as content:
+        rep_name, _ = _resolve_datasets(content, rep_key)
+        dataset = content[rep_name]
+        stop = min(stop, dataset.shape[0])
+        return np.asarray(dataset[start:stop], dtype=np.float32)
+
+
 def compute_query_mean(h5_path: Path, rep_key: str, chunk: int,
                        total_rows: int) -> np.ndarray:
     """Mean over *every* query row, accumulated in float64.
@@ -276,6 +293,66 @@ def _gpu_unavailable_reason(faiss) -> str | None:
     except Exception as e:  # noqa: BLE001
         return f"faiss could not count GPUs ({type(e).__name__})"
     return None
+
+
+def _chunk_identity(*, reference: Path, rep_key: str, centering: str,
+                    query_mean: Path | None, chunk_size: int, lo: int, hi: int,
+                    vote: dict) -> dict:
+    """Everything that would change a label, for the resume manifest.
+
+    A resume that differs on any of these is not a resume, it is two different
+    computations concatenated — a complete CSV in which some rows came from one
+    configuration and some from another, with nothing to say so. Refused rather
+    than reconciled.
+
+    Device is deliberately NOT in here. GPU and CPU agree on 100% of nearest
+    neighbours and ~99.99% of the k-list, differing only by reordering inside
+    near-ties, which changes a vote only where it was already tied. So resuming
+    a preempted GPU shard on a CPU is allowed — that is the whole point — and
+    the manifest records which devices contributed instead.
+    """
+    return {
+        "reference": os.path.realpath(reference),
+        "rep_key": rep_key,
+        "centering": centering,
+        "query_mean": os.path.realpath(query_mean) if query_mean else None,
+        "chunk_size": int(chunk_size),
+        "row_start": int(lo),
+        "row_stop": int(hi),
+        "vote": vote,
+    }
+
+
+def _read_manifest(chunk_dir: Path) -> dict | None:
+    path = chunk_dir / "manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _chunk_path(chunk_dir: Path, start: int, stop: int) -> Path:
+    return chunk_dir / f"chunk_{start:012d}-{stop:012d}.csv"
+
+
+def _complete_chunk_rows(path: Path) -> int | None:
+    """Rows in a finished chunk file, or None if it does not look finished.
+
+    Counted rather than trusted. A chunk file only exists if it was renamed
+    into place whole, but a filesystem that reordered the rename against the
+    data, or a hand-edited directory, would otherwise hand a short chunk
+    straight into the assembled output.
+    """
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as fh:
+            lines = sum(1 for _ in fh)
+    except OSError:
+        return None
+    return max(lines - 1, 0)          # minus the header
 
 
 def resolve_thread_count(requested: int | None, allowed: int) -> int:
@@ -854,6 +931,50 @@ def assign(args) -> dict:
     if tmp_path.exists():
         tmp_path.unlink()
 
+    # Chunk-level checkpointing, so a preempted or requeued task resumes where
+    # it stopped instead of restarting its whole range. Each chunk is written
+    # under a .tmp name and renamed, so a chunk file exists only if it is
+    # whole; the assembled output is still only renamed into place at the very
+    # end. Always on rather than a flag, because a requeued job re-runs the
+    # identical command line — a resume that needed remembering would never
+    # happen on the attempt that needed it.
+    chunk_dir = out_path.with_name(out_path.name + ".chunks")
+    identity = _chunk_identity(
+        reference=args.reference, rep_key=args.rep_key, centering=args.centering,
+        query_mean=args.query_mean, chunk_size=args.chunk_size, lo=lo, hi=hi,
+        vote={"k": k, "k_search": k_search,
+              "distance_weighted": bool(args.distance_weighted),
+              "distance_power": float(args.distance_power),
+              "class_weighted": bool(args.class_weighted),
+              "local_scaling": int(args.local_scaling),
+              "adaptive_margin": float(adaptive_margin),
+              "adaptive_k": int(adaptive_k)},
+    )
+    existing = _read_manifest(chunk_dir)
+    if existing is not None and existing.get("identity") != identity:
+        differing = sorted(
+            key for key in identity
+            if (existing.get("identity") or {}).get(key) != identity[key])
+        raise SystemExit(
+            f"{chunk_dir} holds chunks from a different configuration "
+            f"(differs on: {', '.join(differing)}). Resuming across that would "
+            f"concatenate two computations into one CSV, with some rows from "
+            f"each and nothing to say which. Delete the directory to start this "
+            f"range again:\n\n    rm -rf {chunk_dir}"
+        )
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    if existing is None:
+        (chunk_dir / "manifest.json").write_text(
+            json.dumps({"identity": identity, "devices": [searcher.device]},
+                       indent=2, sort_keys=True))
+    elif searcher.device not in (existing.get("devices") or []):
+        # Which devices contributed. A mixed CPU/GPU shard is admissible — they
+        # agree except on near-tie ordering — but it should be recorded rather
+        # than inferred later from nothing.
+        existing.setdefault("devices", []).append(searcher.device)
+        (chunk_dir / "manifest.json").write_text(
+            json.dumps(existing, indent=2, sort_keys=True))
+
     started = time.perf_counter()
     written = 0
     n_revoted = 0
@@ -865,14 +986,28 @@ def assign(args) -> dict:
     phase = {"read": 0.0, "project": 0.0, "search": 0.0, "vote": 0.0,
              "write": 0.0}
     try:
-        chunks = iter_embedding_chunks(
-            args.h5, args.rep_key, args.chunk_size, lo, hi)
-        while True:
+        # Which ranges are already done. Computed up front so the reader can be
+        # told to skip them rather than reading and discarding — a resumed shard
+        # should not pay for the chunks it is not recomputing.
+        planned = [(start, min(start + args.chunk_size, hi))
+                   for start in range(lo, hi, args.chunk_size)]
+        done: dict[tuple[int, int], int] = {}
+        for start, stop in planned:
+            rows_present = _complete_chunk_rows(_chunk_path(chunk_dir, start, stop))
+            if rows_present == stop - start:
+                done[(start, stop)] = rows_present
+        if done:
+            resumed_rows = sum(done.values())
+            print(f"Resuming  : {len(done):,}/{len(planned):,} chunks already "
+                  f"complete ({resumed_rows:,} tiles), recomputing "
+                  f"{n_assigned - resumed_rows:,}")
+            written += resumed_rows
+
+        for start, stop in planned:
+            if (start, stop) in done:
+                continue
             _t = time.perf_counter()
-            try:
-                start, stop, block = next(chunks)
-            except StopIteration:
-                break
+            block = read_embedding_range(args.h5, args.rep_key, start, stop)
             phase["read"] += time.perf_counter() - _t
 
             _t = time.perf_counter()
@@ -928,7 +1063,12 @@ def assign(args) -> dict:
             # and once the CSV is merged into tile_registry there is otherwise
             # nothing to tell assignments from two different references apart.
             frame["hpc_reference"] = args.reference.stem
-            frame.to_csv(tmp_path, mode="a", header=(written == 0), index=False)
+            # .tmp then rename, so the file exists only when it is whole —
+            # the same rule the assembled output follows, applied per chunk.
+            chunk_path = _chunk_path(chunk_dir, start, stop)
+            staging = chunk_path.with_suffix(chunk_path.suffix + ".tmp")
+            frame.to_csv(staging, index=False)
+            staging.replace(chunk_path)
             phase["write"] += time.perf_counter() - _t
             written += len(frame)
 
@@ -948,8 +1088,38 @@ def assign(args) -> dict:
 
         if written != n_assigned:
             raise RuntimeError(f"Wrote {written} rows for a range of {n_assigned}.")
+
+        # Assemble the chunks in row order. Verified against the range rather
+        # than trusted from the parts: a missing chunk leaves no gap to notice
+        # in a CSV, which is the same reason merge_assignment_shards.py counts
+        # against the projections file instead of believing the shard files.
+        assembled = 0
+        with tmp_path.open("w", newline="") as out:
+            for index, (start, stop) in enumerate(planned):
+                chunk_path = _chunk_path(chunk_dir, start, stop)
+                rows_present = _complete_chunk_rows(chunk_path)
+                if rows_present != stop - start:
+                    raise RuntimeError(
+                        f"chunk {start}-{stop} holds "
+                        f"{rows_present if rows_present is not None else 'no'} "
+                        f"rows, expected {stop - start}. Delete {chunk_dir} and "
+                        f"run this range again.")
+                with chunk_path.open("r", newline="") as part:
+                    header = part.readline()
+                    if index == 0:
+                        out.write(header)
+                    shutil.copyfileobj(part, out)
+                assembled += rows_present
+        if assembled != n_assigned:
+            raise RuntimeError(
+                f"Assembled {assembled} rows from {len(planned)} chunks for a "
+                f"range of {n_assigned}.")
         tmp_path.replace(out_path)
+        # Only once the output is whole and in place.
+        shutil.rmtree(chunk_dir, ignore_errors=True)
     except BaseException:
+        # The .partial goes; the chunks stay. That is the difference between a
+        # preempted task losing its range and losing one chunk.
         if tmp_path.exists():
             tmp_path.unlink()
         raise
@@ -987,6 +1157,7 @@ def assign(args) -> dict:
         "categories": categories,
         "sharded": sharded,
         "revoted": n_revoted,
+        "resumed_chunks": len(done),
     }
 
 
@@ -1223,6 +1394,27 @@ def main() -> None:
         )
 
     stats = assign(args)
+
+    if stats.get("resumed_chunks"):
+        # The in-memory margins, distances and cluster counts cover only the
+        # chunks THIS attempt computed; the rest is uninitialised np.empty,
+        # which would print confident nonsense. The assembled CSV is the whole
+        # range, so the summary comes from there instead. Only on a resumed
+        # run: a normal one pays nothing.
+        print(f"            (summary read back from {stats['out_path'].name}: "
+              f"{stats['resumed_chunks']} chunk(s) came from an earlier attempt)")
+        finished = pd.read_csv(
+            stats["out_path"],
+            usecols=["vote_margin", "neighbor_distance", stats["groupby"]])
+        stats["margins"] = finished["vote_margin"].to_numpy(dtype=np.float32)
+        stats["distances"] = finished["neighbor_distance"].to_numpy(dtype=np.float32)
+        labels = finished[stats["groupby"]].astype(str)
+        lookup = {str(name): i for i, name in enumerate(stats["categories"])}
+        recounted = np.zeros(len(stats["categories"]), dtype=np.int64)
+        for name, n in labels.value_counts().items():
+            if name in lookup:
+                recounted[lookup[name]] = n
+        stats["cluster_counts"] = recounted
 
     counts = stats["cluster_counts"]
     total = max(counts.sum(), 1)

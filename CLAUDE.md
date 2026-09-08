@@ -201,6 +201,20 @@ the mean over *all* queries, so chunking or sharding the assignment changes the 
 is computed once and shared (`--precompute-mean` / `--query-mean`). `project()` therefore refuses to
 derive a mean from the chunk it was handed. Sharding without the shared mean is rejected outright.
 
+**Stage 4 resumes; Stage 3 does not.** A preempted or requeued assignment task used to restart
+its whole range. Chunks are checkpoints now: each is written under a `.tmp` name and renamed, so a
+chunk file exists only if it is whole, and `<out>.chunks/` survives a kill while the `.partial`
+does not. Resume is automatic and unconditional — a requeued job re-runs the identical command
+line, so anything needing a flag would never happen on the attempt that needed it. The chunk
+directory carries a manifest of everything that could change a label (reference, vote, centering,
+chunk size, rep_key, row range, query mean) and **refuses** to resume across a difference, because
+that is two computations concatenated into one CSV with nothing to say which rows came from where.
+Device is deliberately excluded, so a preempted GPU shard can finish on a CPU; the manifest records
+which devices contributed. The equivalence test is the point: a killed-and-resumed run must be
+byte-identical to an uninterrupted one. Note the summary statistics are read back from the
+assembled CSV after a resume, since the in-memory arrays only cover the chunks that attempt
+computed.
+
 **The encoder has no resume and mishandles its own leftovers.** It creates the output with `mode='w'`
 before encoding, and its "output already exists" path crashes on an unbound local. So any interrupted
 attempt makes every retry fail in seconds with an error pointing nowhere near the cause — which is why

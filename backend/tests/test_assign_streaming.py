@@ -1494,6 +1494,73 @@ def test_the_thread_count_appears_in_the_log(tmp_path):
     assert "usable by this process" in threads[0]
 
 
+# --- the walltime the partition will actually grant ----------------------
+#
+# ASSIGN_TIME_LIMIT is four days, chosen for the GPU partition, which allows
+# five. `compute` allows two — so submitting a sharded CPU run with the defaults
+# always failed, and failed in the worst available way: sbatch refuses with
+# "Requested time limit is invalid (missing or exceeds some limit)", naming
+# neither the limit nor the value, at the bottom of a traceback carrying a
+# 3,000-character --wrap string — and *after* the mean job was queued, leaving an
+# orphan waiting on a dependency that would never exist.
+
+
+def test_slurm_walltimes_parse_in_every_form_both_sides_use(tmp_path):
+    from submit_cluster_assignment import parse_slurm_walltime
+
+    assert parse_slurm_walltime("4-00:00:00") == 4 * 86400
+    assert parse_slurm_walltime("08:00:00") == 8 * 3600
+    assert parse_slurm_walltime("1-12:30:45") == 86400 + 12 * 3600 + 30 * 60 + 45
+    assert parse_slurm_walltime("30:00") == 1800
+    # sinfo's word for no limit, which must not read as zero seconds.
+    for unlimited in ("infinite", "INFINITE", "unlimited", "", "  "):
+        assert parse_slurm_walltime(unlimited) is None
+
+
+def test_a_walltime_over_the_partition_limit_is_refused(tmp_path):
+    import submit_cluster_assignment as sca
+
+    original = sca.partition_time_limit
+    sca.partition_time_limit = lambda partition: 2 * 86400      # compute
+    try:
+        try:
+            sca.check_time_limit("compute", "4-00:00:00")
+        except ValueError as e:
+            assert "exceeds partition" in str(e), str(e)
+            assert "1-00:00:00" in str(e), "the message must name a value that works"
+        else:
+            raise AssertionError("4 days was accepted against a 2-day partition")
+    finally:
+        sca.partition_time_limit = original
+
+
+def test_a_walltime_within_the_limit_passes(tmp_path):
+    """The guard has to be able to pass — and an unknown limit must never block
+    a submission, since sinfo being unavailable is not a reason to refuse."""
+    import submit_cluster_assignment as sca
+
+    original = sca.partition_time_limit
+    try:
+        sca.partition_time_limit = lambda partition: 2 * 86400
+        sca.check_time_limit("compute", "1-00:00:00")
+        sca.check_time_limit("compute", "2-00:00:00")           # exactly the limit
+        sca.partition_time_limit = lambda partition: None       # unlimited, or unknown
+        sca.check_time_limit("anything", "9-00:00:00")
+    finally:
+        sca.partition_time_limit = original
+
+
+def test_the_limit_is_checked_before_anything_is_submitted(tmp_path):
+    """Ordering is the point: the mean job goes first, so a walltime rejected by
+    sbatch stranded it against a dependency that never came."""
+    source = (BACKEND / "submit_cluster_assignment.py").read_text()
+    checked = source.index("check_time_limit(partition, time_limit)")
+    first_sbatch = source.index("mean_sbatch = [")
+
+    assert checked < first_sbatch, \
+        "the walltime is checked after the mean job is built"
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

@@ -409,6 +409,89 @@ def vote_flags(
     return flags
 
 
+def parse_slurm_walltime(value: str) -> int | None:
+    """Slurm walltime to seconds. None means unlimited.
+
+    Accepts the forms both sides of this use: "4-00:00:00" from our own
+    constants, "2-00:00:00" / "12:00:00" / "infinite" from `sinfo -o %l`, and
+    "MM:SS" for completeness.
+    """
+    text = (value or "").strip().lower()
+    if not text or text in ("infinite", "unlimited", "n/a"):
+        return None
+    days, _, clock = text.partition("-")
+    if not clock:
+        days, clock = "0", days
+    parts = [int(p) for p in clock.split(":")]
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = 0, parts[0], parts[1]
+    elif len(parts) == 1:
+        hours, minutes, seconds = 0, parts[0], 0
+    else:
+        raise ValueError(f"Unrecognised Slurm walltime: {value!r}")
+    return int(days) * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def partition_time_limit(partition: str) -> int | None:
+    """The partition's own maximum walltime in seconds, or None if unknown.
+
+    None for "could not ask" as well as for "unlimited", deliberately: this is
+    used to produce a better error message, never to refuse on its own, so a
+    cluster where sinfo is unavailable must not lose the ability to submit.
+    """
+    try:
+        result = subprocess.run(["sinfo", "-h", "-p", partition, "-o", "%l"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    limits = []
+    for line in (result.stdout or "").splitlines():
+        try:
+            seconds = parse_slurm_walltime(line)
+        except ValueError:
+            continue
+        if seconds is None:
+            return None                      # an unlimited row caps nothing
+        limits.append(seconds)
+    return max(limits) if limits else None
+
+
+def check_time_limit(partition: str, requested: str) -> None:
+    """Refuse a walltime the partition cannot grant, before sbatch does.
+
+    sbatch's own refusal — "Requested time limit is invalid (missing or exceeds
+    some limit)" — is correct and nearly useless: it names neither the limit nor
+    the value, and it arrives at the bottom of a traceback holding a
+    3,000-character --wrap string. It also arrives *after* the mean job has been
+    submitted, leaving an orphan queued against a dependency that will never
+    exist.
+
+    The 4-day default was set for the GPU partition, which allows five. `compute`
+    allows two, so submitting a CPU run with the defaults always failed here.
+    """
+    limit = partition_time_limit(partition)
+    if limit is None:
+        return
+    try:
+        wanted = parse_slurm_walltime(requested)
+    except ValueError as e:
+        raise ValueError(str(e)) from e
+    if wanted is None or wanted <= limit:
+        return
+    raise ValueError(
+        f"--time-limit {requested} exceeds partition {partition!r}'s maximum of "
+        f"{limit // 86400}-{limit % 86400 // 3600:02d}:"
+        f"{limit % 3600 // 60:02d}:{limit % 60:02d}. sbatch would refuse this "
+        f"after the mean job had already been queued. Pass a shorter "
+        f"--time-limit — a 32-shard assignment is hours per shard, so "
+        f"1-00:00:00 is ample — or submit to a partition with a longer limit."
+    )
+
+
 def _build_assignment_command(
     *,
     singularity_bin: str,
@@ -639,6 +722,9 @@ def submit_cluster_assignment_job(
     if extras_dir is None:
         extras_dir = CONTAINER_EXTRAS_GPU if device == "gpu" else CONTAINER_EXTRAS
     _check_container_extras(extras_dir, singularity_image, singularity_bin)
+    # Before the mean job, so a bad walltime does not leave an orphan queued
+    # against a dependency that never appears.
+    check_time_limit(partition, time_limit)
 
     if shards > 1 and depends_on_job_id is not None:
         # The array size has to be known at sbatch time, and it comes from the
@@ -969,6 +1055,11 @@ def main() -> None:
             overwrite=args.overwrite,
         )
     except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+        print(f"Not submitted: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    except RuntimeError as e:
+        # sbatch refused. The reason is already extracted; a traceback here just
+        # buries it under the whole --wrap string.
         print(f"Not submitted: {e}", file=sys.stderr)
         raise SystemExit(1)
 

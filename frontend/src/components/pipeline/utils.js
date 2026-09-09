@@ -95,7 +95,7 @@ export const STAGE_LABELS = {
   assignment_test: "Cluster assignment (test)",
 };
 
-// Step state -> icon. The point (per app_v28.py) is that all 5 stages are
+// Step state -> icon. The point (per app_v28.py) is that all 6 stages are
 // visible at once with their state, not just whichever one is "current".
 export const STEP_ICON = {
   done: "✅",
@@ -229,7 +229,7 @@ export function displayStage(status) {
   return stage || "unknown";
 }
 
-// Port of _pipeline_steps(status): classifies all 5 stages at once from a
+// Port of _pipeline_steps(status): classifies all 6 stages at once from a
 // single /status response so the whole pipeline can be shown, not just
 // whichever stage happens to be "current".
 export function pipelineSteps(status) {
@@ -356,6 +356,17 @@ export function pipelineSteps(status) {
         .join(", ");
     }
     registration = ["done", summary.slice(0, 70)];
+  } else if (SLURM_IN_FLIGHT.has(status.registration_slurm_state)) {
+    // A Slurm-backed write in flight. Without this the stage reads "ready to
+    // register" while a job is actively writing, which invites a second one —
+    // and Stage 5 writes identity rows for a whole cohort, so a second one is
+    // not a no-op.
+    registration = ["running", `running (${status.registration_slurm_state})`];
+  } else if (status.registration_job_id) {
+    // A job id with no in-flight state and no done flag: it ended without
+    // recording a commit. The step has to say so rather than offering to
+    // register, because the job's own log is the only place the refusal is.
+    registration = ["attention", "a job ended without committing"];
   } else if (status.registration_ready) {
     registration = ["action", "ready to register"];
   } else {
@@ -372,6 +383,10 @@ export function pipelineSteps(status) {
   if (status.kb_load_done) {
     const rows = status.kb_load_rows;
     kbLoad = ["done", rows != null ? `${fmtInt(rows)} tiles in the KB` : "loaded"];
+  } else if (SLURM_IN_FLIGHT.has(status.kb_load_slurm_state)) {
+    kbLoad = ["running", `running (${status.kb_load_slurm_state})`];
+  } else if (status.kb_load_job_id) {
+    kbLoad = ["attention", "a job ended without committing"];
   } else if (!status.assignment_ready) {
     kbLoad = ["blocked", "waiting on cluster classification"];
   } else if (!status.registration_done) {

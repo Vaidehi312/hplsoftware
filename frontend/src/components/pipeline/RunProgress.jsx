@@ -19,12 +19,7 @@ import {
   STEP_ICON,
 } from "./utils";
 import { Alert, Button, Expander } from "./widgets";
-import TilingStage from "./stages/TilingStage";
-import PackagingStage from "./stages/PackagingStage";
-import ExtractionStage from "./stages/ExtractionStage";
-import AssignmentStage from "./stages/AssignmentStage";
-import RegistrationStage from "./stages/RegistrationStage";
-import KbLoadStage from "./stages/KbLoadStage";
+import { STAGE_RENDERERS } from "./stages/index.js";
 
 // Port of _render_job_history(): every Slurm job this run has submitted,
 // across every stage — the run's own status fields only hold one attempt
@@ -146,13 +141,15 @@ export default function RunProgress({ submissionId, job }) {
   const stage = status.status;
   const steps = pipelineSteps(status);
 
-  const renderers = {
-    tiling: () => <TilingStage status={status} submissionId={submissionId} onChanged={refresh} />,
-    packaging: (s) => <PackagingStage status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />,
-    extraction: (s) => <ExtractionStage status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />,
-    assignment: (s) => <AssignmentStage status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />,
-    registration: (s) => <RegistrationStage status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />,
-    kb_load: (s) => <KbLoadStage status={status} submissionId={submissionId} state={s.state} />,
+  // Built from STAGE_RENDERERS so the key set lives in one importable place —
+  // see that module for why. Every stage gets the same props and ignores what
+  // it does not use.
+  const renderStep = (s) => {
+    const Stage = STAGE_RENDERERS[s.key];
+    if (!Stage) return null;
+    return (
+      <Stage status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />
+    );
   };
 
   return (
@@ -190,7 +187,7 @@ export default function RunProgress({ submissionId, job }) {
             </span>
           }
         >
-          {renderers[step.key](step)}
+          {renderStep(step)}
         </Expander>
       ))}
 

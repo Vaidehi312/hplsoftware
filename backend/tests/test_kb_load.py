@@ -467,6 +467,59 @@ def test_a_clean_csv_is_not_caught_by_either_new_refusal(tmp_path):
     assert frame["slide_tile"].is_unique
 
 
+def test_a_csv_carrying_slide_tile_still_identifies_its_cluster_column(tmp_path):
+    """A CSV round-tripped through a frame this module touched comes back with a
+    slide_tile column. The cluster column is found by elimination, so that
+    extra column made two candidates and the load refused — on a file whose
+    cluster IDs were perfectly fine."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=8))
+    frame["slide_tile"] = (frame["slides"].str.upper() + "_"
+                           + frame["tiles"].str.upper())
+    path = tmp_path / "round_tripped.csv"
+    frame.to_csv(path, index=False)
+
+    loaded, column = loader.read_assignments(path)
+    assert column == "leiden_2.5"
+    assert loaded["slide_tile"].iloc[0] == f"{SLIDE.upper()}_0_0.JPEG"
+
+
+def test_a_stale_slide_tile_column_is_rebuilt_not_trusted(tmp_path):
+    """The dangerous version of the same file: a slide_tile written before the
+    tile names were normalised holds the short form and joins nothing. Taking
+    the column at face value would turn a repairable CSV into a 0% match rate
+    reported as a naming mismatch."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=8))
+    frame["slide_tile"] = frame["slides"].str.upper() + "_0_0"  # short and wrong
+    path = tmp_path / "stale_key.csv"
+    frame.to_csv(path, index=False)
+
+    loaded, _ = loader.read_assignments(path)
+    assert loaded["slide_tile"].tolist() == [
+        f"{SLIDE.upper()}_{i}_{i}.JPEG" for i in range(8)]
+
+    engine = _make_kb(tmp_path, _registry_tiles(n=8))
+    assert loader.inspect(engine, loaded, "leiden_2.5")["matched"] == 8
+
+
+def test_a_csv_with_no_cluster_column_does_not_load_slide_tile_as_one(tmp_path):
+    """The loud failure had a silent twin. With slide_tile outside the known
+    set and no cluster column present, it was the only candidate left — so tile
+    names would have been written into tile_registry.hpc_id, every row
+    well-formed and every cluster wrong."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=8)).drop(columns=["leiden_2.5"])
+    frame["slide_tile"] = frame["slides"].str.upper() + "_0_0.JPEG"
+    path = tmp_path / "no_cluster.csv"
+    frame.to_csv(path, index=False)
+
+    try:
+        loader.read_assignments(path)
+    except SystemExit as e:
+        assert "Could not identify the cluster column" in str(e)
+        assert "none left after the known ones" in str(e), str(e)
+    else:
+        raise AssertionError("slide_tile was accepted as the cluster column")
+
+
 def test_both_csv_readers_produce_the_same_assignments(tmp_path):
     """read_assignments reads on several threads where pyarrow is installed and
     falls back where it is not. The two readers must not disagree about values,

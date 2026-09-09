@@ -69,6 +69,19 @@ DB_NAME = os.getenv("DB_NAME", "hpl_kb")
 _META = ("samples", "slides", "tiles")
 _CONFIDENCE = ("vote_margin", "neighbor_distance")
 
+#: Columns *this module* derives and may find already present, because a CSV
+#: that has been round-tripped through a frame read_assignments() touched
+#: carries them back. They are recomputed either way and must never be
+#: candidates for the cluster column.
+#:
+#: This matters more than it looks. The cluster column is found by elimination,
+#: so an unexpected column has two failure modes and only one of them is loud:
+#: alongside a real cluster column it makes two candidates and refuses, but on a
+#: CSV whose cluster column is absent it would be the only candidate left and
+#: get loaded as hpc_id — a registry full of tile names where cluster IDs belong,
+#: every row well-formed.
+_DERIVED = ("slide_tile",)
+
 # Below this share of CSV rows matching tile_registry, refuse to commit. The
 # number this guards against is not 0% — a total mismatch is obvious. It is the
 # 3% that means the CSV and the registry disagree about slide naming for all but
@@ -133,7 +146,7 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     reference changes resolution.
     """
     frame = _read_csv(csv_path)
-    known = set(_META) | set(_CONFIDENCE) | {"hpc_reference"}
+    known = set(_META) | set(_CONFIDENCE) | set(_DERIVED) | {"hpc_reference"}
     missing = [c for c in (*_META, *_CONFIDENCE) if c not in frame.columns]
     if missing:
         raise SystemExit(
@@ -200,6 +213,16 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # tile_coordinates.slide_tile is "<slides>_<tiles>" upper-cased, e.g.
     # TCGA-55-7574-01Z-00-DX1_18_15.JPEG. Built by the shared helper so this and
     # the dataset-registration step cannot drift apart on the key they join on.
+    # Rebuilt from slides + tiles even when the CSV already had a slide_tile
+    # column, and deliberately not trusted: one written before tile names were
+    # normalised holds the short form (`..._18_15`) and would join nothing,
+    # which is the failure this key exists to prevent. The rebuild is from the
+    # same two columns the normalisation above just corrected.
+    if "slide_tile" in frame.columns:
+        print(f"  note: {csv_path.name} already had a slide_tile column; it was "
+              f"rebuilt from slides + tiles rather than trusted, since one "
+              f"written before the tile names were normalised joins nothing.",
+              file=sys.stderr)
     frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
 
     # Two rows claiming the same tile.

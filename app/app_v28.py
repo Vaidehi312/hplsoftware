@@ -3288,6 +3288,30 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
             f"`18_15.jpeg` form — the match rate above depends on that "
             f"correction. The CSV on disk still holds the short form."
         )
+    # Only surfaced when some of it disagrees. A CSV carrying a slide_tile
+    # column that matches the rebuilt key is the normal, healthy case and does
+    # not need a notice; a partial disagreement means the CSV's own columns
+    # disagree with each other, which the match rate alone would not explain.
+    if report.get("slide_tile_supplied") and report.get("slide_tile_disagreed"):
+        disagreed = report["slide_tile_disagreed"]
+        example = report.get("slide_tile_example") or ("", "")
+        if disagreed == report["rows"]:
+            st.info(
+                f"This CSV carries its own `slide_tile` column and every value "
+                f"differs from the join key rebuilt from `slides` + `tiles` "
+                f"(`{example[0]}` → `{example[1]}`) — the usual sign of a column "
+                f"written before the tile names were normalised. The rebuilt key "
+                f"is what joins, so this is expected and harmless."
+            )
+        else:
+            st.warning(
+                f"This CSV carries its own `slide_tile` column and "
+                f"{disagreed:,} of {report['rows']:,} values differ from the key "
+                f"rebuilt from `slides` + `tiles` (`{example[0]}` → "
+                f"`{example[1]}`). A *partial* disagreement means the CSV's own "
+                f"columns disagree with each other — worth checking before "
+                f"loading, since the rebuilt key is what joins."
+            )
     if report["unmatched"]:
         st.warning(f"{report['unmatched']:,} unmatched, e.g. {report['unmatched_examples']}")
     if report["overwriting"]:

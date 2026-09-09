@@ -62,6 +62,9 @@ class _RawConnection:
         return _Cursor(self.copies)
 
 
+_STAGE_COLUMNS = tuple(kb_stage._STAGE_DDL_TYPES)
+
+
 def _frame():
     return pd.DataFrame({
         "samples": ["S1"] * 3,
@@ -84,14 +87,14 @@ def test_postgres_gets_update_from_not_the_portable_fallback(_=None):
     still passed."""
     sql = loader._update_sql(_Bind("postgresql"), "hpl_stage_x")
     assert "FROM hpl_stage_x AS s" in sql
-    assert "SELECT s.hpc_id" not in sql
+    assert "SELECT s.cluster_id" not in sql
     assert loader.supports_update_from(_Bind("postgresql"))
 
 
 def test_an_unknown_database_gets_the_portable_statement(_=None):
     """A dialect nobody has checked must fall back, not be assumed capable."""
     sql = loader._update_sql(_Bind("mysql"), "hpl_stage_x")
-    assert "SELECT s.hpc_id FROM hpl_stage_x s" in sql
+    assert "SELECT s.cluster_id FROM hpl_stage_x s" in sql
     assert not loader.supports_update_from(_Bind("mysql"))
 
 
@@ -116,7 +119,7 @@ def test_the_scratch_table_is_unlogged_on_postgres_only(_=None):
         def execute(self, statement):
             statements.append(str(statement))
 
-    kb_stage.create_stage(_Conn("postgresql"), "st", ["slide_tile", "hpc_id"])
+    kb_stage.create_stage(_Conn("postgresql"), "st", ["slide_tile", "cluster_id"])
     assert "CREATE UNLOGGED TABLE st" in statements[0]
     assert "DOUBLE PRECISION" not in statements[0]  # neither column is numeric
 
@@ -139,7 +142,7 @@ def test_the_copy_payload_is_headerless_csv_in_the_declared_column_order(_=None)
 
     (statement, payload), = raw.copies
     assert statement.startswith(
-        "COPY st (slide_tile, hpc_id, margin, distance, reference) FROM STDIN")
+        "COPY st (slide_tile, cluster_id, margin, distance, reference) FROM STDIN")
     assert "WITH (FORMAT csv)" in statement
     lines = payload.strip("\n").split("\n")
     assert len(lines) == 3, payload
@@ -170,7 +173,7 @@ def test_the_staged_frame_does_not_carry_a_timestamp_column(_=None):
     pushed over a socket to be read back unchanged."""
     stage = kb_stage.build_stage_frame(_frame(), "leiden_2.5")
     assert list(stage.columns) == [
-        "slide_tile", "hpc_id", "margin", "distance", "reference"]
+        "slide_tile", "cluster_id", "margin", "distance", "reference"]
     assert ":assigned_at" in loader._UPDATE_FROM_SQL
 
 
@@ -194,6 +197,30 @@ def test_the_copy_payload_is_chunked_rather_than_one_buffer(_=None):
 
 
 # --- the sweep ------------------------------------------------------------
+
+def test_no_staged_column_is_named_so_the_chatbot_would_render_it(_=None):
+    """app/hpc_chat_handlers_v23.py enumerates every table in the database,
+    keeps any carrying an hpc_id or dominant_hpc column, and renders up to five
+    matching rows straight to the user — skipping only two tables by name. A
+    scratch table with an hpc_id column would therefore be answered out of the
+    chatbot for as long as a load is running, under a name nobody recognises.
+
+    Pinned as a test rather than a comment because the tempting name for this
+    column is exactly the wrong one: it is written into tile_registry.hpc_id,
+    so calling it hpc_id here reads as consistency.
+    """
+    assert "hpc_id" not in _STAGE_COLUMNS
+    assert "dominant_hpc" not in _STAGE_COLUMNS
+
+
+def test_the_scratch_name_prefix_is_what_the_chatbot_skips(_=None):
+    """The second line of defence. Renaming the column is what actually keeps
+    the chatbot out; the prefix skip is what keeps a future column named less
+    carefully from undoing that. Both have to agree on the prefix."""
+    handlers = (BACKEND.parent / "app" / "hpc_chat_handlers_v23.py").read_text()
+    assert f'startswith("{kb_stage._NAME_PREFIX}")' in handlers
+    assert kb_stage.stage_table_name("x").startswith(kb_stage._NAME_PREFIX)
+
 
 def test_the_sweep_is_a_no_op_off_postgres(_=None):
     """It reads pg_tables. On anything else it must return nothing rather than

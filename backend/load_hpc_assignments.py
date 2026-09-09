@@ -218,12 +218,33 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # normalised holds the short form (`..._18_15`) and would join nothing,
     # which is the failure this key exists to prevent. The rebuild is from the
     # same two columns the normalisation above just corrected.
+    rebuilt = make_slide_tile_series(frame["slides"], frame["tiles"])
+    disagreed = 0
+    example = None
     if "slide_tile" in frame.columns:
-        print(f"  note: {csv_path.name} already had a slide_tile column; it was "
-              f"rebuilt from slides + tiles rather than trusted, since one "
-              f"written before the tile names were normalised joins nothing.",
-              file=sys.stderr)
-    frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
+        # Compared rather than silently overwritten. A disagreement is worth a
+        # number: all of them differing is the ordinary case (a column written
+        # before the tile names were normalised, so `..._18_15` against
+        # `..._18_15.JPEG`), and that is benign because the rebuild is what
+        # joins. A *handful* differing is not benign — it means the CSV's
+        # slides or tiles columns are not what its slide_tile was built from,
+        # and the match rate below will be the only other sign of it.
+        supplied = frame["slide_tile"].astype(str).str.strip().str.upper()
+        differs = supplied != rebuilt
+        disagreed = int(differs.sum())
+        if disagreed:
+            first = differs.idxmax()
+            example = (str(supplied.loc[first]), str(rebuilt.loc[first]))
+            print(f"  note: {csv_path.name} carried a slide_tile column and "
+                  f"{disagreed:,} of {len(frame):,} value(s) disagree with the "
+                  f"key rebuilt from slides + tiles, e.g. {example[0]!r} -> "
+                  f"{example[1]!r}. The rebuild is what joins tile_registry.",
+                  file=sys.stderr)
+        else:
+            print(f"  note: {csv_path.name} carried a slide_tile column and "
+                  f"every value matches the key rebuilt from slides + tiles.",
+                  file=sys.stderr)
+    frame["slide_tile"] = rebuilt
 
     # Two rows claiming the same tile.
     #
@@ -279,6 +300,9 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # On the frame rather than in the return tuple, which every caller and test
     # already unpacks as exactly (frame, cluster_column).
     frame.attrs["tile_names_normalized"] = renamed
+    frame.attrs["slide_tile_supplied"] = "slide_tile" in frame.columns
+    frame.attrs["slide_tile_disagreed"] = disagreed
+    frame.attrs["slide_tile_example"] = example
     return frame, cluster_columns[0]
 
 
@@ -355,7 +379,7 @@ _PRESENT_SQL = """
 
 _UPDATE_FROM_SQL = """
     UPDATE tile_registry SET
-        hpc_id = s.hpc_id,
+        hpc_id = s.cluster_id,
         hpc_vote_margin = s.margin,
         hpc_neighbor_distance = s.distance,
         hpc_reference = s.reference,
@@ -371,7 +395,7 @@ _UPDATE_FROM_SQL = """
 #: against the same fixture so they cannot drift.
 _UPDATE_CORRELATED_SQL = """
     UPDATE tile_registry SET
-        hpc_id = (SELECT s.hpc_id FROM {stage} s
+        hpc_id = (SELECT s.cluster_id FROM {stage} s
                   WHERE s.slide_tile = UPPER(tile_registry.slide_tile)),
         hpc_vote_margin = (SELECT s.margin FROM {stage} s
                   WHERE s.slide_tile = UPPER(tile_registry.slide_tile)),
@@ -544,6 +568,13 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str,
         # written after the packaging fix; non-zero says the match rate below
         # was only reachable because of that correction.
         "tile_names_normalized": int(frame.attrs.get("tile_names_normalized", 0)),
+        # Whether the CSV brought its own slide_tile, and how much of it
+        # disagreed with the key that actually joins. All of it differing is
+        # the ordinary pre-normalisation case; a few values differing means the
+        # CSV's own columns disagree with each other.
+        "slide_tile_supplied": bool(frame.attrs.get("slide_tile_supplied", False)),
+        "slide_tile_disagreed": int(frame.attrs.get("slide_tile_disagreed", 0)),
+        "slide_tile_example": frame.attrs.get("slide_tile_example"),
         # What each candidate threshold would cost and buy, from this cohort's
         # own margins. Computed here so the UI and the CLI show the same table.
         "margin_tradeoff": margin_tradeoff(frame),
@@ -1099,6 +1130,16 @@ def _run(args, engine, frame, cluster_column, stage, timing, started) -> None:
               f"{report['tile_names_normalized']:,} name(s) so they match the "
               f"Knowledge Bank's '18_15.jpeg' form; the CSV on disk still holds "
               f"the short form")
+    if report.get("slide_tile_supplied"):
+        if report["slide_tile_disagreed"]:
+            supplied, key = report["slide_tile_example"]
+            print(f"  slide_tile   the CSV's own column disagrees with the join "
+                  f"key on {report['slide_tile_disagreed']:,} of "
+                  f"{report['rows']:,} row(s) ({supplied} -> {key}); the "
+                  f"rebuilt key is what joins")
+        else:
+            print(f"  slide_tile   the CSV's own column matches the rebuilt "
+                  f"join key on every row")
     print(f"  matched      {report['matched']:,} of {report['rows']:,} "
           f"({report['matched'] / report['rows'] * 100:.1f}%) in tile_registry")
     if report["unmatched"]:

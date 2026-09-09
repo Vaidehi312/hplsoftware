@@ -459,6 +459,87 @@ def test_an_empty_vote_margin_is_refused(tmp_path):
         raise AssertionError("a CSV with a blank vote_margin was accepted")
 
 
+def test_a_supplied_slide_tile_that_agrees_is_reported_as_agreeing(tmp_path):
+    """Keeping slide_tile in the CSV is useful and supported. When it matches
+    the rebuilt key, say so — otherwise the note reads like a warning about a
+    file that is entirely fine."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=8))
+    frame["slide_tile"] = (frame["slides"] + "_" + frame["tiles"]).str.upper()
+    path = tmp_path / "agrees.csv"
+    frame.to_csv(path, index=False)
+
+    loaded, column = loader.read_assignments(path)
+    assert column == "leiden_2.5"
+    assert loaded.attrs["slide_tile_supplied"] is True
+    assert loaded.attrs["slide_tile_disagreed"] == 0
+
+
+def test_a_supplied_slide_tile_that_disagrees_is_counted_with_an_example(tmp_path):
+    """The case worth catching. A slide_tile built from different columns than
+    the CSV's own slides/tiles is invisible except as a match rate — so the
+    disagreement is counted and one example shown, rather than the column
+    being silently overwritten."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=8))
+    frame["slide_tile"] = (frame["slides"] + "_" + frame["tiles"]).str.upper()
+    frame.loc[3, "slide_tile"] = "SOMETHING-ELSE_9_9.JPEG"
+    path = tmp_path / "disagrees.csv"
+    frame.to_csv(path, index=False)
+
+    loaded, _ = loader.read_assignments(path)
+    assert loaded.attrs["slide_tile_disagreed"] == 1
+    supplied, rebuilt = loaded.attrs["slide_tile_example"]
+    assert supplied == "SOMETHING-ELSE_9_9.JPEG"
+    assert rebuilt == loaded["slide_tile"].iloc[3]
+
+
+def test_a_stale_supplied_slide_tile_still_joins(tmp_path):
+    """The ordinary pre-normalisation case: every value differs, because the
+    column holds the short form. It must be reported and then ignored — the
+    rebuild is taken from the tile names the normalisation just corrected, so
+    the load still reaches a full match rate."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=12))
+    frame["tiles"] = frame["tiles"].str.replace(".jpeg", "", regex=False)
+    frame["slide_tile"] = (frame["slides"] + "_" + frame["tiles"]).str.upper()
+    path = tmp_path / "stale.csv"
+    frame.to_csv(path, index=False)
+
+    loaded, column = loader.read_assignments(path)
+    assert loaded.attrs["slide_tile_disagreed"] == 12
+    engine = _make_kb(tmp_path, _registry_tiles(n=12))
+    assert loader.inspect(engine, loaded, column)["matched"] == 12
+
+
+def test_duplicates_are_caught_on_the_rebuilt_key_not_the_supplied_one(tmp_path):
+    """Why the rebuild has to happen before the duplicate check.
+
+    The join key is upper-cased, so two rows whose slide names differ only in
+    case are distinct in the CSV's own slide_tile column and become the same
+    key once rebuilt. The collision exists only after the rebuild, so
+    deduplicating on the supplied value would miss it and let an arbitrary one
+    of the two win — the exact ambiguity the duplicate guard exists to refuse.
+
+    Not hypothetical: this cohort's dataset_id is RADIOGENOMICS and its tile
+    folder is Radiogenomics, and case has already cost a day here.
+    """
+    frame = pd.read_csv(_make_csv(tmp_path, n=6))
+    extra = frame.iloc[[5]].copy()
+    extra["slides"] = extra["slides"].str.lower()
+    frame = pd.concat([frame, extra], ignore_index=True)
+    frame["slide_tile"] = frame["slides"] + "_" + frame["tiles"]
+    # Distinct in the file's own column — this is what a dedup on the supplied
+    # value would see, and why it would not fire.
+    assert frame["slide_tile"].is_unique
+    path = tmp_path / "collide.csv"
+    frame.to_csv(path, index=False)
+
+    try:
+        loader.read_assignments(path)
+    except SystemExit as e:
+        assert "more than once" in str(e), str(e)
+    else:
+        raise AssertionError("a post-normalisation key collision was accepted")
+
+
 def test_a_clean_csv_is_not_caught_by_either_new_refusal(tmp_path):
     """The guards above must fail on bad input, not on ordinary input — the
     pair of them sits in front of every load this pipeline does."""

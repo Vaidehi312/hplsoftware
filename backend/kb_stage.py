@@ -66,7 +66,14 @@ CHUNK_ROWS = 500_000
 #: where the error would be about the wrong table.
 _STAGE_DDL_TYPES = {
     "slide_tile": "TEXT",
-    "hpc_id": "TEXT",
+    # Named "cluster_id" and not "hpc_id" on purpose. app/hpc_chat_handlers_v23.py
+    # enumerates every table in the database, keeps any carrying an hpc_id or
+    # dominant_hpc column, and renders up to five matching rows straight to the
+    # user — skipping only two tables by name. A scratch table with an hpc_id
+    # column is therefore answered out of the chatbot for as long as a load is
+    # running, without ever being named in a query. CLAUDE.md warns that a grep
+    # will not find every reader of this schema; this is that warning arriving.
+    "cluster_id": "TEXT",
     "margin": "DOUBLE PRECISION",
     "distance": "DOUBLE PRECISION",
     "reference": "TEXT",
@@ -104,8 +111,9 @@ def build_stage_frame(frame: pd.DataFrame, cluster_column: str) -> pd.DataFrame:
         "slide_tile": frame["slide_tile"],
         # str().strip() exactly as the old record-building loop did: the cluster
         # column's values arrive as whatever the CSV held, and tile_registry's
-        # hpc_id is text.
-        "hpc_id": frame[cluster_column].astype(str).str.strip(),
+        # hpc_id is text. See _STAGE_DDL_TYPES for why this is not called
+        # hpc_id here.
+        "cluster_id": frame[cluster_column].astype(str).str.strip(),
         "margin": pd.to_numeric(frame["vote_margin"], errors="coerce"),
         "distance": pd.to_numeric(frame["neighbor_distance"], errors="coerce"),
         "reference": frame["hpc_reference"].astype(str),

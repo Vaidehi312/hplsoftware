@@ -335,6 +335,14 @@ def handle_hpc(conn, ids, intents, ts_client, engine: Engine) -> str:
         for table in tables:
             if table in ["hpc_dictionary", "h_latent_vectors"]:
                 continue
+            # Stage 6's scratch tables (kb_stage.py) exist only while a load is
+            # running and hold that CSV's rows, not Knowledge Bank state. They
+            # are named so this loop cannot pick them up — no hpc_id or
+            # dominant_hpc column — and skipped by prefix as well, so a future
+            # scratch column named less carefully does not start answering
+            # questions here. This loop is the reader a grep does not find.
+            if table.startswith("hpl_stage_"):
+                continue
 
             cols = [c["name"] for c in insp.get_columns(table)]
             id_col = "hpc_id" if "hpc_id" in cols else ("dominant_hpc" if "dominant_hpc" in cols else None)

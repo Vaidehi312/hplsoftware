@@ -5892,22 +5892,31 @@ def handle_query(req: QueryRequest):
 
 
 # ---------------------------------------------------------------------------
-# Run with:  uvicorn tile_server_v2_:app --host 0.0.0.0 --port 8000 --workers 2
+# Run with:  uvicorn <this file's name>:app --host 0.0.0.0 --port 8000 --workers 2
+# or just:   python <this file>.py   (which derives the module name itself)
 # For local dev with autoreload (single worker only — Uvicorn doesn't
-# support reload + multiple workers):  UVICORN_RELOAD=true python tile_server_v2_.py
+# support reload + multiple workers):  UVICORN_RELOAD=true python <this file>.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
 
-    # "tile_server_v2_:app" (this file's own module name), not "tile_server:app"
-    # — that used to point at a different, older file (tile_server.py) with
-    # none of the upload/dataset-job/Slurm endpoints. Under reload or
-    # multiple workers, Uvicorn re-imports the app from this string in a
-    # subprocess, so that typo meant reload/multi-worker runs were silently
-    # serving stale code, not this file.
+    # Derived from this file's own name, never written out.
+    #
+    # Uvicorn re-imports the app from this string in a subprocess, for reload
+    # and for every worker, so the string has to name whatever file is actually
+    # being run. Hardcoding it has now failed twice in different ways: first as
+    # "tile_server:app", which pointed at an older file with none of the
+    # upload/dataset-job/Slurm endpoints, so multi-worker runs silently served
+    # stale code; then as "tile_server_v2_:app" on a deployment where the file
+    # had been renamed, where every worker died on ImportError and the parent
+    # respawned it in a loop that printed nothing but "Could not import module".
+    #
+    # Path(__file__).stem cannot disagree with the file it is in, which is the
+    # only property that matters here.
+    module_name = Path(__file__).stem
     reload = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
     uvicorn.run(
-        "tile_server_v2_:app",
+        f"{module_name}:app",
         host="0.0.0.0",
         port=8000,
         workers=1 if reload else 2,

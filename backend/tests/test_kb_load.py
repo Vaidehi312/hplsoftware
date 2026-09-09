@@ -190,17 +190,294 @@ def test_loading_twice_is_idempotent(tmp_path):
 
 
 def test_lookup_chunking_does_not_lose_tiles(tmp_path):
-    """inspect() queries in chunks so a whole dataset does not become one
-    enormous parameter list. The chunking must not drop rows at the seams."""
+    """The chunked lookup must not drop rows at the seams.
+
+    inspect() joins a staging table now, so this reaches the chunked path only
+    by calling it directly — which is the point: the path still exists as the
+    fallback for a role that cannot create the scratch table, and a fallback
+    nothing exercises is a fallback nobody knows is broken.
+    """
     original = loader._LOOKUP_CHUNK
     try:
         loader._LOOKUP_CHUNK = 3  # forces ragged chunks against 20 rows
         csv = _make_csv(tmp_path, n=20)
         engine = _make_kb(tmp_path, _registry_tiles(n=20))
         frame, column = loader.read_assignments(csv)
-        assert loader.inspect(engine, frame, column)["matched"] == 20
+        with engine.connect() as conn:
+            present = loader._lookup_present_chunked(
+                conn, frame["slide_tile"].tolist())
+        assert len(set(present["slide_tile"])) == 20
     finally:
         loader._LOOKUP_CHUNK = original
+
+
+def test_the_staged_preview_and_the_chunked_one_agree(tmp_path):
+    """Two ways of asking the same question. The staged join is the one that
+    runs; the chunked lookup is what it replaced. They must return the same
+    registry rows, or the speedup changed the report."""
+    csv = _make_csv(tmp_path, n=20)
+    engine = _make_kb(tmp_path, _registry_tiles(n=20),
+                      existing={_registry_tiles(n=20)[0].upper(): "1"})
+    frame, column = loader.read_assignments(csv)
+
+    staged = loader.inspect(engine, frame, column)
+    with engine.connect() as conn:
+        chunked = loader._lookup_present_chunked(
+            conn, frame["slide_tile"].tolist())
+
+    assert staged["matched"] == len(set(chunked["slide_tile"]))
+    assert staged["overwriting"] == int(chunked["hpc_id"].notna().sum())
+
+
+# --- the staged write ----------------------------------------------------
+# The write used to be one UPDATE per tile. It is one statement joined against
+# a scratch table now, and the only thing that matters about that change is
+# that the Knowledge Bank ends up holding exactly what it held before.
+
+def _write_row_by_row(engine, frame, cluster_column, now):
+    """The pre-staging writer, kept here as the thing to compare against.
+
+    Deliberately a copy rather than the real function: what is under test is
+    that the new statement reproduces the old behaviour, and a test that
+    imported the old code would stop testing that the day the old code was
+    deleted.
+    """
+    records = [
+        {
+            "slide_tile": slide_tile,
+            "hpc_id": str(cluster).strip(),
+            "margin": float(margin),
+            "distance": None if pd.isna(distance) else float(distance),
+            "reference": str(reference),
+            "assigned_at": now,
+        }
+        for slide_tile, cluster, margin, distance, reference in zip(
+            frame["slide_tile"], frame[cluster_column], frame["vote_margin"],
+            frame["neighbor_distance"], frame["hpc_reference"])
+    ]
+    statement = text("""
+        UPDATE tile_registry
+        SET hpc_id = :hpc_id, hpc_vote_margin = :margin,
+            hpc_neighbor_distance = :distance, hpc_reference = :reference,
+            hpc_assigned_at = :assigned_at
+        WHERE UPPER(slide_tile) = :slide_tile
+    """)
+    updated = 0
+    with engine.begin() as conn:
+        for start in range(0, len(records), 5000):
+            result = conn.execute(statement, records[start:start + 5000])
+            updated += result.rowcount if result.rowcount is not None else 0
+    return updated
+
+
+def _registry_rows(engine):
+    with engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT slide_tile, hpc_id, hpc_vote_margin, hpc_neighbor_distance, "
+            "hpc_reference FROM tile_registry ORDER BY slide_tile")).fetchall()
+
+
+def test_the_staged_write_matches_the_row_by_row_one_exactly(tmp_path):
+    """The whole justification for the rewrite. Same CSV, same registry, two
+    writers: every column of every row must come out identical, not merely the
+    hpc_id, and the reported row count must match too."""
+    csv = _make_csv(tmp_path, n=40)
+    tiles = _registry_tiles(n=40)
+    frame, column = loader.read_assignments(csv)
+
+    for name in ("old", "new"):
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    old_engine = _make_kb(tmp_path / "old", tiles)
+    new_engine = _make_kb(tmp_path / "new", tiles)
+
+    old_count = _write_row_by_row(old_engine, frame, column,
+                                  loader.datetime.now(loader.timezone.utc))
+    new_count = loader.load(new_engine, frame, column, vacuum=False)
+
+    assert old_count == new_count == 40
+    assert _registry_rows(old_engine) == _registry_rows(new_engine)
+
+
+def test_both_update_statements_produce_the_same_registry(tmp_path):
+    """UPDATE ... FROM and the portable correlated form are two spellings of
+    one write. Forced against the same fixture so the fallback cannot quietly
+    diverge from the statement that actually runs in production."""
+    csv = _make_csv(tmp_path, n=25)
+    tiles = _registry_tiles(n=25)
+    frame, column = loader.read_assignments(csv)
+
+    results = {}
+    for label, supports in (("update_from", True), ("correlated", False)):
+        (tmp_path / label).mkdir(parents=True, exist_ok=True)
+        engine = _make_kb(tmp_path / label, tiles)
+        original = loader.supports_update_from
+        try:
+            loader.supports_update_from = lambda bind, _s=supports: _s
+            assert loader.load(engine, frame, column, vacuum=False) == 25
+        finally:
+            loader.supports_update_from = original
+        results[label] = _registry_rows(engine)
+
+    assert results["update_from"] == results["correlated"]
+
+
+def test_the_scratch_table_does_not_outlive_the_write(tmp_path):
+    """A staging table left behind is a table nobody can date, on the one
+    database this pipeline shares. Dropped on the way out of both paths."""
+    csv = _make_csv(tmp_path, n=10)
+    engine = _make_kb(tmp_path, _registry_tiles(n=10))
+    frame, column = loader.read_assignments(csv)
+
+    def _stage_tables():
+        with engine.connect() as conn:
+            return [r[0] for r in conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'hpl_stage_%'"))]
+
+    loader.inspect(engine, frame, column)
+    assert _stage_tables() == []
+    loader.load(engine, frame, column, vacuum=False)
+    assert _stage_tables() == []
+
+
+def test_a_short_staging_table_refuses_rather_than_loading_a_subset(tmp_path):
+    """The check that turns a staging bug into a refusal.
+
+    A scratch table short by a slice would make the join update a subset of the
+    cohort and report success — this pipeline's characteristic failure. Forced
+    by having the copy step drop its last chunk.
+    """
+    import kb_stage
+
+    csv = _make_csv(tmp_path, n=10)
+    engine = _make_kb(tmp_path, _registry_tiles(n=10))
+    frame, column = loader.read_assignments(csv)
+
+    original = kb_stage._insert_chunk
+    try:
+        kb_stage._insert_chunk = lambda conn, table, columns, chunk: original(
+            conn, table, columns, chunk.iloc[:-1])
+        try:
+            loader.load(engine, frame, column, vacuum=False)
+        except SystemExit as e:
+            assert "holds 9" in str(e) and "has 10" in str(e), str(e)
+        else:
+            raise AssertionError("a short staging table was accepted")
+    finally:
+        kb_stage._insert_chunk = original
+
+    # And nothing was written.
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM tile_registry WHERE hpc_id IS NOT NULL"
+        )).scalar_one() == 0
+
+
+def test_staging_slices_are_contiguous_and_cover_everything(tmp_path):
+    """A split that overlapped or gapped would stage the wrong rows. Checked
+    arithmetically rather than eyed, at sizes that do not divide evenly."""
+    import kb_stage
+
+    for total in (0, 1, 7, 10, 999, 18_485_499):
+        for parts in (1, 3, 4, 16):
+            bounds = kb_stage._slice_bounds(total, parts)
+            assert sum(b - a for a, b in bounds) == total, (total, parts)
+            assert all(a < b for a, b in bounds), (total, parts)
+            for (_, prev_end), (next_start, _) in zip(bounds, bounds[1:]):
+                assert prev_end == next_start, (total, parts)
+            if bounds:
+                assert bounds[0][0] == 0 and bounds[-1][1] == total
+
+
+def test_parallel_staging_stages_every_row(tmp_path):
+    """More than one worker must not lose or duplicate a slice. SQLite has no
+    COPY so this exercises the serial fallback's arithmetic, and the row-count
+    check above is what guards the parallel path itself."""
+    import kb_stage
+
+    csv = _make_csv(tmp_path, n=37)
+    engine = _make_kb(tmp_path, _registry_tiles(n=37))
+    frame, column = loader.read_assignments(csv)
+    original = kb_stage.CHUNK_ROWS
+    try:
+        kb_stage.CHUNK_ROWS = 5  # ragged chunks against 37 rows
+        assert loader.load(engine, frame, column, stage_workers=4,
+                           vacuum=False) == 37
+    finally:
+        kb_stage.CHUNK_ROWS = original
+
+
+def test_a_stale_scratch_table_name_carries_a_readable_timestamp(tmp_path):
+    """sweep_stale dates a leftover table by the timestamp in its name. If the
+    name and the parser disagree, a sweep either drops nothing or drops a table
+    out from under a running load."""
+    import kb_stage
+    import time as _time
+
+    name = kb_stage.stage_table_name("kb load")
+    assert name.startswith("hpl_stage_kb_load_")
+    stamp = int(name.rsplit("_", 2)[2])
+    assert abs(stamp - _time.time()) < 60
+
+
+# --- the refusals the staged write made necessary ------------------------
+
+def test_two_rows_for_one_tile_are_refused(tmp_path):
+    """The old writer applied duplicates in file order and let the last win.
+    A join cannot: `UPDATE ... FROM` picks an arbitrary match. Refused, which
+    is also right on the merits — a duplicated tile means the CSV's row count
+    is not the cohort's, so its proportions are already wrong."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=6))
+    frame = pd.concat([frame, frame.iloc[[2]]], ignore_index=True)
+    path = tmp_path / "dup.csv"
+    frame.to_csv(path, index=False)
+
+    try:
+        loader.read_assignments(path)
+    except SystemExit as e:
+        assert "more than once" in str(e)
+        assert "merge_assignment_shards.py" in str(e)
+    else:
+        raise AssertionError("a CSV with a duplicated tile was accepted")
+
+
+def test_an_empty_vote_margin_is_refused(tmp_path):
+    """A blank margin passed the non-numeric guard, which only catches values
+    that were something before coercion. It has to be caught now because the
+    two writers disagreed on it — NaN one way, NULL the other — and because a
+    blank margin is a torn write, not a tile without confidence."""
+    frame = pd.read_csv(_make_csv(tmp_path, n=6))
+    frame.loc[3, "vote_margin"] = None
+    path = tmp_path / "blank.csv"
+    frame.to_csv(path, index=False)
+
+    try:
+        loader.read_assignments(path)
+    except SystemExit as e:
+        assert "empty vote_margin" in str(e)
+    else:
+        raise AssertionError("a CSV with a blank vote_margin was accepted")
+
+
+def test_a_clean_csv_is_not_caught_by_either_new_refusal(tmp_path):
+    """The guards above must fail on bad input, not on ordinary input — the
+    pair of them sits in front of every load this pipeline does."""
+    frame, column = loader.read_assignments(_make_csv(tmp_path, n=50))
+    assert len(frame) == 50
+    assert frame["slide_tile"].is_unique
+
+
+def test_both_csv_readers_produce_the_same_assignments(tmp_path):
+    """read_assignments reads on several threads where pyarrow is installed and
+    falls back where it is not. The two readers must not disagree about values,
+    since which one runs is a property of the machine."""
+    path = _make_csv(tmp_path, n=30)
+    threaded = loader._read_csv(path)
+    default = pd.read_csv(path)
+    assert list(threaded.columns) == list(default.columns)
+    for column in default.columns:
+        assert (threaded[column].astype(str).tolist()
+                == default[column].astype(str).tolist()), column
 
 
 # --- the per-slide aggregates --------------------------------------------

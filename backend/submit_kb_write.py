@@ -50,6 +50,13 @@ REGISTRATION_MEMORY = "64G"
 REGISTRATION_TIME_LIMIT = "12:00:00"
 KB_LOAD_MEMORY = "48G"
 KB_LOAD_TIME_LIMIT = "12:00:00"
+
+#: Stage 6 is no longer one core's worth of work. It reads the assignment CSV on
+#: pandas' threaded pyarrow reader and COPYs it into its scratch table on
+#: several connections at once (see kb_stage), so the cores are used rather than
+#: held. Four rather than more: past a handful of COPY writers the limit is
+#: PostgreSQL's relation extension lock, not this side.
+KB_LOAD_CPUS = 4
 DEFAULT_PARTITION = os.getenv("HPL_KB_PARTITION") or os.getenv("HPL_MERGE_PARTITION")
 
 #: Set this to the hostname a compute node can reach Postgres on. It exists
@@ -290,7 +297,7 @@ def submit_kb_load_job(
     info = _submit(_sbatch_argv(
         job_name=f"hpl_kb_load_{submission_id}", log_stem=log_stem,
         memory=memory, time_limit=time_limit, partition=partition,
-        notify_email=notify_email, command=command,
+        notify_email=notify_email, command=command, cpus=KB_LOAD_CPUS,
     ), "kb_load_job_id")
     info["kb_load_log_path"] = _log_path(log_stem, info["kb_load_job_id"])
     info["db_host"] = db_host

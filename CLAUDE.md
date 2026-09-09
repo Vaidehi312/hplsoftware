@@ -233,6 +233,39 @@ tiles. Note `tiles_missing_suffix()` cannot see that case — it samples 100 nam
 all short — which is why `tile_name_verdict()` reads every name. `migrate_tile_names.py` still
 exists and is still the only fix for the artifacts on disk, and for mixed.
 
+**Stage 6 writes with one statement, and the scratch table it joins is not KB
+state.** The load used to send one `UPDATE ... WHERE UPPER(slide_tile) = :tile`
+per tile through `executemany`, and the preview used to send 1,850 expanding-`IN`
+queries of 10,000 keys each. At 18.5M tiles that is ~20M statement executions,
+preceded by a Python list of 18.5M six-key dicts. Both are one statement now,
+joined against a scratch table (`kb_stage.py`) that `COPY`s the CSV in on
+several connections at once. The parallelism is only sound because the scratch
+table is *not* Knowledge Bank state — a half-staged table is discarded and
+remade, never repaired — which is why staging happens outside the write's
+transaction and the write itself is still one transaction covering the tiles and
+both aggregates. `stage_frame()` verifies the staged row count against the frame
+before anything joins against it, because a scratch table short by a slice would
+update a subset of the cohort and report success.
+
+Three consequences worth knowing before touching it. A **duplicate
+`slide_tile`** is now refused at read time: the old per-row writer applied
+duplicates in file order and let the last win, whereas `UPDATE ... FROM` picks an
+arbitrary match, so which one survived would be a property of the query plan.
+An **empty `vote_margin`** is refused for the same reason — it used to be written
+as `float('nan')` and `COPY`'s CSV format reads an empty field as NULL, so the two
+writers disagreed on exactly those rows. And `--rebuild-hpc-index` is **off by
+default**: dropping `idx_tr_hpc_id` for the duration is less total work, because
+an indexed `hpc_id` means none of these updates can be HOT, but `DROP INDEX`
+holds an ACCESS EXCLUSIVE lock on `tile_registry` for the whole transaction, so
+the viewer and the chatbot block until the load commits.
+
+`migrate_indexes.sql` §8 is still what makes any of this fast — the join
+predicate is `UPPER(tile_registry.slide_tile)`, and without
+`idx_tr_slide_tile_upper` the planner has only a sequential scan. And the write
+leaves a dead row version per updated tile, roughly doubling `tile_registry` on
+disk, which is why `VACUUM ANALYZE` runs afterwards (outside the transaction,
+where it must be, and never fatally — the rows are committed by then).
+
 **Reference `.npz` keys are `reference, components, codes, categories, n_neighbors, meta` (+ optional
 `mean`).** There is no `labels` key. `build_hpc_reference.save()` is the authority;
 `test_reference_keys_match_the_builder` round-trips through it so readers cannot drift.

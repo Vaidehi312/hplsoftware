@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Load a cluster-assignment CSV into the Knowledge Bank (tile_registry).
 
-Stage 5, and the step that makes Stage 4's output visible: until a tile's
+Stage 6, and the step that makes Stage 4's output visible: until a tile's
 hpc_id is in tile_registry, the slide viewer's join
 (tile_coordinates -> tile_registry -> hpc_dictionary) returns nothing and the
 CSV is just a file on disk.
@@ -33,8 +33,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +47,7 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import kb_stage  # noqa: E402
 from run_record import record_run  # noqa: E402
 from slide_naming import (  # noqa: E402
     make_slide_tile_series,
@@ -71,9 +75,23 @@ _CONFIDENCE = ("vote_margin", "neighbor_distance")
 # a handful of tiles, which reads as "it worked" in any summary line.
 _MIN_MATCH_RATE = 0.95
 
-# Tiles per lookup query. Large enough to keep round trips down, small enough
-# to stay well inside any driver's parameter limit.
+# Tiles per lookup query. Only reached by the no-staging fallback path — see
+# _lookup_present_chunked — which exists so a database where the scratch table
+# cannot be created still previews rather than failing.
 _LOOKUP_CHUNK = 10_000
+
+#: Connections used to COPY the assignments into the scratch table. Staging is
+#: the one part of this stage that parallelises safely, because the scratch
+#: table is not Knowledge Bank state (see kb_stage's docstring); the write
+#: itself is one statement in one transaction and always will be.
+#: Four rather than a core count: this is bound by how fast one Postgres backend
+#: can ingest COPY, and past a handful of writers they contend on the same
+#: relation extension lock instead of going faster.
+_STAGE_WORKERS = 4
+
+#: Workers Postgres may use for the preview's join. The preview is a read, so
+#: this is free parallelism with no correctness surface at all.
+_QUERY_WORKERS = 4
 
 
 def make_engine():
@@ -81,6 +99,29 @@ def make_engine():
         f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
         pool_pre_ping=True,
     )
+
+
+def _read_csv(csv_path: Path) -> pd.DataFrame:
+    """The CSV, read on as many cores as the installed pandas will use.
+
+    A 7.8M-row assignment CSV is minutes of single-threaded parsing on pandas'
+    default C engine; the pyarrow engine threads the parse. The fallback is not
+    politeness — pyarrow is not among the container extras this pipeline
+    installs, so this script has to keep working where it is absent, and a
+    reader that raised on a machine without it would take Stage 6 down for a
+    speedup.
+
+    Values are identical either way. Dtypes are not guaranteed to be, which is
+    why nothing downstream trusts them: the confidence columns go through
+    to_numeric and the name columns through astype(str) regardless of which
+    reader produced them.
+    """
+    try:
+        return pd.read_csv(csv_path, engine="pyarrow")
+    except Exception as e:  # noqa: BLE001 - any reader failure falls back
+        print(f"  (threaded CSV reader unavailable: {type(e).__name__}: {e}; "
+              f"using the default single-threaded reader)", file=sys.stderr)
+        return pd.read_csv(csv_path)
 
 
 def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
@@ -91,7 +132,7 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     validator uses, and for the same reason: hardcoding it breaks the moment the
     reference changes resolution.
     """
-    frame = pd.read_csv(csv_path)
+    frame = _read_csv(csv_path)
     known = set(_META) | set(_CONFIDENCE) | {"hpc_reference"}
     missing = [c for c in (*_META, *_CONFIDENCE) if c not in frame.columns]
     if missing:
@@ -160,6 +201,58 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # TCGA-55-7574-01Z-00-DX1_18_15.JPEG. Built by the shared helper so this and
     # the dataset-registration step cannot drift apart on the key they join on.
     frame["slide_tile"] = make_slide_tile_series(frame["slides"], frame["tiles"])
+
+    # Two rows claiming the same tile.
+    #
+    # The old writer sent one UPDATE per row, so duplicates applied in file
+    # order and the last one silently won. The staged join cannot reproduce
+    # that and should not try: `UPDATE ... FROM` picks an arbitrary matching
+    # staging row, and which one is a property of the query plan rather than of
+    # the data. Refused instead — and refusing is the right answer for the file
+    # regardless of how it is written, because a duplicated tile means the CSV's
+    # row count is not the cohort's tile count, so every per-slide proportion
+    # computed from it is already wrong by an unknown amount.
+    #
+    # This is what an overlapping shard merge looks like.
+    # merge_assignment_shards.py checks the total against the source precisely
+    # so this cannot arrive, which makes reaching it a sign the parts were
+    # concatenated by hand.
+    duplicated = frame["slide_tile"].duplicated(keep=False)
+    if duplicated.any():
+        counts = frame.loc[duplicated, "slide_tile"].value_counts()
+        raise SystemExit(
+            f"{csv_path} has {int(duplicated.sum()):,} row(s) across "
+            f"{len(counts):,} tile(s) that appear more than once, e.g. "
+            f"{[f'{k} x{v}' for k, v in counts.head(3).items()]}.\n\n"
+            f"Two assignments for one tile cannot both be loaded, and which one "
+            f"would win is not something this can decide for you. The usual "
+            f"cause is shard outputs concatenated by hand where their ranges "
+            f"overlapped — re-merge them with merge_assignment_shards.py, which "
+            f"checks the row total against the projections .h5 rather than "
+            f"believing the parts."
+        )
+
+    # A vote_margin that is empty rather than wrong.
+    #
+    # The non-numeric guard above deliberately only catches values that were
+    # *something* before coercion, so a blank cell arrives here as NaN having
+    # passed every check. It used to be written to hpc_vote_margin as
+    # float('nan'); COPY's CSV format reads an empty field as SQL NULL, so the
+    # per-row and staged writers would disagree on exactly these rows. Refused
+    # rather than reconciled: the margin is the number this stage's entire
+    # confidence story rests on — it is what the --min-margin trade-off table is
+    # computed from — and a blank one is a torn write, not a tile with no
+    # confidence.
+    blank = int(frame["vote_margin"].isna().sum())
+    if blank:
+        raise SystemExit(
+            f"{csv_path} has {blank:,} row(s) with an empty vote_margin. That is "
+            f"an interrupted or truncated write rather than a tile without a "
+            f"confidence — assign_hpc_clusters.py writes a margin for every row "
+            f"it emits. Check the row count against the projections .h5 before "
+            f"loading."
+        )
+
     # On the frame rather than in the return tuple, which every caller and test
     # already unpacks as exactly (frame, cluster_column).
     frame.attrs["tile_names_normalized"] = renamed
@@ -220,7 +313,123 @@ def margin_tradeoff(frame: pd.DataFrame, cuts=_MARGIN_CUTS) -> list[dict]:
     return rows
 
 
-def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float = 0.0) -> dict:
+# ---------------------------------------------------------------------------
+# The two statements that replaced 20 million round trips.
+#
+# Both join tile_registry against a scratch table holding this CSV's keys
+# (kb_stage) instead of carrying the keys in the statement. The join predicate
+# is UPPER(tile_registry.slide_tile) = stage.slide_tile in both, matching what
+# the per-row writer did — make_slide_tile_series already upper-cases the CSV
+# side, and migrate_indexes.sql's idx_tr_slide_tile_upper is an index on
+# exactly this expression.
+# ---------------------------------------------------------------------------
+
+_PRESENT_SQL = """
+    SELECT UPPER(t.slide_tile) AS slide_tile, t.hpc_id, t.hpc_reference
+    FROM tile_registry t
+    JOIN {stage} s ON s.slide_tile = UPPER(t.slide_tile)
+"""
+
+_UPDATE_FROM_SQL = """
+    UPDATE tile_registry SET
+        hpc_id = s.hpc_id,
+        hpc_vote_margin = s.margin,
+        hpc_neighbor_distance = s.distance,
+        hpc_reference = s.reference,
+        hpc_assigned_at = :assigned_at
+    FROM {stage} AS s
+    WHERE UPPER(tile_registry.slide_tile) = s.slide_tile
+"""
+
+#: The same update for a database without UPDATE ... FROM. One correlated
+#: subquery per column, which is why kb_stage indexes the scratch key: without
+#: that index this is five scans of the scratch table per registry row.
+#: Only the tests take this path in practice, and the equivalence test runs both
+#: against the same fixture so they cannot drift.
+_UPDATE_CORRELATED_SQL = """
+    UPDATE tile_registry SET
+        hpc_id = (SELECT s.hpc_id FROM {stage} s
+                  WHERE s.slide_tile = UPPER(tile_registry.slide_tile)),
+        hpc_vote_margin = (SELECT s.margin FROM {stage} s
+                  WHERE s.slide_tile = UPPER(tile_registry.slide_tile)),
+        hpc_neighbor_distance = (SELECT s.distance FROM {stage} s
+                  WHERE s.slide_tile = UPPER(tile_registry.slide_tile)),
+        hpc_reference = (SELECT s.reference FROM {stage} s
+                  WHERE s.slide_tile = UPPER(tile_registry.slide_tile)),
+        hpc_assigned_at = :assigned_at
+    WHERE UPPER(tile_registry.slide_tile) IN (SELECT slide_tile FROM {stage})
+"""
+
+
+def supports_update_from(bind) -> bool:
+    """Whether this database can do UPDATE ... FROM.
+
+    PostgreSQL always could; SQLite gained it in 3.33 (2020), and the tests run
+    on whichever SQLite the interpreter was built against. Feature-detected
+    rather than assumed so the fast statement is used wherever it exists and the
+    portable one is a fallback rather than the test suite's private path.
+    """
+    name = bind.dialect.name
+    if name == "postgresql":
+        return True
+    if name == "sqlite":
+        return tuple(int(x) for x in sqlite3.sqlite_version.split(".")[:2]) >= (3, 33)
+    return False
+
+
+def _update_sql(bind, stage: str) -> str:
+    template = (_UPDATE_FROM_SQL if supports_update_from(bind)
+                else _UPDATE_CORRELATED_SQL)
+    return template.format(stage=stage)
+
+
+def _enable_parallel_query(conn, workers: int = _QUERY_WORKERS) -> None:
+    """Ask Postgres to parallelise the preview's join.
+
+    The preview is a pure read, so this has no correctness surface: parallel
+    workers return the same rows, and the only thing that changes is how many
+    backends scan tile_registry. Note it cannot help the write — PostgreSQL does
+    not parallelise the workers of a DML statement, whatever it does with the
+    plan underneath — which is why the write's speedup had to come from issuing
+    one statement instead of millions rather than from more cores.
+
+    Best-effort: a database that refuses the SET (a restricted role, a pooler
+    that disallows it) still previews correctly, just serially.
+    """
+    if not kb_stage.is_postgres(conn):
+        return
+    try:
+        conn.execute(text(f"SET max_parallel_workers_per_gather = {int(workers)}"))
+    except Exception as e:  # noqa: BLE001 - a speed setting, never a requirement
+        print(f"  (could not enable parallel query: {type(e).__name__}: {e})",
+              file=sys.stderr)
+
+
+def _lookup_present_chunked(conn, tiles: list[str]) -> pd.DataFrame:
+    """The pre-staging preview lookup, kept as the fallback.
+
+    1,850 expanding-IN queries for an 18.5M-row CSV, each re-planned, which is
+    why staging exists. It stays because it needs nothing but SELECT: a role
+    that cannot create the scratch table can still preview, and a preview that
+    refused would block the one step in this stage that changes nothing.
+    """
+    lookup = text("""
+        SELECT UPPER(slide_tile) AS slide_tile, hpc_id, hpc_reference
+        FROM tile_registry
+        WHERE UPPER(slide_tile) IN :tiles
+    """).bindparams(bindparam("tiles", expanding=True))
+    pieces = []
+    for start in range(0, len(tiles), _LOOKUP_CHUNK):
+        pieces.append(pd.read_sql(
+            lookup, conn, params={"tiles": tiles[start:start + _LOOKUP_CHUNK]}))
+    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame(
+        columns=["slide_tile", "hpc_id", "hpc_reference"])
+
+
+def inspect(engine, frame: pd.DataFrame, cluster_column: str,
+            min_margin: float = 0.0, *, stage: str | None = None,
+            stage_workers: int = _STAGE_WORKERS,
+            timing: dict | None = None) -> dict:
     """What loading this CSV would do, computed without changing anything.
 
     Deliberately a separate pass rather than a count taken during the write:
@@ -234,28 +443,49 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float 
     "excluded_from_aggregates" is how many of those exist in this CSV before
     anything is decided.
     """
-    tiles = frame["slide_tile"].tolist()
-    # Looked up in chunks with an expanding IN rather than one ANY(array): a
-    # single parameter carrying 500k tiles is both a portability problem and a
-    # planner one, and this has to work for a whole dataset, not just a subset.
-    lookup = text("""
-        SELECT UPPER(slide_tile) AS slide_tile, hpc_id, hpc_reference
-        FROM tile_registry
-        WHERE UPPER(slide_tile) IN :tiles
-    """).bindparams(bindparam("tiles", expanding=True))
+    tiles = frame["slide_tile"]
 
-    pieces = []
-    with engine.connect() as conn:
-        for start in range(0, len(tiles), _LOOKUP_CHUNK):
-            pieces.append(pd.read_sql(
-                lookup, conn, params={"tiles": tiles[start:start + _LOOKUP_CHUNK]}
-            ))
-        clusters = pd.read_sql(
-            text("SELECT hpc_id FROM hpc_dictionary"), conn
-        )["hpc_id"].astype(str).str.strip().tolist()
-    present = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame(
-        columns=["slide_tile", "hpc_id", "hpc_reference"]
-    )
+    # Stage the keys and join once, rather than send them back in 10,000-key
+    # IN lists. `stage` lets the caller hand over a scratch table it has
+    # already filled — main() stages the full payload once and previews against
+    # it, so a dry-run-then-commit does not pay for staging twice.
+    owned = None
+    if stage is None:
+        owned = kb_stage.stage_table_name("kb_preview")
+        try:
+            seconds = kb_stage.stage_frame(engine, owned, frame[["slide_tile"]],
+                                           workers=stage_workers)
+            if timing is not None:
+                timing["stage"] = timing.get("stage", 0.0) + seconds
+            stage = owned
+        except Exception as e:  # noqa: BLE001 - see _lookup_present_chunked
+            print(f"  (could not create a staging table "
+                  f"({type(e).__name__}: {e}); previewing with the chunked "
+                  f"lookup instead, which is slower but needs only SELECT)",
+                  file=sys.stderr)
+            with engine.begin() as conn:
+                kb_stage.drop_stage(conn, owned)
+            owned = None
+            stage = None
+
+    started = time.perf_counter()
+    try:
+        with engine.connect() as conn:
+            _enable_parallel_query(conn)
+            if stage is not None:
+                present = pd.read_sql(text(_PRESENT_SQL.format(stage=stage)), conn)
+            else:
+                present = _lookup_present_chunked(conn, tiles.tolist())
+            clusters = pd.read_sql(
+                text("SELECT hpc_id FROM hpc_dictionary"), conn
+            )["hpc_id"].astype(str).str.strip().tolist()
+    finally:
+        if owned is not None:
+            with engine.begin() as conn:
+                kb_stage.drop_stage(conn, owned)
+    if timing is not None:
+        timing["preview"] = timing.get("preview", 0.0) + (
+            time.perf_counter() - started)
 
     matched = set(present["slide_tile"])
     assigned = frame[cluster_column].astype(str).str.strip()
@@ -270,7 +500,12 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float 
         "rows": len(frame),
         "matched": len(matched),
         "unmatched": len(frame) - len(matched),
-        "unmatched_examples": [t for t in tiles if t not in matched][:5],
+        # islice over a generator rather than a list comprehension then a
+        # slice: the comprehension built the whole miss list first, which for a
+        # cohort that matches nothing is an 18.5-million-element list to show
+        # five names from.
+        "unmatched_examples": list(islice(
+            (t for t in tiles if t not in matched), 5)),
         # A cluster ID with no hpc_dictionary row joins to NULL in the viewer:
         # the tile gets a cluster but no pattern, malignancy or inflammation.
         "unknown_clusters": sorted(set(assigned) - set(clusters)),
@@ -292,64 +527,179 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str, min_margin: float 
     }
 
 
-def load(engine, frame: pd.DataFrame, cluster_column: str, *, batch: int = 5000,
-         profiles: tuple[pd.DataFrame, pd.DataFrame] | None = None) -> int:
-    """Write the assignments. One transaction: a half-loaded registry, with some
-    tiles on the new reference and some on the old, is not a state anything
-    downstream can interpret."""
-    now = datetime.now(timezone.utc)
-    # Zipped columns rather than itertuples/getattr: itertuples renames anything
-    # that is not a valid Python identifier, and the cluster column is named for
-    # the reference's groupby — "leiden_2.5" — so the dot turns it into a
-    # positional alias and getattr raises. Which is to say the obvious way to
-    # write this loop fails on every real reference and passes on any test that
-    # invents a tidier column name.
-    records = [
-        {
-            "slide_tile": slide_tile,
-            "hpc_id": str(cluster).strip(),
-            "margin": float(margin),
-            "distance": None if pd.isna(distance) else float(distance),
-            "reference": str(reference),
-            "assigned_at": now,
-        }
-        for slide_tile, cluster, margin, distance, reference in zip(
-            frame["slide_tile"],
-            frame[cluster_column],
-            frame["vote_margin"],
-            frame["neighbor_distance"],
-            frame["hpc_reference"],
-        )
-    ]
+def load(engine, frame: pd.DataFrame, cluster_column: str, *,
+         profiles: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+         stage: str | None = None, stage_workers: int = _STAGE_WORKERS,
+         vacuum: bool = True, rebuild_hpc_index: bool = False,
+         timing: dict | None = None) -> int:
+    """Write the assignments. Returns registry rows changed.
 
-    statement = text("""
-        UPDATE tile_registry
-        SET hpc_id = :hpc_id,
-            hpc_vote_margin = :margin,
-            hpc_neighbor_distance = :distance,
-            hpc_reference = :reference,
-            hpc_assigned_at = :assigned_at
-        WHERE UPPER(slide_tile) = :slide_tile
-    """)
+    One transaction for everything that lands in the Knowledge Bank: a
+    half-loaded registry, with some tiles on the new reference and some on the
+    old, is not a state anything downstream can interpret.
+
+    The write is a single statement joined against a scratch table, not one
+    UPDATE per tile. What that replaced, at 18.5M tiles, was 18.5M statement
+    executions preceded by a Python list of 18.5M six-key dicts — several GB of
+    interpreter objects built before the first row was sent. Staging happens
+    *outside* the transaction, on several connections, which is only sound
+    because the scratch table is not Knowledge Bank state: a half-staged table
+    is discarded and remade, and `kb_stage.stage_frame` verifies its row count
+    against the frame before this function will join against it.
+
+    `stage` accepts a scratch table the caller already filled, so main() does
+    not stage the same 18.5M keys for the preview and again for the write.
+    """
+    timing = timing if timing is not None else {}
+    now = datetime.now(timezone.utc)
+
+    owned = None
+    if stage is None:
+        owned = kb_stage.stage_table_name("kb_load")
+        timing["stage"] = timing.get("stage", 0.0) + kb_stage.stage_frame(
+            engine, owned, kb_stage.build_stage_frame(frame, cluster_column),
+            workers=stage_workers)
+        stage = owned
 
     updated = 0
-    # One transaction covering the tiles and both aggregates. Splitting them
-    # would allow a registry whose per-tile clusters and per-slide proportions
-    # came from different runs, which is worse than either being stale: nothing
-    # downstream can tell that has happened.
-    with engine.begin() as conn:
-        for start in range(0, len(records), batch):
-            chunk = records[start:start + batch]
-            result = conn.execute(statement, chunk)
-            updated += result.rowcount if result.rowcount is not None else 0
-            print(f"  tiles {min(start + batch, len(records)):,}/{len(records):,}", flush=True)
+    try:
+        # One transaction covering the tiles and both aggregates. Splitting them
+        # would allow a registry whose per-tile clusters and per-slide
+        # proportions came from different runs, which is worse than either being
+        # stale: nothing downstream can tell that has happened.
+        with engine.begin() as conn:
+            if rebuild_hpc_index:
+                _drop_hpc_index(conn)
+            started = time.perf_counter()
+            result = conn.execute(text(_update_sql(conn, stage)),
+                                  {"assigned_at": now})
+            updated = result.rowcount if result.rowcount is not None else 0
+            timing["tiles"] = timing.get("tiles", 0.0) + (
+                time.perf_counter() - started)
+            print(f"  tiles {updated:,} registry rows updated", flush=True)
 
-        if profiles is not None:
-            proportions, summary = profiles
-            written = replace_profiles(conn, proportions, summary)
-            for table, count in written.items():
-                print(f"  {table}: {count:,} rows", flush=True)
+            if profiles is not None:
+                started = time.perf_counter()
+                proportions, summary = profiles
+                written = replace_profiles(conn, proportions, summary)
+                for table, count in written.items():
+                    print(f"  {table}: {count:,} rows", flush=True)
+                timing["aggregates"] = timing.get("aggregates", 0.0) + (
+                    time.perf_counter() - started)
+
+            if rebuild_hpc_index:
+                started = time.perf_counter()
+                _create_hpc_index(conn)
+                timing["hpc_index"] = timing.get("hpc_index", 0.0) + (
+                    time.perf_counter() - started)
+    finally:
+        # Dropped whether or not the write committed: it is scratch either way,
+        # and leaving it behind on a failure is how a database accumulates
+        # tables nobody can date.
+        if owned is not None:
+            with engine.begin() as conn:
+                kb_stage.drop_stage(conn, owned)
+
+    if vacuum:
+        timing["vacuum"] = timing.get("vacuum", 0.0) + _vacuum_analyze(engine)
     return updated
+
+
+#: The index on the column this stage rewrites on every row.
+_HPC_INDEX = "idx_tr_hpc_id"
+
+
+def _drop_hpc_index(conn) -> None:
+    """Drop idx_tr_hpc_id so the update does not maintain it row by row.
+
+    Because hpc_id is indexed, none of these updates can be a HOT update: every
+    one of the 18.5M rows churns this index as well as the heap. Dropping it for
+    the duration and rebuilding it once is less total work.
+
+    Off by default, and it should stay that way unless someone has decided the
+    cost is worth paying. DROP INDEX takes an ACCESS EXCLUSIVE lock on
+    tile_registry, and because this runs inside the write's transaction that
+    lock is held for the whole load — so the slide viewer and the chatbot block
+    on every query against tile_registry until the write commits, which for a
+    full cohort is not a short time. Inside the transaction is nonetheless the
+    only safe place for it: a failure rolls back the DROP along with everything
+    else, so there is no outcome where the load fails and the index is simply
+    gone.
+    """
+    if not kb_stage.is_postgres(conn):
+        return
+    print(f"  dropping {_HPC_INDEX} for the duration of the write "
+          f"(tile_registry is locked until this commits)", flush=True)
+    conn.execute(text(f"DROP INDEX IF EXISTS {_HPC_INDEX}"))
+
+
+def _create_hpc_index(conn) -> None:
+    if not kb_stage.is_postgres(conn):
+        return
+    print(f"  rebuilding {_HPC_INDEX}", flush=True)
+    conn.execute(text(
+        f"CREATE INDEX IF NOT EXISTS {_HPC_INDEX} ON tile_registry (hpc_id)"))
+
+
+def _vacuum_analyze(engine) -> float:
+    """VACUUM ANALYZE tile_registry after the write. Returns seconds taken.
+
+    Not a tuning nicety. Under MVCC an UPDATE writes a new row version and
+    leaves the old one dead, so updating every row of tile_registry roughly
+    doubles the table on disk — no write strategy avoids that, staged or per-row.
+    Without a vacuum that space is only reclaimed whenever autovacuum next gets
+    to a table this size, and until it does every sequential scan the viewer
+    does reads both versions of every row. ANALYZE matters for a second reason:
+    hpc_id went from mostly NULL to fully populated, and the planner's old
+    statistics say otherwise.
+
+    Runs outside the write's transaction because VACUUM cannot run inside one,
+    and after it, so a failed load does not spend the time. Never fatal — the
+    rows are committed by the time this is called, and reporting a completed
+    write as failed because the housekeeping did not run is the more misleading
+    of the two errors.
+    """
+    if not kb_stage.is_postgres(engine):
+        return 0.0
+    started = time.perf_counter()
+    print("  vacuum analyze tile_registry (reclaiming the old row versions "
+          "this update leaves behind) ...", flush=True)
+    try:
+        pooled = engine.raw_connection()
+        try:
+            # The DBAPI connection itself rather than the pool's proxy: VACUUM
+            # cannot run inside a transaction, and AUTOCOMMIT has to be set on
+            # the psycopg2 connection, not on something wrapping it.
+            raw = pooled.dbapi_connection
+            raw.set_isolation_level(0)  # ISOLATION_LEVEL_AUTOCOMMIT
+            try:
+                with raw.cursor() as cursor:
+                    cursor.execute("VACUUM ANALYZE tile_registry")
+            finally:
+                raw.set_isolation_level(1)  # as the pool handed it over
+        finally:
+            pooled.close()
+    except Exception as e:  # noqa: BLE001 - housekeeping, never the verdict
+        print(f"  WARNING: VACUUM ANALYZE tile_registry failed "
+              f"({type(e).__name__}: {e}). The load itself committed. Run it by "
+              f"hand, or leave it to autovacuum — until then tile_registry holds "
+              f"a dead row version per updated tile and the planner's statistics "
+              f"for hpc_id are stale.", file=sys.stderr)
+    return time.perf_counter() - started
+
+
+def report_timing(elapsed: float, timing: dict) -> None:
+    """Where the time went, in Stage 4's format, because Stage 6 had no such
+    line and every claim about its cost was therefore arithmetic."""
+    if not timing:
+        return
+    accounted = sum(timing.values())
+    print("Time spent: " + ", ".join(
+        f"{name} {seconds:,.0f}s ({seconds / max(elapsed, 1e-9) * 100:.0f}%)"
+        for name, seconds in sorted(timing.items(), key=lambda kv: -kv[1])))
+    if elapsed - accounted > 0.05 * elapsed:
+        print(f"            unaccounted {elapsed - accounted:,.0f}s "
+              f"({(elapsed - accounted) / max(elapsed, 1e-9) * 100:.0f}%)")
 
 
 def compute_profiles(frame: pd.DataFrame, cluster_column: str,
@@ -650,6 +1000,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record-kb-target", default=None,
                         help="Recorded as kb_load_kb_target, so the run says "
                              "which Knowledge Bank it filled.")
+    parser.add_argument("--stage-workers", type=int, default=_STAGE_WORKERS,
+                        metavar="N",
+                        help="Connections used to COPY the assignments into the "
+                             "scratch table the write joins against. Staging is "
+                             "the only part of this stage that parallelises "
+                             "safely; the write is one statement in one "
+                             "transaction. 1 takes the parallel path out of the "
+                             "picture entirely.")
+    parser.add_argument("--no-vacuum", action="store_true",
+                        help="Skip the VACUUM ANALYZE after the write. Updating "
+                             "every row leaves a dead version of each behind, so "
+                             "skipping this leaves tile_registry roughly twice "
+                             "its size and the planner's hpc_id statistics stale "
+                             "until autovacuum reaches it.")
+    parser.add_argument("--rebuild-hpc-index", action="store_true",
+                        help="Drop idx_tr_hpc_id for the duration of the write "
+                             "and rebuild it after. Less total work, because "
+                             "every row's update otherwise maintains that index "
+                             "too — but it holds an ACCESS EXCLUSIVE lock on "
+                             "tile_registry for the whole load, so the viewer "
+                             "and chatbot block until it commits.")
     parser.add_argument("--min-margin", type=float, default=0.0,
                         help="Exclude tiles below this vote_margin from "
                              "hpl_profile_proportion/summary. tile_registry keeps every "
@@ -661,9 +1032,41 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    started = time.perf_counter()
+    timing: dict[str, float] = {}
+
+    _t = time.perf_counter()
     frame, cluster_column = read_assignments(args.csv)
+    timing["read csv"] = time.perf_counter() - _t
+
     engine = make_engine()
-    report = inspect(engine, frame, cluster_column, min_margin=args.min_margin)
+
+    # Scratch tables left by a job killed between CREATE and DROP. Swept here
+    # rather than left to accumulate, and only ones older than a day, so this
+    # can never remove the table under a load running on another node right now.
+    stale = kb_stage.sweep_stale(engine)
+    if stale:
+        print(f"  swept {len(stale)} stale staging table(s) from earlier runs: "
+              f"{stale[:3]}")
+
+    # Staged once and used by both the preview and the write. A dry run only
+    # ever reads the keys, so it does not pay to ship the payload columns it
+    # will not look at.
+    stage_frame = (kb_stage.build_stage_frame(frame, cluster_column)
+                   if args.commit else frame[["slide_tile"]])
+    stage = kb_stage.stage_table_name("kb_load")
+    try:
+        timing["stage"] = kb_stage.stage_frame(
+            engine, stage, stage_frame, workers=max(1, args.stage_workers))
+        _run(args, engine, frame, cluster_column, stage, timing, started)
+    finally:
+        with engine.begin() as conn:
+            kb_stage.drop_stage(conn, stage)
+
+
+def _run(args, engine, frame, cluster_column, stage, timing, started) -> None:
+    report = inspect(engine, frame, cluster_column, min_margin=args.min_margin,
+                     stage=stage, timing=timing)
 
     print(f"CSV            : {args.csv}")
     print(f"  rows         {report['rows']:,}   cluster column '{cluster_column}'")
@@ -737,11 +1140,15 @@ def main() -> None:
 
     if not args.commit:
         print("\nDry run — nothing written. Re-run with --commit to load.")
+        report_timing(time.perf_counter() - started, timing)
         return
 
     print(f"\nLoading into {DB_NAME}.tile_registry ...")
     try:
-        updated = load(engine, frame, cluster_column, profiles=profiles)
+        updated = load(engine, frame, cluster_column, profiles=profiles,
+                       stage=stage, vacuum=not args.no_vacuum,
+                       rebuild_hpc_index=args.rebuild_hpc_index,
+                       timing=timing)
     except BaseException as e:
         if args.record_run and args.record_run_db:
             record_run(args.record_run_db, args.record_run,
@@ -765,6 +1172,10 @@ def main() -> None:
             f"registry changed between the preview and the write.",
             file=sys.stderr,
         )
+    elapsed = time.perf_counter() - started
+    print(f"Loaded    : {updated:,} tiles in {elapsed:.1f}s "
+          f"({updated / max(elapsed, 1e-9):,.0f} tiles/s)")
+    report_timing(elapsed, timing)
 
 
 if __name__ == "__main__":

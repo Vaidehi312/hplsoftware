@@ -27,6 +27,7 @@ the host is resolved and refused at submit time instead; see resolve_job_db_host
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -306,28 +307,116 @@ def submit_kb_load_job(
 
 
 def check_db_from_compute_node(host: str | None = None, port: str | None = None,
+                              database: str | None = None,
                               time_limit: str = "5") -> dict:
-    """Ask Slurm whether a compute node can open a TCP connection to Postgres.
+    """Can a compute node actually *use* Postgres? One srun, from where the job runs.
 
-    One srun, so the answer comes from where the job will actually run rather
-    than from the login node, which can always reach it. This is the check the
-    whole feature rests on, so it is a command rather than a paragraph of
-    documentation.
+    This used to open a TCP socket and stop there, which is a weaker question
+    than the one being asked and passes in the exact state that made it worth
+    asking. Job 1243329 is the example: DB_HOST resolved, the socket opened,
+    and the job then died on `fe_sendauth: no password supplied` five minutes
+    later, because the server authenticates over a unix socket where pg_hba
+    says peer and a compute node arrives over TCP where it says scram. A
+    reachability check that cannot see that is a check that says yes and costs
+    an hour.
+
+    So the probe opens the socket *and* completes a real connection, as the job
+    will, with the job's own DB_USER/DB_PASS. The two results are reported
+    separately because they have different fixes: no TCP is listen_addresses or
+    a firewall, TCP without a connection is pg_hba, the role's password, or a
+    database that does not exist on that server.
     """
     host = host or resolve_job_db_host()
     port = port or os.getenv("DB_PORT", "5432")
-    probe = (f"import socket; socket.create_connection(({host!r}, {int(port)}), 5); "
-             f"print('reachable')")
+    database = database or os.getenv("DB_NAME", "hpl_kb")
+
+    # Deliberately not importing db_url inside the probe: srun's cwd need not be
+    # backend/, and psycopg2's own keywords are what libpq reads anyway. An
+    # empty DB_PASS is passed as None so ~/.pgpass and $PGPASSWORD still apply,
+    # which is how a job authenticates when the password lives in a file.
+    probe = (
+        "import json, os, socket\n"
+        f"host, port, db = {host!r}, {int(port)}, {database!r}\n"
+        "out = {'tcp': False, 'connected': False, 'error': None}\n"
+        "try:\n"
+        "    socket.create_connection((host, port), 5).close()\n"
+        "    out['tcp'] = True\n"
+        "except Exception as e:\n"
+        "    out['error'] = f'{type(e).__name__}: {e}'\n"
+        "if out['tcp']:\n"
+        "    try:\n"
+        "        import psycopg2\n"
+        "        psycopg2.connect(host=host, port=port, dbname=db,\n"
+        "                         user=os.getenv('DB_USER', 'vpandya'),\n"
+        "                         password=os.getenv('DB_PASS') or None,\n"
+        "                         connect_timeout=5).close()\n"
+        "        out['connected'] = True\n"
+        "    except Exception as e:\n"
+        "        out['error'] = f'{type(e).__name__}: {e}'\n"
+        "print('HPL_DB_PROBE ' + json.dumps(out))\n"
+    )
     argv = ["srun", f"--time=00:00:{int(time_limit):02d}", "-n1",
             _python(), "-c", probe]
     result = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+
+    parsed = {"tcp": False, "connected": False, "error": None}
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("HPL_DB_PROBE "):
+            try:
+                parsed.update(json.loads(line[len("HPL_DB_PROBE "):]))
+            except ValueError:
+                pass
+
     return {
-        "host": host, "port": port,
-        "reachable": result.returncode == 0 and "reachable" in (result.stdout or ""),
+        "host": host, "port": port, "database": database,
+        # Kept as the TCP answer it always was, so nothing reading it changes
+        # meaning; "usable" is the one to gate a submission on.
+        "reachable": parsed["tcp"],
+        "usable": parsed["connected"],
+        "error": parsed["error"],
         "stdout": (result.stdout or "").strip(),
         "stderr": (result.stderr or "").strip(),
         "command": argv,
     }
+
+
+def probe_advice(result: dict) -> str:
+    """What to do about each way the probe can come out short.
+
+    Kept next to the probe because psycopg2's error names the symptom and the
+    fix is cluster configuration in every case — and because the four cases
+    have four different fixes that look alike from the server.
+    """
+    if result.get("usable"):
+        return ""
+    if not result.get("reachable"):
+        return (f"Nothing accepted a TCP connection on {result['host']}:"
+                f"{result['port']} from a compute node. Postgres is probably "
+                f"listening only on localhost or a unix socket — check "
+                f"listen_addresses in postgresql.conf — or a firewall is in "
+                f"the way. Stages 5 and 6 have to run in the server until this "
+                f"changes.")
+    error = (result.get("error") or "").lower()
+    if "no password supplied" in error or "authentication failed" in error:
+        return (f"Postgres answered and refused the connection: the compute "
+                f"node arrives over TCP, where pg_hba.conf asks for a password, "
+                f"while the server itself connects over a socket where it does "
+                f"not. Give the job a password — export DB_PASS in the shell "
+                f"the server is started from (sbatch passes the submitting "
+                f"environment to the job), or put it in a passfile and export "
+                f"PGPASSFILE, which is read by libpq only when DB_PASS is "
+                f"empty. If the role has no password yet, set one with "
+                f"\\password in psql.")
+    if "does not exist" in error:
+        return (f"Postgres answered, but {result['database']!r} is not a "
+                f"database on that server. Check DB_NAME, and that the test "
+                f"Knowledge Bank has been created.")
+    if "no pg_hba.conf entry" in error:
+        return (f"Postgres answered and has no pg_hba.conf rule covering the "
+                f"compute nodes' subnet, so no password can help. A host rule "
+                f"for that range is needed.")
+    return (f"Postgres answered but the connection did not complete: "
+            f"{result.get('error')}")
 
 
 def main() -> int:
@@ -338,6 +427,10 @@ def main() -> int:
                              "connection to Postgres from a compute node, and "
                              "report whether it worked. Run this once before "
                              "relying on Slurm-backed Stages 5 and 6.")
+    parser.add_argument("--database", default=None,
+                        help="Database to connect to in the probe. Defaults to "
+                             "$DB_NAME, then hpl_kb — pass hpl_kb_test to check "
+                             "the test Knowledge Bank.")
     parser.add_argument("--host", default=None,
                         help=f"Host to probe. Defaults to ${JOB_DB_HOST_ENV}, "
                              f"then $DB_HOST.")
@@ -348,19 +441,21 @@ def main() -> int:
                      "Pass --check-db to test connectivity.")
 
     try:
-        result = check_db_from_compute_node(args.host)
+        result = check_db_from_compute_node(args.host, database=args.database)
     except ValueError as e:
         print(f"Not checked: {e}")
         return 1
     print(f"host        {result['host']}:{result['port']}")
-    print(f"reachable   {result['reachable']}")
-    if not result["reachable"]:
-        print(f"stderr      {result['stderr'][:500]}")
-        print("\nStages 5 and 6 cannot run on Slurm until a compute node can "
-              "reach Postgres over TCP. Either configure Postgres to listen on "
-              "an interface the cluster can reach, or keep those stages running "
-              "in the server.")
-    return 0 if result["reachable"] else 1
+    print(f"database    {result['database']}")
+    print(f"tcp         {result['reachable']}")
+    print(f"connected   {result['usable']}")
+    if not result["usable"]:
+        if result["error"]:
+            print(f"error       {result['error']}")
+        if result["stderr"]:
+            print(f"stderr      {result['stderr'][:500]}")
+        print(f"\n{probe_advice(result)}")
+    return 0 if result["usable"] else 1
 
 
 if __name__ == "__main__":

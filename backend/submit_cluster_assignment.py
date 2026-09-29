@@ -49,6 +49,8 @@ from submit_feature_extraction import (
     MERGE_PARTITION,
     SINGULARITY_BIN,
     SINGULARITY_IMAGE,
+    bootstrap_container_extras,
+    _CONTAINER_EXTRA_PACKAGES_GPU,
     _bind_args,
     _check_container_extras,
     _check_singularity_image,
@@ -612,8 +614,14 @@ def _build_assignment_command(
     vote: list[str] | None = None,
     threads: int = 1,
     device: str = "cpu",
+    row_range: tuple[int, int] | None = None,
 ) -> str:
     """Shell command the Slurm --wrap runs.
+
+    shard_bounds is for a Slurm array (each task picks its range by
+    SLURM_ARRAY_TASK_ID); row_range is one fixed range, for a caller that runs
+    every shard as its own job with no array index — the Nextflow pipeline.
+    Both reach the container by the same SINGULARITYENV_ route.
 
     --nv only for device="gpu". The search is CPU work by default, and asking
     for the GPU runtime then would queue the job behind every real GPU job for
@@ -681,7 +689,17 @@ def _build_assignment_command(
         ]
     if query_mean is not None:
         args.append(f"--query-mean {shlex.quote(real(query_mean))}")
-    if shard_bounds is not None:
+    if shard_bounds is not None and row_range is not None:
+        raise ValueError("Pass shard_bounds (a Slurm array) or row_range (one "
+                         "fixed range), not both.")
+    if row_range is not None:
+        lo, hi = (int(v) for v in row_range)
+        outer_preamble = (
+            "set -euo pipefail; "
+            f"ROW_START={lo}; ROW_STOP={hi}; "
+            'echo "=== Rows $ROW_START-$ROW_STOP ==="; '
+        )
+    elif shard_bounds is not None:
         starts = " ".join(str(lo) for lo, _ in shard_bounds)
         stops = " ".join(str(hi) for _, hi in shard_bounds)
         outer_preamble = (
@@ -695,6 +713,7 @@ def _build_assignment_command(
             'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
             'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
         )
+    if shard_bounds is not None or row_range is not None:
         env_parts += [
             'SINGULARITYENV_ROW_START="$ROW_START"',
             'SINGULARITYENV_ROW_STOP="$ROW_STOP"',

@@ -14,6 +14,7 @@
 //
 // Every component receives the same props and ignores the ones it does not
 // need, so this stays a plain lookup rather than six call signatures.
+import AnorakStage from "./AnorakStage.jsx";
 import AssignmentStage from "./AssignmentStage.jsx";
 import ExtractionStage from "./ExtractionStage.jsx";
 import KbLoadStage from "./KbLoadStage.jsx";
@@ -28,4 +29,5 @@ export const STAGE_RENDERERS = {
   assignment: AssignmentStage,
   registration: RegistrationStage,
   kb_load: KbLoadStage,
+  anorak: AnorakStage,
 };

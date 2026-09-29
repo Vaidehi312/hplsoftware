@@ -177,7 +177,7 @@ function CohortShift({ submissionId }) {
 // inputs, because a half-applied configuration (distance weighting on but
 // the exponent left at 1, say) produces a complete CSV that isn't the
 // measured configuration.
-function VotePicker({ submissionId, onChange }) {
+export function VotePicker({ submissionId, onChange }) {
   const [presets, setPresets] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [chosen, setChosen] = useState("");

@@ -348,6 +348,105 @@ def test_recording_never_raises_into_the_jobs_exit_status(tmp_path):
         run_record.run_engine = original
 
 
+# --- the probe that says whether any of this can work ----------------------
+
+def _probe_stdout(tcp, connected, error=None):
+    """What the srun'd probe prints back."""
+    import json
+    return "container packages: ok\nHPL_DB_PROBE " + json.dumps(
+        {"tcp": tcp, "connected": connected, "error": error}) + "\n"
+
+
+def _fake_srun(stdout, returncode=0):
+    def run(argv, capture_output=True, text=True, timeout=None):
+        run.argv = argv
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout,
+                                           stderr="")
+    return run
+
+
+def test_a_socket_that_opens_but_cannot_authenticate_is_not_usable(_tmp=None):
+    """The state that cost job 1243329 five minutes and an hour of reading.
+
+    TCP succeeded, so the old check — socket.create_connection and nothing
+    more — reported reachable and said go. The job then failed on fe_sendauth,
+    because the server reaches Postgres over a unix socket where pg_hba says
+    peer and a compute node arrives over TCP where it says scram.
+    """
+    original = kb.subprocess.run
+    kb.subprocess.run = _fake_srun(_probe_stdout(
+        True, False,
+        'OperationalError: connection to server at "hpc-login-01" '
+        '(172.21.234.110), port 5432 failed: fe_sendauth: no password supplied'))
+    try:
+        result = kb.check_db_from_compute_node(host="hpc-login-01",
+                                               database="hpl_kb_test")
+    finally:
+        kb.subprocess.run = original
+
+    assert result["reachable"] is True, "the socket did open"
+    assert result["usable"] is False, "and the job still could not connect"
+    advice = kb.probe_advice(result)
+    assert "DB_PASS" in advice and "PGPASSFILE" in advice, advice
+
+
+def test_a_working_database_is_usable_and_needs_no_advice(_tmp=None):
+    original = kb.subprocess.run
+    kb.subprocess.run = _fake_srun(_probe_stdout(True, True))
+    try:
+        result = kb.check_db_from_compute_node(host="hpc-login-01",
+                                               database="hpl_kb_test")
+    finally:
+        kb.subprocess.run = original
+    assert result["usable"] is True
+    assert kb.probe_advice(result) == ""
+
+
+def test_nothing_listening_is_reported_as_the_different_problem_it_is(_tmp=None):
+    """Different fix: listen_addresses or a firewall, not a password."""
+    original = kb.subprocess.run
+    kb.subprocess.run = _fake_srun(_probe_stdout(
+        False, False, "ConnectionRefusedError: [Errno 111] Connection refused"))
+    try:
+        result = kb.check_db_from_compute_node(host="hpc-login-01")
+    finally:
+        kb.subprocess.run = original
+    assert (result["reachable"], result["usable"]) == (False, False)
+    assert "listen_addresses" in kb.probe_advice(result)
+
+
+def test_a_missing_database_is_not_read_as_an_auth_problem(_tmp=None):
+    """hpl_kb_test not existing on that server looks identical from the server."""
+    original = kb.subprocess.run
+    kb.subprocess.run = _fake_srun(_probe_stdout(
+        True, False, 'OperationalError: FATAL: database "hpl_kb_test" does not exist'))
+    try:
+        result = kb.check_db_from_compute_node(host="hpc-login-01",
+                                               database="hpl_kb_test")
+    finally:
+        kb.subprocess.run = original
+    advice = kb.probe_advice(result)
+    assert "not a database" in advice and "DB_PASS" not in advice, advice
+
+
+def test_the_probe_asks_about_the_database_it_was_given(_tmp=None):
+    """A probe against the wrong database answers a question nobody asked."""
+    original = kb.subprocess.run
+    fake = _fake_srun(_probe_stdout(True, True))
+    kb.subprocess.run = fake
+    try:
+        kb.check_db_from_compute_node(host="hpc-login-01", database="hpl_kb_test")
+    finally:
+        kb.subprocess.run = original
+    probe_source = fake.argv[-1]
+    assert "'hpl_kb_test'" in probe_source
+    assert "'hpc-login-01'" in probe_source
+    # The job's own credentials, not this process's: sbatch passes the
+    # submitting environment through, and DB_PASS empty must stay empty so
+    # libpq still reads a passfile.
+    assert "os.getenv('DB_PASS') or None" in probe_source
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

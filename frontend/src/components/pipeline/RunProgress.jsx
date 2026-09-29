@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../../api";
 import { usePolling } from "../../hooks/usePolling";
 import {
+  PIPELINE_STAGES,
   describeJobParams,
   displayStage,
   errorDetail,
@@ -20,6 +21,7 @@ import {
 } from "./utils";
 import { Alert, Button, Expander } from "./widgets";
 import { STAGE_RENDERERS } from "./stages/index.js";
+import PipelineStage, { PipelineOverview } from "./stages/PipelineStage.jsx";
 
 // Port of _render_job_history(): every Slurm job this run has submitted,
 // across every stage — the run's own status fields only hold one attempt
@@ -145,6 +147,13 @@ export default function RunProgress({ submissionId, job }) {
   // see that module for why. Every stage gets the same props and ignores what
   // it does not use.
   const renderStep = (s) => {
+    // A pipeline run's Stages 1-4 have no buttons of their own — the pipeline
+    // starts each once the one before has verified its output.
+    if (status.pipeline && PIPELINE_STAGES.includes(s.key)) {
+      return (
+        <PipelineStage stage={s.key} status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />
+      );
+    }
     const Stage = STAGE_RENDERERS[s.key];
     if (!Stage) return null;
     return (
@@ -173,6 +182,8 @@ export default function RunProgress({ submissionId, job }) {
       {stage === "cancelled" && (
         <Alert type="info">This run was cancelled. Stages already finished on disk are still usable.</Alert>
       )}
+
+      {status.pipeline && <PipelineOverview status={status} />}
 
       {steps.map((step) => (
         <Expander

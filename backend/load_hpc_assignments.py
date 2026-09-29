@@ -47,6 +47,7 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db_url import database_url  # noqa: E402
 import kb_stage  # noqa: E402
 from run_record import record_run  # noqa: E402
 from slide_naming import (  # noqa: E402
@@ -109,13 +110,14 @@ _QUERY_WORKERS = 4
 
 def make_engine():
     return create_engine(
-        f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+        database_url(DB_NAME, user=DB_USER, password=DB_PASS,
+                     host=DB_HOST, port=DB_PORT),
         pool_pre_ping=True,
     )
 
 
 def _read_csv(csv_path: Path) -> pd.DataFrame:
-    """The CSV, read on as many cores as the installed pandas will use.
+    """The CSV as text, read on as many cores as the installed pandas will use.
 
     A 7.8M-row assignment CSV is minutes of single-threaded parsing on pandas'
     default C engine; the pyarrow engine threads the parse. The fallback is not
@@ -124,17 +126,60 @@ def _read_csv(csv_path: Path) -> pd.DataFrame:
     reader that raised on a machine without it would take Stage 6 down for a
     speedup.
 
-    Values are identical either way. Dtypes are not guaranteed to be, which is
-    why nothing downstream trusts them: the confidence columns go through
-    to_numeric and the name columns through astype(str) regardless of which
-    reader produced them.
+    Every column comes back as the literal text in the file, with no NA
+    guessing (`dtype=str, keep_default_na=False`), and both readers agree on
+    that exactly. Letting pandas infer types is a rewrite of the identifier
+    columns rather than a reading of them: an all-digit slide id loses its
+    zeros ('007' -> 7), one blank or 'NA' anywhere in the column turns every
+    other id in it into a float ('1001' -> 1001.0), and a slide or sample
+    actually called 'NA', 'None' or 'null' becomes NaN. slide_tile is built
+    from those values, so the key comes out as '1001.0_18_15.JPEG' — which
+    joins nothing, or joins a different slide that really is called '7'. The
+    numeric columns are converted by name in read_assignments(), where a blank
+    is still a blank and can be refused as one.
     """
     try:
-        return pd.read_csv(csv_path, engine="pyarrow")
+        return _read_csv_threaded(csv_path)
     except Exception as e:  # noqa: BLE001 - any reader failure falls back
         print(f"  (threaded CSV reader unavailable: {type(e).__name__}: {e}; "
               f"using the default single-threaded reader)", file=sys.stderr)
-        return pd.read_csv(csv_path)
+        return _read_csv_default(csv_path)
+
+
+def _read_csv_default(csv_path: Path) -> pd.DataFrame:
+    return pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+
+
+def _read_csv_threaded(csv_path: Path) -> pd.DataFrame:
+    """pyarrow's reader, told every column is a string before it parses.
+
+    Not `pd.read_csv(engine="pyarrow", dtype=str)`, which looks equivalent and
+    is not: that engine lets pyarrow infer each column first and casts the
+    result afterwards, so '007' is parsed as the integer 7 and handed back as
+    the string '7'. Only pyarrow's own column_types reaches the parser.
+    """
+    import csv
+    import pyarrow as pa
+    import pyarrow.csv as pa_csv
+
+    with open(csv_path, newline="") as handle:
+        header = next(csv.reader(handle), None)
+    if not header:
+        raise ValueError("no header row")
+    if len(set(header)) != len(header):
+        # pandas renames a repeated column ('x', 'x.1'); pyarrow keeps both
+        # under one name. Left to the default reader so the two cannot differ.
+        raise ValueError(f"repeated column name(s) in {header}")
+    table = pa_csv.read_csv(csv_path, convert_options=pa_csv.ConvertOptions(
+        column_types={name: pa.string() for name in header},
+        null_values=[], strings_can_be_null=False,
+        quoted_strings_can_be_null=False))
+    return table.to_pandas()
+
+
+def _blank(values: pd.Series) -> pd.Series:
+    """Empty after stripping — what an absent field is once read as text."""
+    return values.isna() | (values.astype(str).str.strip() == "")
 
 
 def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
@@ -180,11 +225,18 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
     # with the offending values rather than coerced: a file with a stray row in
     # it is a file whose row count nobody should trust, and dropping the row
     # quietly would leave a cohort short by an unknown amount.
+    #
+    # The columns arrive as text (see _read_csv), so a blank field is "" here,
+    # not NaN. It is excluded from this check and becomes NaN, so an empty
+    # vote_margin still reaches its own refusal below rather than being called
+    # "not a number" — or, worse, coerced to 0. 'NA' or 'nan' written into a
+    # margin is not blank, and is refused here as the non-number it is.
     for column in _CONFIDENCE:
         if column not in frame.columns:
             continue
-        coerced = pd.to_numeric(frame[column], errors="coerce")
-        bad = coerced.isna() & frame[column].notna()
+        empty = _blank(frame[column])
+        coerced = pd.to_numeric(frame[column].where(~empty), errors="coerce")
+        bad = coerced.isna() & ~empty
         if bad.any():
             examples = frame.loc[bad, column].astype(str).head(5).tolist()
             raise SystemExit(
@@ -198,6 +250,26 @@ def read_assignments(csv_path: Path) -> tuple[pd.DataFrame, str]:
                 f"source rather than believing the parts."
             )
         frame[column] = coerced
+
+    # An identity field that is empty. Read as text, a blank slide or tile is
+    # "" rather than NaN, and would build the key '_18_15.JPEG' — a row that
+    # joins nothing and hides inside the 5% the match-rate guard allows, while
+    # its cluster still counts toward a slide called ''. A blank cluster id is
+    # the same torn row from the other side: it used to become NaN, which a
+    # text hpc_id column receives as the string 'nan'. Refused by name; a blank
+    # *sample* is not, because it is not part of any key this stage joins on,
+    # and select_tumour_slides.py refuses it itself with its own reasons.
+    for column in ("slides", "tiles", cluster_columns[0]):
+        empty = _blank(frame[column])
+        if empty.any():
+            rows = (frame.index[empty][:5] + 2).tolist()   # 1-based, after header
+            raise SystemExit(
+                f"{csv_path} has {int(empty.sum()):,} row(s) with an empty "
+                f"{column}, e.g. at line(s) {rows}. assign_hpc_clusters.py "
+                f"writes every one of these for every row, so this is a torn "
+                f"or hand-edited file rather than a tile without one. Check "
+                f"the row count against the projections .h5 before loading."
+            )
 
     verdict = tile_name_verdict(frame["tiles"])
     if verdict == "mixed":
@@ -537,6 +609,27 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str,
     matched = set(present["slide_tile"])
     assigned = frame[cluster_column].astype(str).str.strip()
 
+    # What tile_registry.hpc_id actually is, and whether this CSV's cluster
+    # column can be written into it. Reported here because the preview stages
+    # only the join key: without it, the dry run is clean and the commit is
+    # what discovers the type mismatch, 18.5M COPYed rows later.
+    cluster_type = kb_stage.cluster_stage_type(engine)
+    unwritable, unwritable_examples = kb_stage.unwritable_cluster_ids(
+        assigned, cluster_type)
+
+    # Render the IDs the way the integer column will hold them before comparing
+    # them to hpc_dictionary. A cluster column with a single missing value reads
+    # as float64, so astype(str) gives "45.0" while the dictionary's integer
+    # column gives "45" — and every ID in the cohort is then reported as having
+    # no dictionary row. That refusal is believable and names the wrong cause,
+    # which is the failure this file is written against.
+    if kb_stage.is_integer_type(cluster_type):
+        numbers = pd.to_numeric(assigned, errors="coerce")
+        whole = numbers.notna() & (numbers == numbers.round())
+        if whole.any():
+            assigned = assigned.mask(
+                whole, numbers.where(whole).astype("Int64").astype(str))
+
     already = present[present["hpc_id"].notna()]
     other_reference = already[
         already["hpc_reference"].notna()
@@ -557,6 +650,11 @@ def inspect(engine, frame: pd.DataFrame, cluster_column: str,
         # the tile gets a cluster but no pattern, malignancy or inflammation.
         "unknown_clusters": sorted(set(assigned) - set(clusters)),
         "known_clusters": len(clusters),
+        # The column's real type, and how many cluster IDs it cannot hold. A
+        # non-zero count here is a refusal at commit, not a warning.
+        "cluster_column_type": cluster_type,
+        "unwritable_cluster_ids": unwritable,
+        "unwritable_cluster_examples": unwritable_examples,
         "overwriting": int(len(already)),
         "overwriting_other_reference": int(len(other_reference)),
         "distribution": assigned.value_counts().head(5).to_dict(),
@@ -610,9 +708,14 @@ def load(engine, frame: pd.DataFrame, cluster_column: str, *,
     owned = None
     if stage is None:
         owned = kb_stage.stage_table_name("kb_load")
+        # Read off tile_registry.hpc_id rather than assumed: see
+        # kb_stage.cluster_stage_type. Both the DDL and the staged values depend
+        # on it, so it is resolved once, here, before anything is written.
+        cluster_type = kb_stage.cluster_stage_type(engine)
         timing["stage"] = timing.get("stage", 0.0) + kb_stage.stage_frame(
-            engine, owned, kb_stage.build_stage_frame(frame, cluster_column),
-            workers=stage_workers)
+            engine, owned,
+            kb_stage.build_stage_frame(frame, cluster_column, cluster_type),
+            workers=stage_workers, cluster_type=cluster_type)
         stage = owned
 
     updated = 0
@@ -813,6 +916,44 @@ def _existing_columns(conn, table: str) -> set[str]:
     return {c["name"] for c in sqlalchemy_inspect(conn).get_columns(table)}
 
 
+def _catch_up_id_sequence(conn, table: str) -> int | None:
+    """Advance `table`'s serial id sequence past its largest id, if it lags.
+
+    Both aggregate tables take `id` from a sequence, and the INSERT below names
+    no id. A sequence behind MAX(id) — what a data-only restore or a COPY with
+    explicit ids leaves, since neither calls setval — hands out an id a row
+    already holds: on 2026-09-27 the RADIOGENOMICS load of 18.5M tiles failed
+    at its very last statement on `hpl_profile_summary_pkey (id)=(1)`, and the
+    single transaction took every tile update back with it. Nothing references
+    `id` (both foreign keys into hpl_profile_summary are on (samples, slides)),
+    so moving the sequence forward can put no row in the wrong place; it is only
+    ever moved forward, and the move is reported.
+
+    Postgres only — SQLite's INTEGER PRIMARY KEY picks max+1 itself. setval is
+    not transactional, so a later rollback keeps the advance, which is harmless.
+    Returns the new value, or None when nothing was changed.
+    """
+    if conn.dialect.name != "postgresql":
+        return None
+    sequence = conn.execute(
+        text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table}).scalar()
+    if not sequence:
+        return None
+    largest = conn.execute(text(f"SELECT MAX(id) FROM {table}")).scalar()
+    if largest is None:
+        return None
+    last = conn.execute(
+        text("SELECT pg_sequence_last_value(CAST(:s AS regclass))"), {"s": sequence}).scalar()
+    if last is not None and last >= largest:
+        return None
+    conn.execute(text("SELECT setval(CAST(:s AS regclass), :v)"),
+                 {"s": sequence, "v": int(largest)})
+    print(f"  {table}: id sequence {sequence} was at {last}, behind MAX(id) "
+          f"{largest}; advanced it to {largest} so the insert cannot reuse an id",
+          file=sys.stderr)
+    return int(largest)
+
+
 def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> dict:
     """Swap in the aggregates for just the slides being loaded.
 
@@ -943,6 +1084,8 @@ def replace_profiles(conn, proportions: pd.DataFrame, summary: pd.DataFrame) -> 
 
     _delete("hpl_profile_proportion")
     _delete("hpl_profile_summary")
+    for table in ("hpl_profile_summary", "hpl_profile_proportion"):
+        _catch_up_id_sequence(conn, table)
     written = {
         "hpl_profile_summary": _insert("hpl_profile_summary", summary),
         "hpl_profile_proportion": _insert("hpl_profile_proportion", proportions),
@@ -1106,12 +1249,14 @@ def main() -> None:
     # Staged once and used by both the preview and the write. A dry run only
     # ever reads the keys, so it does not pay to ship the payload columns it
     # will not look at.
-    stage_frame = (kb_stage.build_stage_frame(frame, cluster_column)
+    cluster_type = kb_stage.cluster_stage_type(engine)
+    stage_frame = (kb_stage.build_stage_frame(frame, cluster_column, cluster_type)
                    if args.commit else frame[["slide_tile"]])
     stage = kb_stage.stage_table_name("kb_load")
     try:
         timing["stage"] = kb_stage.stage_frame(
-            engine, stage, stage_frame, workers=max(1, args.stage_workers))
+            engine, stage, stage_frame, workers=max(1, args.stage_workers),
+            cluster_type=cluster_type)
         _run(args, engine, frame, cluster_column, stage, timing, started)
     finally:
         with engine.begin() as conn:
@@ -1187,6 +1332,16 @@ def _run(args, engine, frame, cluster_column, stage, timing, started) -> None:
             f"difference between the .h5 and the registry, not missing tiles — "
             f"check the unmatched examples above against "
             f"`SELECT slide_tile FROM tile_registry LIMIT 5`."
+        )
+    if report.get("unwritable_cluster_ids"):
+        problems.append(
+            f"{report['unwritable_cluster_ids']:,} cluster ID(s) are not whole "
+            f"numbers, and tile_registry.hpc_id is "
+            f"{report['cluster_column_type']}: "
+            f"{report['unwritable_cluster_examples']}. No flag makes these "
+            f"writable — the assignment CSV's cluster column is wrong. This is "
+            f"the check that turns job 1243334's failed UPDATE into a refusal "
+            f"before any row is staged."
         )
     if report["unknown_clusters"] and not args.allow_unknown_clusters:
         problems.append(

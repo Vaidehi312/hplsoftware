@@ -41,6 +41,7 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db_url import database_url  # noqa: E402
 from slide_naming import (  # noqa: E402
     make_slide_tile_series,
     normalize_tile_names,
@@ -55,7 +56,8 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 
 def engine_for(db_name: str):
     return create_engine(
-        f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{db_name}",
+        database_url(db_name, user=DB_USER, password=DB_PASS,
+                     host=DB_HOST, port=DB_PORT),
         pool_pre_ping=True,
     )
 

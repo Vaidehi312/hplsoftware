@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, KB_PRODUCTION, KB_TEST } from "./api";
 import PipelinePanel from "./components/pipeline";
 import SlideViewer from "./components/viewer";
+import ChatPanel from "./components/chat/ChatPanel.jsx";
 import { clearHpcReferenceCache } from "./components/viewer/hpcReferenceCache.js";
 import "./App.css";
 
@@ -147,6 +148,12 @@ function App() {
         </aside>
 
         <main className="app-main">
+          {/* Chat first, matching app_v28.py's layout (chat above the slide
+              picker/viewer). Naming a slide in chat calls setSlideId directly
+              — in this UI there is no separate open/close toggle for the
+              viewer, so setting the active slide already is "opening" it. */}
+          <ChatPanel key={`chat-${kbTarget}`} slideId={slideId} onOpenSlide={setSlideId} />
+
           {/* Distinct key prefixes: these two are siblings, and React requires
               keys to be unique among siblings — a bare kbTarget on both is a
               duplicate-key error, which it reports as a warning and then

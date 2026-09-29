@@ -837,12 +837,21 @@ def _build_extraction_command(
     batch_size: int,
     extras_dir: Path,
     shard_bounds: list[tuple[int, int]] | None = None,
+    row_range: tuple[int, int] | None = None,
 ) -> str:
     """Shell command the Slurm --wrap runs: probe GPU, check imports, encode.
 
     --cleanenv keeps the host's broken CUDA stubs out of LD_LIBRARY_PATH;
     --nv is what actually injects the driver's libcuda into the container.
+
+    shard_bounds is for a Slurm array: each task picks its range by
+    SLURM_ARRAY_TASK_ID. row_range is one fixed range, for a caller that runs
+    each shard as its own job with no array index — the Nextflow pipeline,
+    where every shard is a separate task. Exactly one or neither.
     """
+    if shard_bounds is not None and row_range is not None:
+        raise ValueError("Pass shard_bounds (a Slurm array) or row_range (one "
+                         "fixed range), not both.")
     binds = _bind_args(
         hpl_repo_dir, real_hdf5_path, checkpoint, singularity_image, extras_dir
     )
@@ -900,27 +909,51 @@ def _build_extraction_command(
         )
     )
 
-    # For an array job the row range comes from the task index. The bounds are
-    # baked in as shell arrays rather than recomputed in the job: the split has
-    # to be identical to the one the merge step will check against, and
-    # recomputing it in two places is how those drift apart.
+    # The row range, resolved OUTSIDE the container and handed in through the
+    # environment. It used to be resolved in here, from SLURM_ARRAY_TASK_ID —
+    # which `singularity exec --cleanenv` has already wiped by then, so under
+    # `set -u` every array task aborted the moment the import check finished.
+    # That is the bug CLAUDE.md records for Stage 4, found there first; this is
+    # the same fix. SINGULARITYENV_/APPTAINERENV_ are the documented route
+    # through --cleanenv, and both prefixes are set because the binary may be
+    # either.
     #
-    # Under `set -u` an unset SLURM_ARRAY_TASK_ID aborts here, which is what we
-    # want — it means a sharded command was submitted as a plain job, and the
-    # alternative is one task silently encoding the wrong range.
-    shard_preamble = ""
+    # For an array the bounds are baked in as shell arrays rather than
+    # recomputed in the job: the split has to be identical to the one the
+    # merge step will check against, and recomputing it in two places is how
+    # those drift apart. The index is still read under `set -u`, out here,
+    # where an unset one really does mean a sharded command was submitted as
+    # a plain job — and one task silently encoding the wrong range is worse
+    # than a refusal.
+    outer_preamble = ""
+    env_prefix = ""
     row_args = ""
-    if shard_bounds is not None:
-        starts = " ".join(str(lo) for lo, _ in shard_bounds)
-        stops = " ".join(str(hi) for _, hi in shard_bounds)
-        shard_preamble = (
-            f"SHARD_STARTS=({starts}); "
-            f"SHARD_STOPS=({stops}); "
-            'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
-            'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
-            'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
+    if shard_bounds is not None or row_range is not None:
+        if shard_bounds is not None:
+            starts = " ".join(str(lo) for lo, _ in shard_bounds)
+            stops = " ".join(str(hi) for _, hi in shard_bounds)
+            outer_preamble = (
+                "set -euo pipefail; "
+                f"SHARD_STARTS=({starts}); "
+                f"SHARD_STOPS=({stops}); "
+                'ROW_START="${SHARD_STARTS[$SLURM_ARRAY_TASK_ID]}"; '
+                'ROW_STOP="${SHARD_STOPS[$SLURM_ARRAY_TASK_ID]}"; '
+                'echo "=== Shard $SLURM_ARRAY_TASK_ID: rows $ROW_START-$ROW_STOP ==="; '
+            )
+        else:
+            lo, hi = (int(v) for v in row_range)
+            outer_preamble = (
+                "set -euo pipefail; "
+                f"ROW_START={lo}; ROW_STOP={hi}; "
+                'echo "=== Rows $ROW_START-$ROW_STOP ==="; '
+            )
+        env_prefix = (
+            'SINGULARITYENV_ROW_START="$ROW_START" '
+            'SINGULARITYENV_ROW_STOP="$ROW_STOP" '
+            'APPTAINERENV_ROW_START="$ROW_START" '
+            'APPTAINERENV_ROW_STOP="$ROW_STOP" '
         )
-        row_args = " --row_start $ROW_START --row_stop $ROW_STOP"
+        row_args = ' --row_start "$ROW_START" --row_stop "$ROW_STOP"'
 
     encode = (
         f"cd {shlex.quote(repo_in_job)} && "
@@ -971,11 +1004,10 @@ def _build_extraction_command(
         "echo 'all inputs visible'; "
         "echo '=== Container packages ==='; "
         f"{import_check}; "
-        f"{shard_preamble}"
         "echo '=== Feature extraction ==='; "
         f"{encode}"
     )
-    return " ".join([
+    return outer_preamble + env_prefix + " ".join([
         shlex.quote(singularity_bin),
         "exec",
         "--nv",

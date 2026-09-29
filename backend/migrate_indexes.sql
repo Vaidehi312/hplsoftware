@@ -114,6 +114,24 @@ CREATE INDEX IF NOT EXISTS idx_tc_slides_upper
     ON tile_coordinates (UPPER(TRIM(slides)));
 CREATE INDEX IF NOT EXISTS idx_wr_slide_id_upper
     ON wsi_registry (UPPER(slide_id));
+-- slide_hpc_membership is deleted per slide on every Stage 6 refresh, with
+-- `WHERE UPPER(TRIM(slide_id)) IN :slides`. Nothing normalises this table's
+-- slide_id — the UPDATEs above cover tile_coordinates, tile_registry,
+-- wsi_registry and the profiles, not this one — so the TRIM in that query is
+-- load-bearing, and the index has to be on the same expression rather than the
+-- query being simplified to match a plainer index. Its primary key leads with
+-- the bare column, which this expression cannot use.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema()
+                 AND table_name = 'slide_hpc_membership') THEN
+        CREATE INDEX IF NOT EXISTS idx_shm_slide_id_upper
+            ON slide_hpc_membership (UPPER(TRIM(slide_id)));
+    ELSE
+        RAISE NOTICE 'slide_hpc_membership absent; its index was not created.';
+    END IF;
+END$$;
 -- wsi_metadata is checked by the same collision guard. Guarded by existence:
 -- it is one of the tables migrate_kb_base_tables.sql adds, and CREATE INDEX
 -- still raises when the table is absent.

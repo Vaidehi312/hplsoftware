@@ -621,13 +621,29 @@ def detect_entity_patterns(query: str) -> dict:
     q = (query or "").strip().lower()
 
     def after(keyword):
-        m = re.search(rf"{keyword}\s*[:=]?\s*([^\s,;]+)", q, re.I)
+        # (?![a-z]) blocks the keyword's own plural "s" glued on with no
+        # separator: "hpcs"/"slides"/"tiles"/"samples" — all extremely
+        # natural phrasings ("which slides have...", "how many tiles...") —
+        # used to match the bare keyword and then capture their own trailing
+        # "s" as if it were the identifier (slide_match=="s", etc.), which
+        # silently skipped the real, digit/pattern-anchored fallback regexes
+        # below since those only run `if not <keyword>_match`. Still allows
+        # "hpc40"/"hpc:40"/"hpc-40" — a digit or punctuation right after the
+        # keyword, never a letter.
+        m = re.search(rf"{keyword}(?![a-z])\s*[:=]?\s*([^\s,;]+)", q, re.I)
         return m.group(1).strip() if m else None
 
     tile_match = after("tile")
     slide_match = after("slide")
     sample_match = after("sample")
     hpc_match = after("hpc")
+    if hpc_match and not re.search(r"\d", hpc_match):
+        # "hpc" used generically with nothing numeric nearby ("how many
+        # tiles does this hpc have" captured hpc_match=="have") — not a real
+        # ID. Drop it so the digit-anchored fallback just below gets a
+        # chance to correctly find nothing, rather than keeping a captured
+        # English word that int(hpc_id) will only fail on downstream.
+        hpc_match = None
     if slide_match is None:
         m = re.search(r"\b(TCGA-[A-Z0-9\-]+-?DX\d+)\b", query or "", re.I)
         if m:

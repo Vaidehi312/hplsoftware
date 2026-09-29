@@ -649,6 +649,29 @@ def test_the_conflicting_sample_check_can_fail(tmp_path):
     assert plan["conflicting_samples"] == []
 
 
+def test_numeric_slide_ids_in_stage1_metadata_still_join_the_h5(tmp_path):
+    """Stage 1's CSV spells the slide the way the .h5 does, but pandas reads an
+    all-digit slides column as numbers: '007' comes back as 7, and 'NA' as NaN.
+    The coordinates' key is then '7_1_1.JPEG' against the .h5's '007_1_1.JPEG',
+    and registration reports tiles_with_coordinates: 0 for slides that were
+    tiled perfectly well."""
+    h5_path = tmp_path / "packaged.h5"
+    _write_h5(h5_path, [("S1", "007", "1_1.jpeg"), ("S2", "NA", "2_2.jpeg"),
+                        ("S3", "1001", "3_3.jpeg")])
+    tile_dir = tmp_path / "tiles"
+    _write_metadata(tile_dir, "Radiogenomics", "007", [(1, 1)])
+    _write_metadata(tile_dir, "Radiogenomics", "NA", [(2, 2)])
+    _write_metadata(tile_dir, "Radiogenomics", "1001", [(3, 3)])
+
+    plan = rd.build_registration(h5_path, tile_dir, "Radiogenomics",
+                                 str(h5_path), "RADIOGENOMICS")
+
+    assert sorted(plan["coordinates"]["slide_tile"]) == [
+        "007_1_1.JPEG", "1001_3_3.JPEG", "NA_2_2.JPEG"], \
+        plan["coordinates"]["slide_tile"].tolist()
+    assert sorted(plan["coordinates"]["slides"]) == ["007", "1001", "NA"]
+
+
 def test_committing_to_a_database_without_the_base_tables_is_refused(tmp_path):
     """A database built from schema.sql has no wsi_registry at all. Refuse with
     the migration to run, rather than raising an OperationalError naming a

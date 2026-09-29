@@ -112,6 +112,11 @@ export const DELIVERABLE_ICON = {
   interrupted: "\u{1F7E0}",
 };
 
+// Must match IN_FLIGHT_SLURM_STATES in tile_server_v2_.py. It lacked
+// CONFIGURING (nodes allocated, prologue still running — squeue reports it
+// first now), so a job Slurm was starting read here as "did not finish" and got
+// a Retry button. Stages whose submit guard matters (ANORAK) also get the
+// server's own verdict in /status rather than trusting this copy.
 export const SLURM_IN_FLIGHT = new Set([
   "PENDING",
   "RUNNING",
@@ -119,6 +124,7 @@ export const SLURM_IN_FLIGHT = new Set([
   "RESIZING",
   "SUSPENDED",
   "COMPLETING",
+  "CONFIGURING",
 ]);
 
 // Port of _describe_job_params(stage, params): the one line that tells two
@@ -232,6 +238,53 @@ export function displayStage(status) {
 // Port of _pipeline_steps(status): classifies all 6 stages at once from a
 // single /status response so the whole pipeline can be shown, not just
 // whichever stage happens to be "current".
+// Stages 1-4 of a pipeline run (POST /pipeline-runs) are one Nextflow run.
+// Port of _pipeline_stage_states in app_v28.py: "done" still means the
+// server's own validator accepted the stage's output; no stage has a button
+// of its own — the pipeline starts each once the one before has verified.
+export const PIPELINE_STAGES = ["tiling", "packaging", "extraction", "assignment"];
+const PIPELINE_STAGE_NAME = {
+  tiling: "tiling", packaging: "packaging", extraction: "feature extraction", assignment: "classification",
+};
+const PIPELINE_STAGE_READY = {
+  packaging: "h5_ready", extraction: "extraction_ready", assignment: "assignment_ready",
+};
+
+export function pipelineStageVerified(status, stage) {
+  const info = ((status.pipeline || {}).stages || {})[stage] || {};
+  if (stage === "tiling") return info.state === "COMPLETED" && Boolean(status.tiling_complete);
+  return Boolean(status[PIPELINE_STAGE_READY[stage]]);
+}
+
+export function pipelineStageStates(status, computed) {
+  const stages = (status.pipeline || {}).stages || {};
+  const out = [];
+  let previousDone = true;
+  PIPELINE_STAGES.forEach((stage, i) => {
+    const slurm = (stages[stage] || {}).state;
+    let result;
+    if (pipelineStageVerified(status, stage)) {
+      result = ["done", computed[i][1]];
+    } else if (slurm === "COMPLETED") {
+      // The task said done, the server's validator disagrees — never hidden.
+      result = ["attention", "pipeline marked it done, but the output fails validation"];
+    } else if (slurm === "RUNNING") {
+      result = ["running", "running in the pipeline"];
+    } else if (SLURM_IN_FLIGHT.has(slurm)) {
+      result = ["blocked", previousDone ? "queued in the pipeline" : `waits for ${PIPELINE_STAGE_NAME[PIPELINE_STAGES[i - 1]]}`];
+    } else if (slurm == null) {
+      result = ["attention", "can't reach Slurm — state unknown"];
+    } else if (previousDone) {
+      result = ["failed", `pipeline stopped here (${slurm})`];
+    } else {
+      result = ["blocked", "not reached"];
+    }
+    out.push(result);
+    previousDone = result[0] === "done";
+  });
+  return out;
+}
+
 export function pipelineSteps(status) {
   const stage = status.status;
   const total = status.total_slides;
@@ -395,6 +448,48 @@ export function pipelineSteps(status) {
     kbLoad = ["action", "ready to load"];
   }
 
+  // --- 7. ANORAK growth-pattern grading -------------------------------------
+  // Not gated on anything Stages 1-6 produce: ANORAK does its own tiling at its
+  // own resolution and reads the raw slides, so it shares no artifact with
+  // them. What it needs from them is the *slide list* — the cohort's tumour
+  // slides, which come from the cluster composition Stage 6 loads. So this is
+  // "action" as soon as there is something to grade, and the summary names
+  // which list it is about to use rather than assuming one.
+  let anorak;
+  if (status.anorak_ready) {
+    const scope = status.anorak_scope;
+    const slides = status.anorak_slides;
+    let detail = slides ? `${fmtInt(slides)} slides` : "complete";
+    if (scope === "subset") detail += ` (random subset, seed ${status.anorak_seed})`;
+    anorak = ["done", `growth patterns graded · ${detail}`];
+  } else if (status.anorak_in_flight || SLURM_IN_FLIGHT.has(status.anorak_slurm_state)) {
+    // The head job being alive is all this says. It submits a job per slide
+    // per stage itself, so its own state carries no progress.
+    anorak = ["running", `pipeline running (${status.anorak_slurm_state})`];
+  } else if (status.anorak_job_id && status.anorak_state_unknown) {
+    // Not "did not finish": Slurm could not be asked, so the head job may well
+    // be alive — and the server refuses a new submission until it can.
+    anorak = ["attention", "state unknown — Slurm unreachable"];
+  } else if (status.anorak_job_id) {
+    if (status.anorak_invalid_reason) {
+      anorak = ["attention", "finished without a usable grading table"];
+    } else {
+      anorak = ["attention", `did not finish (${status.anorak_slurm_state || "no Slurm record"})`];
+    }
+  } else if (status.kb_load_done) {
+    anorak = ["action", "ready to run"];
+  } else {
+    // Deliberately not "blocked": a slide list chosen some other way is a
+    // perfectly good input, and blocking would hide the form that takes one.
+    anorak = ["action", "ready to run (needs a tumour-slide list)"];
+  }
+
+  if (status.pipeline) {
+    [tiling, packaging, extraction, assignment] = pipelineStageStates(status, [
+      tiling, packaging, extraction, assignment,
+    ]);
+  }
+
   return [
     { key: "tiling", title: "1. Tiling", state: tiling[0], summary: tiling[1] },
     { key: "packaging", title: "2. Packaging (.h5)", state: packaging[0], summary: packaging[1] },
@@ -402,6 +497,7 @@ export function pipelineSteps(status) {
     { key: "assignment", title: "4. Cluster classification", state: assignment[0], summary: assignment[1] },
     { key: "registration", title: "5. Register in the Knowledge Bank", state: registration[0], summary: registration[1] },
     { key: "kb_load", title: "6. Knowledge Bank load", state: kbLoad[0], summary: kbLoad[1] },
+    { key: "anorak", title: "7. Growth patterns (ANORAK)", state: anorak[0], summary: anorak[1] },
   ];
 }
 

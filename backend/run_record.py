@@ -28,6 +28,7 @@ import sys
 
 from sqlalchemy import create_engine, text
 from sqlalchemy import inspect as sqlalchemy_inspect
+from db_url import database_url
 
 
 def run_engine(run_db_name: str):
@@ -36,7 +37,8 @@ def run_engine(run_db_name: str):
     host = os.getenv("DB_HOST", "127.0.0.1")
     port = os.getenv("DB_PORT", "5432")
     return create_engine(
-        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{run_db_name}",
+        database_url(run_db_name, user=user, password=password,
+                     host=host, port=port),
         pool_pre_ping=True,
     )
 

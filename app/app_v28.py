@@ -20,11 +20,26 @@ import os
 import time
 import json
 import requests
+from urllib.parse import quote
 from api_client import TileServerClient
 from hpc_chat_handlers_v23 import detect_entity_patterns as chat_detect_entity_patterns
 from hpc_chat_handlers_v23 import fetch_answer_from_db as chat_fetch_answer_from_db
 
 detect_entity_patterns = chat_detect_entity_patterns
+
+# backend/ holds the definitions the pipeline and the UI have to agree on. This
+# one is what hpc_dictionary.malignant means — a loosely typed column whose type
+# kb_live_schema_2026-08-26.txt never captured — and it is now read by
+# backend/select_tumour_slides.py to decide which slides ANORAK runs on at all.
+# Imported rather than reimplemented because this file already held three
+# normalisations of that column and they did not agree: color_for_malignant()
+# below did not recognise "malignant"/"non-malignant", so a dictionary row
+# spelled that way rendered grey in the viewer while the tile filter counted it
+# correctly.
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+from malignancy import describe_malignant, malignant_flag  # noqa: E402
+from db_url import database_url, safe_text  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -37,6 +52,22 @@ st.title("🧠 HPC Chatbot")
 # Tile server client (talks to FastAPI on HPCC)
 # ---------------------------------------------------------------------------
 TILE_SERVER_URL = os.getenv("TILE_SERVER_URL", "http://localhost:8000")
+
+# The same server, as the *browser* has to reach it — which is not always the
+# same address this process reaches it at. Nearly every call here is made
+# server-side by requests, but OpenSeadragon's are made by the viewer's browser,
+# so over an SSH tunnel the two differ: this process talks to localhost:8000 on
+# the machine Streamlit runs on, while the laptop has the tile server forwarded
+# to some other local port (localhost:8001, the same way the database is on
+# 5433 rather than 5432). Pointing TILE_SERVER_URL at the browser's port would
+# break every server-side call; leaving the viewer on this one leaves it
+# fetching a port nothing is listening on, and the only symptom is
+# OpenSeadragon's "failed to open the DZI source".
+#
+# Defaults to TILE_SERVER_URL, so a deployment where both sides see the same
+# address needs no configuration:
+#     export TILE_SERVER_BROWSER_URL=http://localhost:8001
+TILE_SERVER_BROWSER_URL = os.getenv("TILE_SERVER_BROWSER_URL", TILE_SERVER_URL)
 
 # ---------------------------------------------------------------------------
 # Knowledge Bank target
@@ -248,6 +279,54 @@ def render_wsi_upload_panel():
             else:
                 st.info(f"Status: **{stage}** (queued → masking → tiling → packaging → done)")
                 st.button("Refresh status", key="wsi_processing_refresh")
+
+            _render_upload_pipeline(processing_slide_id, status_payload or {})
+
+
+def _render_upload_pipeline(slide_id: str, status_payload: dict):
+    """The rest of the pipeline for an uploaded slide: Stages 3-7, rendered by
+    the same stepper a dataset run uses.
+
+    An upload used to stop at its .h5. Masking, tiling and packaging all ran
+    and then nothing else could: feature extraction, cluster classification,
+    registration and the Knowledge Bank load are keyed on a run, and an upload
+    had none — so an uploaded slide could be looked at, but never carried any
+    HPC labels, never appeared in hpl_profile_*, and the chatbot could not
+    answer a single question about it. The backend now creates a one-slide run
+    for every upload (see _start_upload_run in tile_server_v2_.py), and this is
+    where the user drives it: the same seven steps, with Stages 1 and 2 already
+    finished by the upload itself.
+    """
+    submission_id = status_payload.get("submission_id")
+    if not submission_id:
+        st.warning(
+            "This upload has no pipeline run on record, so it stops at the "
+            "tiles. Re-upload the slide to create one; without it the slide "
+            "can be viewed but cannot reach the Knowledge Bank."
+        )
+        return
+
+    st.divider()
+    st.caption(
+        f"**Rest of the pipeline for {slide_id}** — cohort "
+        f"`{status_payload.get('dataset_name') or ''}`. Steps 1 and 2 were done "
+        f"by the upload itself; run 3 onwards here to get this slide's tiles "
+        f"into the Knowledge Bank and its HPC overlay into the viewer."
+    )
+    # Registration always asks for Replace on an uploaded slide, and the
+    # refusal it comes from names a row count rather than a reason. Said here,
+    # next to the step, because the step itself is shared with cohorts where
+    # the same message means something else entirely.
+    st.caption(
+        "Step 5 will report this cohort as already occupied and ask for "
+        "**Replace** — that is the slide's own registry row, written at upload "
+        "time so the viewer could open it straight away. Replace rewrites "
+        "exactly this slide's rows and touches no other cohort."
+    )
+    _render_job_progress(
+        {"submission_id": submission_id, "total_slides": 1, "submitted_at": ""},
+        key_prefix=f"upload_{slide_id}_",
+    )
 
 
 def _job_label(job: dict) -> str:
@@ -1052,36 +1131,146 @@ def _render_new_dataset_submission_form(dataset_path: str):
             line.strip() for line in slide_names_raw.splitlines() if line.strip()
         ]
 
-    if st.button("Submit dataset job", key="dataset_job_submit", use_container_width=True):
+    seed = None
+    if selection_mode == "Random subset":
+        seed_text = st.text_input(
+            "Sampling seed (optional)", value="", key="dataset_job_seed",
+            help="Leave blank and one is chosen and recorded with the run, so the "
+                 "same slides can be asked for again — a subset is how a test "
+                 "run is done, exactly as for ANORAK.",
+        )
+        seed = int(seed_text) if seed_text.strip().isdigit() else None
+
+    # --- Stages 3 and 4, asked for once, here --------------------------------
+    # One click runs tiling, packaging, feature extraction and classification
+    # as a single Nextflow pipeline (hpl-nf/), the way ANORAK runs. Every input
+    # a later stage used to ask for at its own button is asked for now, and the
+    # server refuses before queueing anything if one is wrong. Each stage is
+    # still checked on its own: the pipeline marks a stage done only after the
+    # same validator the server's gate uses, and the stepper shows every stage
+    # with its own state. Registration and the Knowledge Bank load stay manual,
+    # with their dry runs.
+    st.markdown("**Feature extraction (Stage 3)**")
+    checkpoint = st.text_input(
+        "Model checkpoint path",
+        key="dataset_job_pipeline_checkpoint",
+        help="Absolute path to the frozen encoder checkpoint, e.g. "
+             ".../weights/BarlowTwins_3.ckt (a TensorFlow prefix — the .index / "
+             ".data files beside it are what exist on disk).",
+    )
+    extraction_shards = st.number_input(
+        "GPU shards", min_value=1, max_value=64, value=1, step=1,
+        key="dataset_job_pipeline_ext_shards",
+        help="Split the encode across this many GPU tasks. Extraction is "
+             "read-bound, and separate processes are the only lever that "
+             "scales it; one shard is fine for a small cohort.",
+    )
+
+    st.markdown("**Cluster classification (Stage 4)**")
+    vote_preset, vote_overrides = _render_vote_picker("new_run", "dataset_job_")
+    reference = st.text_input(
+        "Reference .npz (optional)", value="", key="dataset_job_pipeline_reference",
+        help="Leave blank for the configured reference. Cluster IDs only mean "
+             "anything relative to one reference, so change this deliberately.",
+    )
+    columns = st.columns(2)
+    assignment_shards = columns[0].number_input(
+        "Assignment shards", min_value=1, max_value=64, value=1, step=1,
+        key="dataset_job_pipeline_asg_shards",
+        help="More than one computes a shared query mean first, so every shard "
+             "centres identically.",
+    )
+    device = columns[1].radio(
+        "Search device", ["auto", "cpu", "gpu"], horizontal=True,
+        key="dataset_job_pipeline_device",
+        help="auto uses a GPU only when the GPU faiss extras are installed. The "
+             "GPU search is the same exact scan, verified against the CPU one.",
+    )
+
+    allow_incomplete = st.checkbox(
+        "Package without slides that fail to tile", value=False,
+        key="dataset_job_pipeline_allow_incomplete",
+        help="Off: one slide that cannot be tiled (after retries) stops the run "
+             "before packaging, so the .h5 is never missing slides silently. On: "
+             "those slides are left out and named on the tiling step. Can also be "
+             "switched on when resuming a run that stopped on them.",
+    )
+
+    with st.expander("Head job", expanded=False):
+        st.caption(
+            "The pipeline runs as one Slurm head job that submits every task "
+            "itself, supervised by the same stall watchdog as ANORAK."
+        )
+        chain = st.number_input(
+            "Head jobs", min_value=1, max_value=10, value=3, step=1,
+            key="dataset_job_pipeline_chain",
+            help="The head job plus standbys. A standby starts only if the one "
+                 "before it ended without finishing (walltime, or watchdog "
+                 "restarts spent) and resumes it. A real failure or a Stop stops "
+                 "the whole chain.",
+        )
+        time_limit = st.text_input(
+            "Head job walltime (optional)", value="",
+            key="dataset_job_pipeline_time",
+            help="Slurm format, e.g. 2-00:00:00. Blank uses the server default. "
+                 "Must be within the partition's MaxTime (sinfo -o '%P %l').",
+        )
+
+    if st.button("Run pipeline (Stages 1-4)", key="dataset_job_submit",
+                 type="primary", use_container_width=True):
         if not dataset_path.strip():
             st.error("Enter a dataset path first.")
         elif selection_mode == "Specific slides" and not slide_names:
             st.error("Enter at least one slide filename or ID.")
         elif not dataset_name.strip():
             st.error("Enter a name for the new dataset folder, or switch to an existing one.")
+        elif not checkpoint.strip():
+            st.error("A model checkpoint is required — feature extraction cannot run without one.")
         else:
             try:
-                result = client.submit_dataset_job(
+                result = client.start_pipeline_run(
                     dataset_path=dataset_path.strip(),
+                    checkpoint=checkpoint.strip(),
+                    dataset_name=dataset_name.strip() or None,
                     max_concurrent=int(max_concurrent),
                     min_tissue=float(min_tissue),
                     sample_size=int(sample_size) if sample_size else None,
                     slide_names=slide_names,
+                    seed=seed,
                     partition=partition.strip() or None,
                     notify_email=notify_email.strip() or None,
-                    dataset_name=dataset_name.strip() or None,
-                )
-                st.success(
-                    f"Queued — submission {result['submission_id']} into dataset "
-                    f"folder '{result.get('dataset_name', dataset_name.strip())}'. "
-                    f"Discovering slides and submitting to Slurm in the "
-                    f"background; check it under 'Recent dataset jobs' below."
+                    extraction_shards=int(extraction_shards),
+                    reference=reference.strip() or None,
+                    vote_preset=vote_preset or None,
+                    vote_overrides=vote_overrides,
+                    assignment_shards=int(assignment_shards),
+                    device=device,
+                    chain=int(chain),
+                    time_limit=time_limit.strip() or None,
+                    allow_incomplete=bool(allow_incomplete),
                 )
             except requests.exceptions.HTTPError as e:
-                detail = e.response.text if e.response is not None else str(e)
-                st.error(f"Submission failed: {detail}")
+                st.error(f"Refused: {_http_detail(e)}")
             except Exception as e:
                 st.error(f"Submission failed: {e}")
+            else:
+                st.success(
+                    f"Pipeline queued — run {result['submission_id']} into dataset "
+                    f"folder '{result.get('dataset_name', dataset_name.strip())}'. "
+                    f"Slides are being found and the head job submitted in the "
+                    f"background; follow each stage under 'Recent dataset jobs'."
+                )
+                st.caption(
+                    f"GPU: {result.get('gpu_gres')} ({result.get('gpu_gres_reason')}) · "
+                    f"search: {result.get('device')} ({result.get('device_reason')}) · "
+                    f"vote: {result.get('vote')}"
+                )
+                st.caption("Outputs will land at:")
+                st.code("\n".join(filter(None, (
+                    result.get("h5_output_path"),
+                    result.get("extraction_output_path"),
+                    result.get("assignment_output_path"),
+                ))), language=None)
 
 
 def _dataset_job_display_stage(status: dict) -> str:
@@ -1123,7 +1312,14 @@ _STEP_ICON = {
     "failed": "❌",
     "blocked": "⚪",      # can't start yet, an earlier step must finish
 }
-_SLURM_IN_FLIGHT = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "COMPLETING"}
+# Must match IN_FLIGHT_SLURM_STATES in tile_server_v2_.py. It lacked
+# CONFIGURING (nodes allocated, prologue still running — squeue reports it
+# first now), so a job Slurm was starting read here as "did not finish" and
+# got a Retry button. Stages whose submit guard matters (ANORAK) also get the
+# server's own verdict in /status rather than trusting this copy.
+_SLURM_IN_FLIGHT = {
+    "PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "COMPLETING", "CONFIGURING",
+}
 
 
 def _error_detail(e) -> tuple[dict | None, str]:
@@ -1468,6 +1664,47 @@ def _pipeline_steps(status: dict) -> list[dict]:
     else:
         kb_load = ("action", "ready to load")
 
+    # --- 7. ANORAK growth-pattern grading ------------------------------------
+    # Not gated on anything this pipeline produces: ANORAK does its own tiling
+    # at its own resolution and reads the raw slides, so it shares no artifact
+    # with Stages 1-6. What it needs from them is the *slide list* — the
+    # cohort's tumour slides, which come from the cluster composition Stage 6
+    # loads. So this is "action" as soon as there is something to grade, and
+    # the form says which list it is about to use rather than assuming one.
+    if status.get("anorak_ready"):
+        scope = status.get("anorak_scope")
+        slides = status.get("anorak_slides")
+        detail = f"{slides:,} slides" if slides else "complete"
+        if scope == "subset":
+            detail += f" (random subset, seed {status.get('anorak_seed')})"
+        anorak = ("done", f"growth patterns graded · {detail}")
+    elif status.get("anorak_in_flight") or status.get("anorak_slurm_state") in _SLURM_IN_FLIGHT:
+        # The head job being alive is all this says. It submits a job per slide
+        # per stage itself, so its own state carries no progress — which is why
+        # the summary names the pipeline rather than a percentage it does not
+        # have.
+        anorak = ("running", f"pipeline running ({status['anorak_slurm_state']})")
+    elif status.get("anorak_job_id") and status.get("anorak_state_unknown"):
+        # Not "did not finish": Slurm could not be asked, so the head job may
+        # well be alive — and the server refuses a new submission until it can.
+        anorak = ("attention", "state unknown — Slurm unreachable")
+    elif status.get("anorak_job_id"):
+        if status.get("anorak_invalid_reason"):
+            anorak = ("attention", "finished without a usable grading table")
+        else:
+            anorak = ("attention",
+                      f"did not finish ({status.get('anorak_slurm_state') or 'no Slurm record'})")
+    elif status.get("kb_load_done"):
+        anorak = ("action", "ready to run")
+    else:
+        # Deliberately not "blocked": a slide list chosen some other way is a
+        # perfectly good input, and blocking would hide the form that takes one.
+        anorak = ("action", "ready to run (needs a tumour-slide list)")
+
+    if status.get("pipeline"):
+        tiling, packaging, extraction, assignment = _pipeline_stage_states(
+            status, (tiling, packaging, extraction, assignment))
+
     return [
         {"key": "tiling", "title": "1. Tiling", "state": tiling[0], "summary": tiling[1]},
         {"key": "packaging", "title": "2. Packaging (.h5)", "state": packaging[0], "summary": packaging[1]},
@@ -1475,7 +1712,198 @@ def _pipeline_steps(status: dict) -> list[dict]:
         {"key": "assignment", "title": "4. Cluster classification", "state": assignment[0], "summary": assignment[1]},
         {"key": "registration", "title": "5. Register in the Knowledge Bank", "state": registration[0], "summary": registration[1]},
         {"key": "kb_load", "title": "6. Knowledge Bank load", "state": kb_load[0], "summary": kb_load[1]},
+        {"key": "anorak", "title": "7. Growth patterns (ANORAK)", "state": anorak[0], "summary": anorak[1]},
     ]
+
+
+# Stages 1-4 of a pipeline run (POST /pipeline-runs) are one Nextflow run. Their
+# state comes from the stage's done marker and the head job (hpl_nf_state), and
+# "done" still means what it means for a clicked-through stage: the server's own
+# validator accepted the output. The one thing that changes is that no stage
+# has a button of its own — the pipeline starts each when the one before it
+# has verified its output.
+_PIPELINE_STAGES = ("tiling", "packaging", "extraction", "assignment")
+_PIPELINE_STAGE_READY = {
+    "tiling": "tiling_complete",
+    "packaging": "h5_ready",
+    "extraction": "extraction_ready",
+    "assignment": "assignment_ready",
+}
+_PIPELINE_STAGE_NAME = {
+    "tiling": "tiling", "packaging": "packaging",
+    "extraction": "feature extraction", "assignment": "classification",
+}
+
+
+def _pipeline_stage_verified(status: dict, stage: str) -> bool:
+    pipeline_stage = ((status.get("pipeline") or {}).get("stages") or {}).get(stage) or {}
+    if stage == "tiling":
+        # tiling_complete is "terminal", not "succeeded"; for the pipeline the
+        # stage's own verdict is what counts.
+        return pipeline_stage.get("state") == "COMPLETED" and bool(status.get("tiling_complete"))
+    return bool(status.get(_PIPELINE_STAGE_READY[stage]))
+
+
+def _pipeline_stage_states(status: dict, computed: tuple) -> tuple:
+    """(state, summary) for Stages 1-4 of a pipeline run.
+
+    A verified stage keeps the summary the clicked-through path computes
+    (slide counts, tile counts), so the two kinds of run read the same once
+    finished. Everything else is said in the pipeline's terms: queued behind
+    the stage before it, running, or where the run stopped.
+    """
+    pipeline = status["pipeline"]
+    stages = pipeline.get("stages") or {}
+    out = []
+    previous_done = True
+    for stage, (state, summary) in zip(_PIPELINE_STAGES, computed):
+        slurm = (stages.get(stage) or {}).get("state")
+        if _pipeline_stage_verified(status, stage):
+            out.append(("done", summary))
+        elif slurm == "COMPLETED":
+            # The task said done, the server's validator disagrees. Never
+            # papered over: this is the file-of-the-right-shape failure.
+            out.append(("attention", "pipeline marked it done, but the output fails validation"))
+        elif slurm == "RUNNING":
+            out.append(("running", "running in the pipeline"))
+        elif slurm in _SLURM_IN_FLIGHT:
+            out.append(("blocked", "queued in the pipeline" if previous_done
+                        else f"waits for {_PIPELINE_STAGE_NAME[_PIPELINE_STAGES[len(out) - 1]]}"))
+        elif slurm is None:
+            out.append(("attention", "can't reach Slurm — state unknown"))
+        elif previous_done:
+            out.append(("failed", f"pipeline stopped here ({slurm})"))
+        else:
+            out.append(("blocked", "not reached"))
+        previous_done = out[-1][0] == "done"
+    return tuple(out)
+
+
+def _render_pipeline_overview(status: dict, submission_id: str, key_prefix: str):
+    """The head job, in one line, above the steps."""
+    pipeline = status["pipeline"]
+    head = ", ".join(pipeline.get("head_job_ids") or []) or "not submitted yet"
+    state = pipeline.get("head_state") or "unknown"
+    if pipeline.get("finished"):
+        st.success("Nextflow pipeline finished: Stages 1-4 are verified. "
+                   "Register and load into the Knowledge Bank below.")
+    elif state in _SLURM_IN_FLIGHT:
+        st.info(f"Nextflow pipeline {state.lower()} — head job {head}. It submits a "
+                f"job per slide and per shard itself, so squeue shows many more.")
+    else:
+        st.warning(f"Nextflow pipeline stopped ({state}) — head job {head}.")
+    selection = pipeline.get("selection") or {}
+    if selection.get("scope") == "subset":
+        st.caption(f"Random subset: {selection.get('slides')} of {selection.get('pool')} "
+                   f"slides, seed {selection.get('seed')}. A test run — the full "
+                   f"directory has not been processed.")
+    settings = pipeline.get("settings") or {}
+    if settings:
+        st.caption(
+            f"Checkpoint {settings.get('checkpoint')} · {settings.get('extraction_shards')} "
+            f"GPU shard(s) on {settings.get('gpu_gres')} · reference "
+            f"{settings.get('reference')} · vote {settings.get('vote')} · "
+            f"{settings.get('assignment_shards')} assignment shard(s) on "
+            f"{settings.get('device')}"
+        )
+    st.caption(f"Run directory (config, stage markers, nextflow.log, report): "
+               f"`{pipeline.get('out_dir')}`")
+
+
+def _render_pipeline_resume(status: dict, submission_id: str, key_prefix: str):
+    """Why it stopped, and the one button that continues it."""
+    pipeline = status["pipeline"]
+    if pipeline.get("stop_reason"):
+        st.caption("Why it stopped (the supervisor's stop marker):")
+        st.code(pipeline["stop_reason"], language=None)
+    if pipeline.get("log_tail"):
+        with st.expander("End of nextflow.log", expanded=True):
+            st.code(pipeline["log_tail"], language=None)
+    if not pipeline.get("resumable"):
+        return
+    st.caption("Resuming re-runs only what did not finish, with this run's own "
+               "recorded settings; every stage is verified again before it counts.")
+    columns = st.columns(2)
+    chain = columns[0].number_input(
+        "Head jobs", min_value=1, max_value=10, value=3, step=1,
+        key=f"{key_prefix}pipeline_resume_chain_{submission_id}")
+    time_limit = columns[1].text_input(
+        "Head job walltime (optional)", value="",
+        key=f"{key_prefix}pipeline_resume_time_{submission_id}")
+    already = bool((pipeline.get("settings") or {}).get("allow_incomplete"))
+    allow_incomplete = st.checkbox(
+        "Package without slides that fail to tile", value=already,
+        disabled=already,
+        key=f"{key_prefix}pipeline_resume_incomplete_{submission_id}",
+        help="For a run that stopped because some slides cannot be tiled: they "
+             "are left out of the .h5 and named on the tiling step. Everything "
+             "already tiled is kept.",
+    )
+    if st.button("Resume pipeline", type="primary",
+                 key=f"{key_prefix}pipeline_resume_{submission_id}"):
+        try:
+            result = client.resume_pipeline_run(
+                submission_id, chain=int(chain), time_limit=time_limit.strip() or None,
+                allow_incomplete=True if allow_incomplete and not already else None)
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Refused: {_http_detail(e)}")
+        except Exception as e:
+            st.error(f"Resume failed: {e}")
+        else:
+            st.success(f"Resumed — head job {result.get('nf_job_id')}.")
+
+
+def _render_pipeline_stage_step(status: dict, submission_id: str, key_prefix: str,
+                                stage: str, state: str):
+    """Stages 1-4 of a pipeline run: what the stage verified, where its output
+    is, and — at the stage the run stopped — why, and Resume."""
+    pipeline = status["pipeline"]
+    info = (pipeline.get("stages") or {}).get(stage) or {}
+    done = info.get("done") or {}
+
+    if stage == "tiling":
+        total = status.get("total_slides")
+        if done:
+            st.caption(f"{done.get('succeeded', 0):,} of {done.get('slides', total) or 0:,} "
+                       f"slides have tiles (every CSV checked against its summary).")
+        excluded = done.get("excluded_slides") or []
+        if excluded:
+            st.warning(
+                f"{done.get('excluded', len(excluded))} slide(s) failed to tile and were "
+                f"left out of the .h5 (this run allows it). Their TILE task logs say why."
+            )
+            if st.checkbox(f"Show the {len(excluded)} left-out slide(s)",
+                           key=f"{key_prefix}pipeline_excluded_{submission_id}"):
+                st.code("\n".join(excluded), language=None)
+        zero_tile = status.get("zero_tile_slides") or done.get("zero_tile_slides") or []
+        if zero_tile:
+            st.warning(f"{len(zero_tile)} slide(s) ran but saved zero tiles (no tissue above "
+                       f"the minimum). Re-running won't change that.")
+            if st.checkbox(f"Show the {len(zero_tile)} zero-tile slide ID(s)",
+                           key=f"{key_prefix}pipeline_zero_tile_{submission_id}"):
+                st.code("\n".join(zero_tile), language=None)
+    else:
+        path_key = {"packaging": "h5_output_path", "extraction": "extraction_output_path",
+                    "assignment": "assignment_output_path"}[stage]
+        if status.get(path_key):
+            st.caption("Output:")
+            st.code(status[path_key], language=None)
+        count = done.get("tiles") or done.get("embeddings") or done.get("assignments")
+        if count:
+            st.caption(f"Verified by the pipeline: {count:,} rows.")
+        reason = status.get({"packaging": "h5_invalid_reason",
+                             "extraction": "extraction_invalid_reason",
+                             "assignment": "assignment_invalid_reason"}[stage])
+        if reason:
+            st.error(f"The server's check rejects this output: {reason}")
+        if stage == "assignment" and status.get("assignment_vote"):
+            st.caption(f"Vote: {status['assignment_vote']}")
+        if stage == "assignment" and _pipeline_stage_verified(status, stage):
+            # Worth running before the KB load, exactly as for a clicked run.
+            _render_cohort_shift(submission_id, key_prefix)
+
+    if state == "failed":
+        _render_pipeline_resume(status, submission_id, key_prefix)
 
 
 def _render_tiling_step(status: dict, submission_id: str, key_prefix: str):
@@ -2469,6 +2897,238 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
     )
 
 
+def _render_anorak_step(status: dict, submission_id: str, key_prefix: str, state: str):
+    """Stage 7: ANORAK growth-pattern segmentation and IASLC grading.
+
+    The one stage that runs as a Nextflow pipeline rather than a Slurm job of
+    its own, which changes what there is to show. The job id here is a *head
+    process* — it submits a job per slide per stage itself — so its Slurm state
+    answers "is the pipeline alive" and nothing about how far through it is.
+    Progress lives in the run's own output directory, which is why that path is
+    shown whether the run is finished or still going.
+    """
+    if status.get("anorak_ready"):
+        st.success("Growth pattern grading complete:")
+        st.code(status.get("anorak_grades_csv"), language=None)
+        scope = status.get("anorak_scope")
+        slides = status.get("anorak_slides")
+        if scope == "subset":
+            # The seed is shown, not buried in the run record: a subset result
+            # that disagrees with a later full run is explained by which slides
+            # it saw, and that is the only way to ask for them again.
+            st.caption(
+                f"Random subset: {slides:,} of {status.get('anorak_sample_size') or slides} "
+                f"requested, seed {status.get('anorak_seed')}. "
+                f"This is a test run — the full cohort has not been graded."
+            )
+        elif slides:
+            st.caption(f"Full slide list: {slides:,} slides.")
+        if status.get("anorak_out_dir"):
+            st.caption("Per-slide masks, proportions and the Nextflow report:")
+            st.code(status["anorak_out_dir"], language=None)
+        # overwrite, and only here: it means "replace a finished table", which
+        # the server refuses to do unasked. It never gets past a live head job.
+        _render_anorak_form(status, submission_id, key_prefix,
+                            button_label="Run again", expanded=False, overwrite=True)
+        return
+
+    if status.get("anorak_error"):
+        st.error(status["anorak_error"])
+
+    job_id = status.get("anorak_job_id")
+    if job_id:
+        st.caption("Nextflow head job:")
+        st.code(job_id, language=None)
+        anorak_state = status.get("anorak_slurm_state")
+        if status.get("anorak_in_flight") or anorak_state in _SLURM_IN_FLIGHT:
+            st.info(
+                f"Pipeline running (head job state: {anorak_state}). It submits "
+                f"one job per slide per stage, so `squeue` shows many more jobs "
+                f"than this one."
+            )
+            if status.get("anorak_out_dir"):
+                st.caption("Live progress — Nextflow's own trace and report:")
+                st.code(f"{status['anorak_out_dir']}/pipeline_info", language=None)
+            return
+        if status.get("anorak_submit_blocked"):
+            # The server's refusal, shown instead of a form it would refuse:
+            # with Slurm unreachable the head job may still be running, and
+            # a second one would rewrite its slide list underneath it.
+            st.warning(status["anorak_submit_blocked"])
+            return
+        st.warning(f"This attempt ended as: {anorak_state or 'no Slurm record'}")
+        if status.get("anorak_invalid_reason"):
+            st.error(f"An output exists but is not a finished grading table: "
+                     f"{status['anorak_invalid_reason']}")
+        # Written by the head job's supervisor when the run ended for good —
+        # the reason, and why no standby took over. A bare FAILED was all this
+        # used to say, with the reason in a file nobody was pointed at.
+        if status.get("anorak_stop_reason"):
+            st.caption("Why it stopped (the supervisor's stop marker):")
+            st.code(status["anorak_stop_reason"], language=None)
+        if status.get("anorak_out_dir"):
+            st.caption("The head job's log is the first place to look:")
+            st.code(f"{status['anorak_out_dir']}/nextflow.log", language=None)
+
+    _render_anorak_form(
+        status, submission_id, key_prefix,
+        button_label="Retry ANORAK" if job_id else "Run ANORAK",
+    )
+
+
+def _render_anorak_form(status: dict, submission_id: str, key_prefix: str,
+                        button_label: str = "Run ANORAK", expanded: bool = True,
+                        overwrite: bool = False):
+    """The slide list, the scope, and the one button.
+
+    Resubmitting resumes by default. Nextflow caches on task inputs, so a retry
+    after a fixed container or a raised time limit re-runs only what actually
+    failed — which for a cohort this size is the difference between an hour and
+    a week.
+    """
+    with st.expander("Run settings", expanded=expanded):
+        st.caption(
+            "ANORAK segments growth patterns in lung adenocarcinoma, so it runs "
+            "only on slides that carry tumour. Point it at the output of "
+            "`select_tumour_slides.py --out`, which writes tumour slides only, "
+            "optionally filtered by `filter_slides_by_tile_count.py` for a floor "
+            "on how much malignant tissue a verdict rests on. The run refuses the "
+            "list before queueing anything if a row has a blank sample or is not "
+            "marked as tumour."
+        )
+        # Deliberately NOT pre-filled with anorak_slide_list. That field holds
+        # the run's own copy of the list, inside its output directory, so
+        # pre-filling it fed a re-run its own output — and a second submission
+        # then truncated the file the first run's head job was reading, which
+        # surfaced as "Missing 'header' in CSV file" with nothing pointing back
+        # here. The previous path is shown below instead, to copy if wanted.
+        slides_csv = st.text_input(
+            "Tumour-slide list (.csv)",
+            value="",
+            key=f"{key_prefix}_anorak_csv",
+            help="Absolute path on the HPC filesystem. Needs a slide_id column "
+                 "and a samples column naming each slide's tumour, filled in on "
+                 "every row: grades are pooled by sample, and a blank one used "
+                 "to pool unrelated slides into one tumour. An is_tumour column, "
+                 "if present, must be true on every row. This is the source list "
+                 "— the run writes its own copy beside its outputs.",
+        )
+        if status.get("anorak_slide_list"):
+            st.caption("The previous attempt ran on this list — a copy, inside "
+                       "the run's own output directory. Point at the source it "
+                       "came from, not at this:")
+            st.code(status["anorak_slide_list"], language=None)
+
+        # "Test" and "production" are the same pipeline over a different number
+        # of slides, deliberately: a separate test mode would be evidence about
+        # the test mode. The only thing that changes is how many slides the
+        # list is narrowed to.
+        scope_label = st.radio(
+            "Scope",
+            ["Full slide list (production)", "Random subset (test)"],
+            key=f"{key_prefix}_anorak_scope",
+            horizontal=True,
+            help="A subset runs every stage exactly as the full cohort does, "
+                 "on fewer slides — so a subset that works is evidence the "
+                 "full run will.",
+        )
+        subset = scope_label.startswith("Random subset")
+
+        sample_size = None
+        seed = None
+        if subset:
+            columns = st.columns(2)
+            sample_size = columns[0].number_input(
+                "Slides to sample", min_value=1, value=10, step=1,
+                key=f"{key_prefix}_anorak_n",
+                help="Sampled at random across the list rather than taken from "
+                     "the top — the first N slides of a cohort are usually one "
+                     "or two patients, sharing a scanner, a batch and a stain run.",
+            )
+            seed_text = columns[1].text_input(
+                "Seed (optional)", value="",
+                key=f"{key_prefix}_anorak_seed",
+                help="Leave blank and one is chosen and recorded, so the sample "
+                     "can be asked for again either way. On a retry of a subset "
+                     "run, blank repeats the previous sample — the server "
+                     "refuses if it cannot.",
+            )
+            if status.get("anorak_scope") == "subset" and status.get("anorak_seed") is not None:
+                columns[1].caption(f"Previous attempt: seed {status['anorak_seed']}.")
+            seed = int(seed_text) if seed_text.strip().isdigit() else None
+
+        resume = st.checkbox(
+            "Continue the cached run", value=True,
+            key=f"{key_prefix}_anorak_resume",
+            help="Nextflow re-runs only the tasks whose inputs changed. Uncheck "
+                 "to start from scratch — which for a full cohort is days.",
+        )
+
+        # Capped by the partition's MaxTime, and a submission over that ceiling
+        # is rejected by sbatch rather than trimmed to fit — so it is here
+        # rather than only in the server's environment. Blank uses the
+        # deployment default (ANORAK_HEAD_TIME_LIMIT).
+        time_limit = st.text_input(
+            "Head job walltime (optional)", value="",
+            key=f"{key_prefix}_anorak_time",
+            help="Slurm format, e.g. 2-00:00:00 or 48:00:00. Leave blank for "
+                 "the server's default. Must be within the partition's MaxTime "
+                 "(sinfo -o '%P %l'); the head job has to outlive every job it "
+                 "submits, so pick the largest allowed.",
+        )
+
+        # Standbys resume the run before them, so without resume there is
+        # nothing for one to continue — the server refuses the combination.
+        chain = st.number_input(
+            "Head jobs", min_value=1, value=2 if resume else 1, step=1,
+            key=f"{key_prefix}_anorak_chain_{int(resume)}",
+            disabled=not resume,
+            help="The first head job plus standbys. A standby starts only if the "
+                 "one before it ended without finishing — it reached its walltime "
+                 "or ran out of watchdog restarts — and resumes it. A real failure "
+                 "or a scancel stops the whole chain. Needs 'Continue the cached "
+                 "run'; without it one head job is submitted.",
+        )
+
+        if st.button(button_label, key=f"{key_prefix}_anorak_go", type="primary"):
+            if not slides_csv.strip():
+                st.error("A slide list is required.")
+                return
+            try:
+                result = client.start_anorak(
+                    submission_id,
+                    slides_csv=slides_csv.strip(),
+                    scope="subset" if subset else "full",
+                    sample_size=int(sample_size) if subset else None,
+                    seed=seed,
+                    resume=resume,
+                    overwrite=overwrite,
+                    time_limit=time_limit.strip() or None,
+                    chain=int(chain) if resume else 1,
+                )
+            except requests.exceptions.HTTPError as e:
+                st.error(_http_detail(e))
+                return
+            except Exception as e:
+                st.error(f"Submission failed: {e}")
+                return
+
+            selection = result.get("selection") or {}
+            if selection.get("scope") == "subset":
+                st.success(
+                    f"Submitted: {selection['slides']} slides sampled at random "
+                    f"from {selection.get('pool')}, seed {selection.get('seed')} "
+                    f"(job {result.get('anorak_job_id')})."
+                )
+            else:
+                st.success(
+                    f"Submitted: {selection.get('slides')} slides "
+                    f"(job {result.get('anorak_job_id')})."
+                )
+            st.caption("The list this run was given, kept beside its outputs:")
+            st.code(result.get("slide_list"), language=None)
+
+
 def _http_detail(error) -> str:
     """FastAPI's `detail`, not the JSON envelope around it.
 
@@ -3319,6 +3979,16 @@ def _render_kb_load_step(status: dict, submission_id: str, key_prefix: str, stat
         if report["overwriting_other_reference"]:
             note += f" ({report['overwriting_other_reference']:,} from a different reference)"
         st.info(note)
+    if report.get("unwritable_cluster_ids"):
+        st.error(
+            f"{report['unwritable_cluster_ids']:,} cluster ID(s) are not whole "
+            f"numbers and `tile_registry.hpc_id` is "
+            f"`{report.get('cluster_column_type')}`: "
+            f"{report['unwritable_cluster_examples']}. The load will refuse — "
+            f"the assignment CSV's cluster column has to be fixed. Shown here "
+            f"because the preview stages only the join key, so this would "
+            f"otherwise surface as a failed UPDATE after every row was copied."
+        )
     if report["unknown_clusters"]:
         st.warning(
             f"{len(report['unknown_clusters'])} cluster ID(s) have no `hpc_dictionary` "
@@ -3488,7 +4158,15 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
         "assignment": lambda s: _render_assignment_step(status, submission_id, key_prefix, s["state"]),
         "registration": lambda s: _render_registration_step(status, submission_id, key_prefix, s["state"]),
         "kb_load": lambda s: _render_kb_load_step(status, submission_id, key_prefix, s["state"]),
+        "anorak": lambda s: _render_anorak_step(status, submission_id, key_prefix, s["state"]),
     }
+    if status.get("pipeline"):
+        # A pipeline run: Stages 1-4 have no buttons of their own — the
+        # pipeline starts each once the one before it has verified its output.
+        _render_pipeline_overview(status, submission_id, key_prefix)
+        for stage in _PIPELINE_STAGES:
+            renderers[stage] = (lambda stage: lambda s: _render_pipeline_stage_step(
+                status, submission_id, key_prefix, stage, s["state"]))(stage)
     for step in steps:
         icon = _STEP_ICON.get(step["state"], "•")
         # Auto-open whichever step is waiting on the user, so the next action
@@ -3544,14 +4222,54 @@ with st.sidebar:
 
 # OpenSeadragon pyramid viewer helper
 # ---------------------------------------------------------------------------
-def render_openseadragon_viewer(slide_id: str, viewer_key: str = "main", height: int = 780, overlay_tiles=None):
-    """Render an OpenSeadragon pyramid viewer for a slide with optional SVG tile overlays."""
+def render_openseadragon_viewer(slide_id: str, viewer_key: str = "main", height: int = 780,
+                                overlay_tiles=None, tile_index=None, tile_size_native: float = 0.0):
+    """Render an OpenSeadragon pyramid viewer for a slide with optional SVG tile overlays.
+
+    tile_index (see build_osd_tile_index) adds hover and click: the cell under
+    the pointer is outlined and named, and a click pins that highlight. The
+    lookup is floor(x / tile_size_native) against a Map, not a scan, because
+    the tiles sit on a regular lattice — x_native = col * pitch, which is what
+    tile_coordinates records.
+
+    The selection lives inside the iframe and does not come back to Streamlit:
+    components.html is one-way, so a click here cannot set session state the
+    way the click-inspector's streamlit_image_coordinates can. That is why the
+    readout is drawn in the iframe rather than as a widget beside it — Click
+    tile inspector mode remains the way to pull a tile into the page itself.
+    """
     slide_id = (slide_id or "").strip().upper()
     safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", f"{slide_id}_{viewer_key}")
-    dzi_url = f"{TILE_SERVER_URL}/dzi/{slide_id}.dzi"
+    # Three things this URL has to get right, none of which the browser will
+    # forgive:
+    #
+    #  * the browser's address for the server, not this process's (see
+    #    TILE_SERVER_BROWSER_URL);
+    #  * the slide id percent-encoded. Ours contain spaces and colons
+    #    ("BB232000 A1 -1 - 2023-08-29 20.07.22"), and this string is pasted
+    #    straight into a JS string literal and an st.caption — a raw '#' in an
+    #    id would truncate the request at the fragment and a raw space is not a
+    #    URL character at all;
+    #  * kb_target, because the viewer fetches this itself and therefore sends
+    #    none of the client's parameters. Without it the server resolves the
+    #    slide against production's wsi_registry and 404s on every test-KB
+    #    cohort, while the rest of the page — all server-side calls — reads test
+    #    perfectly well.
+    #
+    # The query has to sit on the ".dzi" URL rather than be dropped because
+    # OpenSeadragon 4.1.1 carries it onto the tile requests too, and only in
+    # that form: DziTileSource matches /\.(dzi|xml|js)\?/ and appends whatever
+    # it finds to every ..._files/{level}/{col}_{row}.jpeg it builds. Put the
+    # target anywhere else and the metadata resolves on test while all 996
+    # tiles 404 against production.
+    slide_path = quote(slide_id, safe="")
+    target = quote(client.kb_target, safe="")
+    dzi_url = f"{TILE_SERVER_BROWSER_URL}/dzi/{slide_path}.dzi?kb_target={target}"
 
     overlay_tiles = overlay_tiles or []
     overlay_json = json.dumps(overlay_tiles)
+    tile_index_json = json.dumps(tile_index or [])
+    pitch_json = json.dumps(float(tile_size_native or 0))
 
     st.caption(f"OpenSeadragon DZI source: {dzi_url}")
 
@@ -3575,12 +4293,47 @@ def render_openseadragon_viewer(slide_id: str, viewer_key: str = "main", height:
                 height:100%;
                 pointer-events:none;
                 z-index:5;
-            "></svg>
+            "><g id="osd_grid_{safe_key}"></g><g id="osd_highlight_{safe_key}"></g></svg>
+
+            <!-- The hover readout, inside the viewer so the answer appears
+                 where the pointer already is. Hidden until the pointer is
+                 actually over a tile: an empty box parked in the corner reads
+                 as a broken widget. -->
+            <div id="osd_hud_{safe_key}" style="
+                position:absolute;
+                left:10px;
+                top:10px;
+                z-index:6;
+                display:none;
+                pointer-events:none;
+                padding:6px 10px;
+                border-radius:8px;
+                background:rgba(17,24,39,0.82);
+                border:1px solid rgba(255,255,255,0.28);
+                color:#f9fafb;
+                font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                font-size:12px;
+                line-height:1.35;
+                max-width:60%;
+                overflow-wrap:anywhere;
+            "></div>
         </div>
 
         <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.1/openseadragon.min.js"></script>
         <script>
             const overlayTiles = {overlay_json};
+            // [col, row, slide_tile, hpc_id] per tile — see build_osd_tile_index.
+            const tileIndexRows = {tile_index_json};
+            const tilePitch = {pitch_json};
+
+            // Keyed "<col>_<row>". One Map get per mouse move, rather than a
+            // scan over every tile on the slide, because the tiles are a
+            // regular lattice: x_native = col * pitch.
+            const tileByCell = new Map();
+            tileIndexRows.forEach(function(t) {{
+                tileByCell.set(t[0] + "_" + t[1], {{ col: t[0], row: t[1], slideTile: t[2], hpcId: t[3] }});
+            }});
+
             const viewer = OpenSeadragon({{
                 id: "osd_{safe_key}",
                 prefixUrl: "https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.1/images/",
@@ -3595,7 +4348,10 @@ def render_openseadragon_viewer(slide_id: str, viewer_key: str = "main", height:
                 maxZoomPixelRatio: 3.0,
                 showRotationControl: false,
                 gestureSettingsMouse: {{
-                    clickToZoom: true,
+                    // Off, where it used to be on: a single click now pins the
+                    // tile under the pointer, and the two cannot share the
+                    // gesture. Double click still zooms, and so does the wheel.
+                    clickToZoom: false,
                     dblClickToZoom: true,
                     dragToPan: true,
                     scrollToZoom: true
@@ -3603,47 +4359,212 @@ def render_openseadragon_viewer(slide_id: str, viewer_key: str = "main", height:
             }});
 
             const overlaySvg = document.getElementById("osd_overlay_{safe_key}");
+            const gridGroup = document.getElementById("osd_grid_{safe_key}");
+            const highlightGroup = document.getElementById("osd_highlight_{safe_key}");
+            const hud = document.getElementById("osd_hud_{safe_key}");
+
+            let hoveredTile = null;
+            let pinnedTile = null;
+
+            function sizeOverlay() {{
+                const container = viewer.container.getBoundingClientRect();
+                overlaySvg.setAttribute("viewBox", `0 0 ${{container.width}} ${{container.height}}`);
+                return container;
+            }}
+
+            // How heavy a grid outline is, given the tile's current width in
+            // screen pixels: a constant fraction of the cell, which is what
+            // the click inspector draws (its 2-unit stroke on a thumbnail
+            // viewBox is ~4.2% of a tile at any display scale). The rule here
+            // used to be min(4, w/35), which agrees with that only while a
+            // tile is under ~140 px — past there the cap holds while the cell
+            // keeps growing, so at 600 px the outline was 0.67% of the cell.
+            // The floor keeps it visible zoomed out; the ceiling stops it
+            // eating the tile it frames. Mirrors gridStrokeWidth() in
+            // frontend/src/components/viewer/overlayBuilders.js.
+            const GRID_STROKE_FRACTION = 0.042;
+            const GRID_STROKE_MIN = 1.5;
+            const GRID_STROKE_MAX = 9;
+            // Drawn under the colour, slightly wider, so the outline holds its
+            // edge on pale H&E as well as on the dark background. The HPC
+            // colours themselves are untouched — they are what the legend is
+            // keyed on.
+            const GRID_HALO_COLOR = "rgba(17, 24, 39, 0.72)";
+            const GRID_HALO_EXTRA = 2.5;
+
+            function gridStrokeWidth(w) {{
+                if (!(w > 0)) {{ return GRID_STROKE_MIN; }}
+                return Math.max(GRID_STROKE_MIN, Math.min(GRID_STROKE_MAX, w * GRID_STROKE_FRACTION));
+            }}
+
+            function makeRect(box, stroke, strokeWidth, fill, opacity) {{
+                const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+                r.setAttribute("x", box.x);
+                r.setAttribute("y", box.y);
+                r.setAttribute("width", Math.max(box.w, 1));
+                r.setAttribute("height", Math.max(box.h, 1));
+                r.setAttribute("fill", fill || "none");
+                r.setAttribute("stroke", stroke);
+                r.setAttribute("stroke-width", strokeWidth);
+                r.setAttribute("opacity", opacity || "0.95");
+                return r;
+            }}
+
+            function appendRect(group, t, container) {{
+                const rectVp = viewer.viewport.imageToViewportRectangle(
+                    Number(t.x),
+                    Number(t.y),
+                    Number(t.w),
+                    Number(t.h)
+                );
+
+                const p1 = viewer.viewport.pixelFromPoint(rectVp.getTopLeft(), true);
+                const p2 = viewer.viewport.pixelFromPoint(rectVp.getBottomRight(), true);
+
+                const x = Math.min(p1.x, p2.x);
+                const y = Math.min(p1.y, p2.y);
+                const w = Math.abs(p2.x - p1.x);
+                const h = Math.abs(p2.y - p1.y);
+
+                if (x + w < 0 || y + h < 0 || x > container.width || y > container.height) {{
+                    return;
+                }}
+
+                const box = {{ x: x, y: y, w: w, h: h }};
+                // A record carrying `color` is a grid outline; one carrying
+                // `fill` and its own stroke_width is a heatmap or risk cell,
+                // whose hairline edge belongs to a colour scale and is left
+                // exactly as it was.
+                const isGridOutline = !t.stroke_width && !!t.color;
+                const strokeWidth = t.stroke_width || gridStrokeWidth(w);
+
+                if (isGridOutline) {{
+                    group.appendChild(makeRect(
+                        box, GRID_HALO_COLOR, strokeWidth + GRID_HALO_EXTRA, null, "1.0"));
+                }}
+
+                group.appendChild(makeRect(
+                    box, t.stroke || t.color || "yellow", strokeWidth, t.fill, t.opacity));
+            }}
+
+            // The hovered and pinned cells only. Its own group, and its own
+            // redraw, because this runs on every mouse move — rebuilding the
+            // grid's several thousand rects to move one outline would make
+            // pointing at a tile cost more than panning does.
+            function drawHighlight() {{
+                if (!viewer || !viewer.viewport || !viewer.world || viewer.world.getItemCount() === 0) {{
+                    return;
+                }}
+                const container = sizeOverlay();
+                highlightGroup.innerHTML = "";
+                if (!(tilePitch > 0)) {{
+                    return;
+                }}
+
+                if (pinnedTile) {{
+                    const px = pinnedTile.col * tilePitch;
+                    const py = pinnedTile.row * tilePitch;
+                    const pad = tilePitch * 0.06;
+                    appendRect(highlightGroup, {{
+                        x: px - pad, y: py - pad, w: tilePitch + 2 * pad, h: tilePitch + 2 * pad,
+                        fill: "none", stroke: "yellow", stroke_width: 6, opacity: "1.0"
+                    }}, container);
+                    appendRect(highlightGroup, {{
+                        x: px, y: py, w: tilePitch, h: tilePitch,
+                        fill: "none", stroke: "lime", stroke_width: 3, opacity: "1.0"
+                    }}, container);
+                }}
+
+                if (hoveredTile) {{
+                    appendRect(highlightGroup, {{
+                        x: hoveredTile.col * tilePitch,
+                        y: hoveredTile.row * tilePitch,
+                        w: tilePitch,
+                        h: tilePitch,
+                        fill: "rgba(255,255,255,0.18)",
+                        stroke: "#ffffff",
+                        stroke_width: 2,
+                        opacity: "1.0"
+                    }}, container);
+                }}
+            }}
+
+            function describe(tile, pinned) {{
+                const label = tile.hpcId === null || tile.hpcId === undefined
+                    ? "no HPC label" : ("HPC " + tile.hpcId);
+                return '<div style="font-weight:700;">' + tile.slideTile + "</div>"
+                     + '<div style="opacity:0.88;">' + label + (pinned ? " · pinned" : "") + "</div>";
+            }}
+
+            function drawHud() {{
+                const tile = hoveredTile || pinnedTile;
+                if (!tile) {{
+                    hud.style.display = "none";
+                    return;
+                }}
+                hud.innerHTML = describe(tile, !hoveredTile);
+                hud.style.display = "block";
+            }}
+
+            // The tile under a point in the viewer's own pixel space, or null
+            // where the slide has no tile (background, or tissue below the
+            // threshold that Stage 1 skipped).
+            function tileAtPixel(px, py) {{
+                if (!(tilePitch > 0) || tileByCell.size === 0) {{ return null; }}
+                if (!viewer.world || viewer.world.getItemCount() === 0) {{ return null; }}
+                const vp = viewer.viewport.pointFromPixel(new OpenSeadragon.Point(px, py), true);
+                const img = viewer.viewport.viewportToImageCoordinates(vp);
+                if (img.x < 0 || img.y < 0) {{ return null; }}
+                const col = Math.floor(img.x / tilePitch);
+                const row = Math.floor(img.y / tilePitch);
+                return tileByCell.get(col + "_" + row) || null;
+            }}
+
+            viewer.container.addEventListener("mousemove", function(event) {{
+                const bounds = viewer.container.getBoundingClientRect();
+                const tile = tileAtPixel(event.clientX - bounds.left, event.clientY - bounds.top);
+                if (tile === hoveredTile) {{ return; }}  // same cell — nothing to redraw
+                hoveredTile = tile;
+                drawHighlight();
+                drawHud();
+            }});
+
+            viewer.container.addEventListener("mouseleave", function() {{
+                if (hoveredTile === null) {{ return; }}
+                hoveredTile = null;
+                drawHighlight();
+                drawHud();
+            }});
+
+            // canvas-click rather than a DOM click: OpenSeadragon sets
+            // event.quick false for a press that turned into a drag, which is
+            // the difference between picking a tile and finishing a pan on top
+            // of one. Clicking the pinned tile again unpins it.
+            viewer.addHandler("canvas-click", function(event) {{
+                if (!event.quick) {{ return; }}
+                const tile = tileAtPixel(event.position.x, event.position.y);
+                if (!tile) {{ return; }}
+                pinnedTile = (pinnedTile && pinnedTile.col === tile.col && pinnedTile.row === tile.row)
+                    ? null : tile;
+                drawHighlight();
+                drawHud();
+            }});
 
             function drawTileOverlay() {{
                 if (!viewer || !viewer.viewport || !viewer.world || viewer.world.getItemCount() === 0) {{
                     return;
                 }}
 
-                const container = viewer.container.getBoundingClientRect();
-                overlaySvg.setAttribute("viewBox", `0 0 ${{container.width}} ${{container.height}}`);
-                overlaySvg.innerHTML = "";
+                const container = sizeOverlay();
+                gridGroup.innerHTML = "";
 
                 overlayTiles.forEach(function(t) {{
-                    const rectVp = viewer.viewport.imageToViewportRectangle(
-                        Number(t.x),
-                        Number(t.y),
-                        Number(t.w),
-                        Number(t.h)
-                    );
-
-                    const p1 = viewer.viewport.pixelFromPoint(rectVp.getTopLeft(), true);
-                    const p2 = viewer.viewport.pixelFromPoint(rectVp.getBottomRight(), true);
-
-                    const x = Math.min(p1.x, p2.x);
-                    const y = Math.min(p1.y, p2.y);
-                    const w = Math.abs(p2.x - p1.x);
-                    const h = Math.abs(p2.y - p1.y);
-
-                    if (x + w < 0 || y + h < 0 || x > container.width || y > container.height) {{
-                        return;
-                    }}
-
-                    const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-                    r.setAttribute("x", x);
-                    r.setAttribute("y", y);
-                    r.setAttribute("width", Math.max(w, 1));
-                    r.setAttribute("height", Math.max(h, 1));
-                    r.setAttribute("fill", t.fill || "none");
-                    r.setAttribute("stroke", t.stroke || t.color || "yellow");
-                    r.setAttribute("stroke-width", t.stroke_width || Math.max(1, Math.min(4, w / 35)));
-                    r.setAttribute("opacity", t.opacity || "0.95");
-                    overlaySvg.appendChild(r);
+                    appendRect(gridGroup, t, container);
                 }});
+
+                // The highlight sits in its own group but still has to follow
+                // the viewport, so a pan or zoom redraws both.
+                drawHighlight();
             }}
 
             viewer.addHandler("open", drawTileOverlay);
@@ -3685,6 +4606,12 @@ def fetch_tile_region_from_svs(slide_id: str, x_native, y_native, tile_size_nati
         "h": int(tile_size_native),
         "level": 0,
         "quality": 95,
+        # This one call builds its own request instead of going through
+        # TileServerClient, so it is the one call that does not get kb_target
+        # attached for it. Omitted, the fallback resolves the slide against
+        # production and the tile a test cohort falls back to is either a 404 or
+        # — for an id present in both banks — the wrong slide's pixels.
+        "kb_target": client.kb_target,
     }
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
@@ -3724,14 +4651,15 @@ DB_NAME = KB_DATABASES[kb_target]
 # forwarded port, usually 127.0.0.1:5433.
 # Do not silently prefer DATABASE_URL/HPL_DB_URL because old shell values can
 # point to localhost:5432 and cause confusing connection refused errors.
-if DB_PASS:
-    DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-else:
-    DATABASE_URL = f"postgresql+psycopg2://{DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# Built by backend/db_url.py rather than formatted here: a password containing
+# '@', '/' or ':' re-splits an interpolated URL into a different host and
+# database, and the branch on DB_PASS is unnecessary because an empty password
+# is dropped, which is what lets libpq fall through to ~/.pgpass.
+DATABASE_URL = database_url(DB_NAME, user=DB_USER, password=DB_PASS,
+                            host=DB_HOST, port=DB_PORT)
 
-SAFE_DATABASE_URL = DATABASE_URL
-if DB_PASS:
-    SAFE_DATABASE_URL = DATABASE_URL.replace(f":{DB_PASS}@", ":****@")
+# str() on a URL masks the password, so this is what any message may show.
+SAFE_DATABASE_URL = safe_text(DATABASE_URL)
 
 engine = create_engine(
     DATABASE_URL,
@@ -3819,7 +4747,7 @@ def load_survival_coefficients(p_threshold=0.05):
     except Exception as e:
         st.warning(
             "Could not load survival coefficients. Check that the PostgreSQL database or SSH tunnel is running. "
-            f"Current DATABASE_URL: {DATABASE_URL}. Error: {e}"
+            f"Current DATABASE_URL: {SAFE_DATABASE_URL}. Error: {e}"
         )
         return {}
 
@@ -4148,15 +5076,13 @@ def color_for_necrosis(label):
 
 
 def color_for_malignant(flag):
-    if flag is None or pd.isna(flag):
+    # Grey means "this row does not say" — a NULL or a spelling
+    # backend/malignancy.py does not recognise. Deliberately not folded into
+    # the non-malignant green: a dictionary row that needs attention should be
+    # visible in the viewer rather than shown as benign.
+    flag = malignant_flag(flag)
+    if flag is None:
         return (160, 160, 160)
-    if isinstance(flag, (int, np.integer)):
-        flag = bool(flag)
-    if isinstance(flag, str):
-        s = flag.strip().lower()
-        if s in ("true", "t", "1", "yes", "y"): flag = True
-        elif s in ("false", "f", "0", "no", "n"): flag = False
-        else: return (160, 160, 160)
     return (255, 80, 80) if flag else (80, 200, 120)
 
 
@@ -4710,17 +5636,8 @@ def show_wsi(slide_id, ui_suffix=""):
     if nec_f is not None:
         filtered_df = filtered_df[filtered_df["necrosis"].astype(str).str.lower().str.strip() == nec_f]
     if mal_f is not None and "malignant" in filtered_df.columns:
-        def _mal_filter_value(v):
-            if isinstance(v, (int, np.integer, bool, np.bool_)):
-                return "malignant" if bool(v) else "non-malignant"
-            s = str(v).strip().lower()
-            if s in ("true", "t", "1", "yes", "y", "malignant"):
-                return "malignant"
-            if s in ("false", "f", "0", "no", "n", "non-malignant", "non malignant"):
-                return "non-malignant"
-            return "missing"
-
-        filtered_df = filtered_df[filtered_df["malignant"].map(_mal_filter_value) == mal_f]
+        filtered_df = filtered_df[
+            filtered_df["malignant"].map(describe_malignant) == mal_f]
     st.caption(f"Matched tiles: {len(filtered_df)}")
 
     # ------------------------------------------------------------------
@@ -4941,19 +5858,9 @@ def show_wsi(slide_id, ui_suffix=""):
 
             for label, count in mal_counts.items():
                 pct = 100.0 * float(count) / n_tiles
-                s = str(label).lower()
+                label_key = describe_malignant(label)
 
-                if s in ("true", "t", "1", "yes", "y", "malignant"):
-                    sample_val = True
-                    label_key = "malignant"
-                elif s in ("false", "f", "0", "no", "n", "non-malignant", "non malignant"):
-                    sample_val = False
-                    label_key = "non-malignant"
-                else:
-                    sample_val = None
-                    label_key = "missing"
-
-                css_color = rgb_to_css(color_for_malignant(sample_val))
+                css_color = rgb_to_css(color_for_malignant(label))
                 pretty = label_key.replace("-", " ").title()
 
                 st.markdown(
@@ -5005,6 +5912,11 @@ def show_wsi(slide_id, ui_suffix=""):
                 viewer_key=f"{_k('osd')}_{highlight_mode}_{len(osd_overlay_records)}_survival_v2_{st.session_state.get(_k('heat_hpc'), 'none')}_{st.session_state.get(_k('heat_alpha'), 0.6)}",
                 height=780,
                 overlay_tiles=osd_overlay_records,
+                # Built from df, not from the overlay records: the overlay is
+                # filtered by the legend and capped at 6,000, and neither has
+                # anything to do with "which tile is under my pointer".
+                tile_index=build_osd_tile_index(df, tile_size_native),
+                tile_size_native=tile_size_native,
             )
             return
 
@@ -5236,6 +6148,47 @@ def build_survival_osd_overlay_records(df, tile_size_native, max_tiles=6000):
         })
 
     return records
+
+
+def build_osd_tile_index(df, tile_size_native):
+    """What the pyramid viewer needs to answer "which tile is under the
+    pointer" — one compact row per tile: [col, row, slide_tile, hpc_id].
+
+    Compact lists rather than dicts because this is serialised into the
+    iframe's HTML: a slide with 20,000 tiles is a few hundred KB this way and
+    roughly three times that with a key repeated per field.
+
+    Not filtered and not capped, unlike build_osd_overlay_records below. What
+    a tile *is* does not depend on the legend filter, and the 6,000-record cap
+    exists because drawing that many SVG rects is slow — looking one up in a
+    Map is not.
+
+    col/row come straight from tile_coordinates. They are derived from
+    x_native only when absent, using the same pitch the viewer hit-tests with,
+    so a row that has them and a row that does not land in the same lattice.
+    """
+    if df is None or df.empty:
+        return []
+
+    pitch = float(tile_size_native or 0)
+    rows = []
+    for _, r in df.iterrows():
+        col, row = r.get("col"), r.get("row")
+        if col is None or pd.isna(col) or row is None or pd.isna(row):
+            if pitch <= 0:
+                continue
+            x, y = r.get("x_native"), r.get("y_native")
+            if x is None or pd.isna(x) or y is None or pd.isna(y):
+                continue
+            col, row = int(float(x) // pitch), int(float(y) // pitch)
+        hpc = r.get("hpc_id")
+        rows.append([
+            int(col),
+            int(row),
+            str(r.get("slide_tile") or ""),
+            None if hpc is None or pd.isna(hpc) else int(hpc),
+        ])
+    return rows
 
 
 def build_osd_overlay_records(df, highlight_mode, infl_f, nec_f, mal_f, tile_size_native, heat_hpc=None, heat_alpha=0.6, max_tiles=6000):

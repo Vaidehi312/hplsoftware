@@ -228,6 +228,103 @@ def test_the_sweep_is_a_no_op_off_postgres(_=None):
     assert kb_stage.sweep_stale(_Bind("sqlite")) == []
 
 
+# --- the staged column has to be assignable into the real one --------------
+#
+# Job 1243334 staged cluster_id as TEXT, COPYed 18,485,499 rows, and then died
+# on `column "hpc_id" is of type integer but expression is of type text`. Every
+# test passed first: SQLite types values dynamically, so its TEXT column held
+# integers happily, and test_kb_load.py's fixture declared hpc_id TEXT anyway,
+# following schema.sql — the stale dump CLAUDE.md warns against. No amount of
+# loading proves the types agree on SQLite, so the agreement is asserted here.
+
+def _registry(tmp_path, hpc_id_type):
+    from sqlalchemy import create_engine, text
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/kb_{hpc_id_type.split('(')[0].lower()}.db")
+    with engine.begin() as conn:
+        conn.execute(text(
+            f"CREATE TABLE tile_registry (slide_tile TEXT, "
+            f"hpc_id {hpc_id_type}, hpc_reference TEXT)"))
+    return engine
+
+
+def test_the_staged_cluster_column_follows_the_real_column(tmp_path):
+    """Read off tile_registry, not off a constant or a comment."""
+    assert kb_stage.cluster_stage_type(_registry(tmp_path, "INTEGER")) == "BIGINT"
+    assert kb_stage.cluster_stage_type(_registry(tmp_path, "BIGINT")) == "BIGINT"
+    assert kb_stage.cluster_stage_type(_registry(tmp_path, "TEXT")) == "TEXT"
+    assert kb_stage.cluster_stage_type(_registry(tmp_path, "VARCHAR(100)")) == "TEXT"
+
+
+def test_an_unreadable_registry_falls_back_rather_than_raising(tmp_path):
+    """A database with no tile_registry is the caller's problem: Stage 6 refuses
+    on the match rate a moment later, with a message about the actual cause."""
+    from sqlalchemy import create_engine
+    assert kb_stage.cluster_stage_type(
+        create_engine(f"sqlite:///{tmp_path}/empty.db")) == "TEXT"
+
+
+def test_the_scratch_ddl_uses_the_type_it_was_handed(_=None):
+    statements = []
+
+    class _Conn(_Bind):
+        def execute(self, statement):
+            statements.append(str(statement))
+
+    kb_stage.create_stage(_Conn("postgresql"), "st",
+                          ["slide_tile", "cluster_id"], "BIGINT")
+    assert "cluster_id BIGINT" in statements[0], statements[0]
+    assert "cluster_id TEXT" not in statements[0]
+
+
+def test_integer_cluster_ids_are_staged_as_integers_not_floats(_=None):
+    """'45.0' is what astype(str) makes of a float column, and COPY rejects it
+    for a BIGINT column one row into an 18.5M-row load."""
+    frame = _frame()
+    frame["leiden_2.5"] = frame["leiden_2.5"].astype(float)
+    staged = kb_stage.build_stage_frame(frame, "leiden_2.5", "BIGINT")
+    assert staged["cluster_id"].dtype.kind == "i", staged["cluster_id"].dtype
+    assert all("." not in v for v in staged["cluster_id"].astype(str))
+
+
+def test_a_text_column_still_gets_text(_=None):
+    """The other KB shape has to keep working: the type is read, not assumed."""
+    staged = kb_stage.build_stage_frame(_frame(), "leiden_2.5", "TEXT")
+    assert staged["cluster_id"].dtype == object
+    assert staged["cluster_id"].tolist() == [
+        str(v).strip() for v in _frame()["leiden_2.5"]]
+
+
+def test_a_cluster_id_that_is_not_a_whole_number_is_refused_before_staging(_=None):
+    """Refused rather than coerced, and before the COPY.
+
+    Rounding or dropping 'unknown' would attach some other cluster's ID to
+    those tiles, which is the failure this stage is written against — and the
+    refusal has to name the values, because each kind means a different defect
+    in the assignment CSV.
+    """
+    frame = _frame()
+    frame.loc[frame.index[0], "leiden_2.5"] = "unknown"
+    try:
+        kb_stage.build_stage_frame(frame, "leiden_2.5", "BIGINT")
+    except ValueError as e:
+        assert "unknown" in str(e) and "whole numbers" in str(e), str(e)
+    else:
+        raise AssertionError("a non-integer cluster ID was staged for an "
+                             "integer column")
+
+
+def test_the_unwritable_count_is_available_without_raising(_=None):
+    """What the preview reports. The preview stages only the join key, so it
+    cannot discover this by staging — without the count, a clean dry run is
+    followed by a commit that fails."""
+    frame = _frame()
+    frame.loc[frame.index[0], "leiden_2.5"] = "45.5"
+    values = frame["leiden_2.5"].astype(str)
+    assert kb_stage.unwritable_cluster_ids(values, "BIGINT") == (1, ["45.5"])
+    assert kb_stage.unwritable_cluster_ids(values, "TEXT") == (0, [])
+
+
 def main():
     tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_")]
     failures = []

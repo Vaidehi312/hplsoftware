@@ -247,6 +247,16 @@ export default function KbLoadStage({ status, submissionId, state }) {
                 : ""}
             </Alert>
           )}
+          {report.unwritable_cluster_ids > 0 && (
+            <Alert type="error">
+              {fmtInt(report.unwritable_cluster_ids)} cluster ID(s) are not whole numbers and{" "}
+              <code>tile_registry.hpc_id</code> is <code>{report.cluster_column_type}</code>:{" "}
+              {JSON.stringify(report.unwritable_cluster_examples)}. The load will refuse — the
+              assignment CSV&apos;s cluster column has to be fixed. Shown here because the preview
+              stages only the join key, so this would otherwise surface as a failed UPDATE after
+              every row was copied.
+            </Alert>
+          )}
           {report.unknown_clusters && report.unknown_clusters.length > 0 && (
             <Alert type="warning">
               {report.unknown_clusters.length} cluster ID(s) have no <code>hpc_dictionary</code> row:{" "}

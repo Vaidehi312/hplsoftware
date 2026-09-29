@@ -123,6 +123,23 @@ export const api = {
 
   submitDatasetJob: (body) => postJson("/dataset-jobs", cleanBody(body)),
 
+  // One click: Stages 1-4 as a single Nextflow run (POST /pipeline-runs).
+  // Every input a later stage used to ask for at its own button is sent here,
+  // once; the server refuses before queueing anything if one is wrong. Polled
+  // through getDatasetJobStatus like any run — its `pipeline` block says where
+  // each stage is. Registration and the KB load stay manual.
+  startPipelineRun: (body) => postJson("/pipeline-runs", cleanBody(body), { timeoutMs: 120000 }),
+  // Resubmit a stopped pipeline run with -resume: re-runs only what did not
+  // finish, with the run's own recorded settings.
+  resumePipelineRun: (submissionId, { chain = null, timeLimit = null, allowIncomplete = null } = {}) =>
+    postJson(`/dataset-jobs/${submissionId}/pipeline-resume`, {
+      chain,
+      time_limit: timeLimit,
+      allow_incomplete: allowIncomplete,
+    }),
+  checkPipelineSubmit: (partition = null) =>
+    getJson("/pipeline-submit-check", { params: partition ? { partition } : undefined, timeoutMs: 180000 }),
+
   listDatasetJobs: (withState = false) =>
     withState
       ? getJson("/dataset-jobs", { params: { with_state: "true" }, timeoutMs: 60000 })
@@ -195,6 +212,48 @@ export const api = {
 
   checkCohortShift: (submissionId, { csvPath = null, topSlides = 10 } = {}) =>
     postJson(`/dataset-jobs/${submissionId}/cohort-shift`, { csv_path: csvPath, top_slides: topSlides }),
+
+  // Stage 7: ANORAK growth-pattern grading. Gated on nothing this pipeline
+  // produces — see startAnorak's own note — so it can be submitted whenever a
+  // tumour-slide list exists.
+  //
+  // scope="subset" samples sampleSize slides at random rather than taking the
+  // first N — the first N of a cohort sorted by slide id is usually one or two
+  // patients, sharing a scanner, a batch and a stain run. resume continues the
+  // run's cached Nextflow work directory, which is what makes a resubmission
+  // after a fixed container re-run only what failed. chain is the number of
+  // head jobs — the first plus standbys that resume it if it hits its walltime
+  // or runs out of watchdog restarts; 2 here, 1 on the server for old clients.
+  startAnorak: (
+    submissionId,
+    {
+      slidesCsv,
+      scope = "full",
+      sampleSize = null,
+      seed = null,
+      resume = true,
+      overwrite = false,
+      timeLimit = null,
+      chain = 2,
+    } = {}
+  ) =>
+    postJson(`/dataset-jobs/${submissionId}/anorak`, {
+      slides_csv: slidesCsv,
+      scope,
+      sample_size: sampleSize,
+      seed,
+      resume,
+      overwrite,
+      time_limit: timeLimit,
+      chain,
+    }),
+
+  // Whether a compute node can reach the Slurm controller. Worth once per
+  // cluster before the first ANORAK run: the Nextflow head job submits every
+  // task itself, and on a cluster where compute nodes cannot submit it waits
+  // out its time limit having done nothing.
+  checkAnorakSubmit: (partition = null) =>
+    getJson("/anorak-submit-check", partition ? { params: { partition } } : undefined),
 
   // Registration — the identity rows Stage 6's UPDATE needs to exist.
   //
@@ -401,8 +460,31 @@ export const api = {
   // -- H5 tile image by slide_tile key ---------------------------------------
   tileImageUrl: (slideTile, quality = 85) => imageUrl(`/tile_image/${slideTile}`, { quality }),
 
+  // Full NL query pipeline (Phase 2 — see tile_server_v2_.py's /query
+  // docstring). `history` is the last few {role, content} chat turns (used
+  // for follow-up questions); `sessionContext` mirrors app_v28.py's
+  // active_slide/viewer_open/selected_hpc/highlight_mode dict, so "this
+  // slide"/"that HPC" can resolve against whatever this client currently has
+  // open — the server has no session of its own to read that from.
+  query: (queryText, slideId = null, { history = null, sessionContext = null } = {}) =>
+    postJson("/query", {
+      query: queryText,
+      slide_id: slideId,
+      kb_target: kbTarget,
+      history,
+      session_context: sessionContext,
+    }),
+
   // -- DZI (OpenSeadragon reads this directly, but exposed for convenience) --
-  dziUrl: (slideId) => `${BASE_URL}/dzi/${slideId}.dzi`,
+  // OpenSeadragon fetches this itself, so none of the parameters get() and
+  // post() attach come with it — kb_target has to be on the URL or the viewer
+  // resolves every slide against production. It goes on the ".dzi" URL
+  // specifically: DziTileSource matches /\.(dzi|xml|js)\?/ and copies the query
+  // onto each ..._files/{level}/{col}_{row}.jpeg it builds, so this is also
+  // what carries the target to the tiles. The id is encoded because ours hold
+  // spaces and colons.
+  dziUrl: (slideId) =>
+    `${BASE_URL}/dzi/${encodeURIComponent(slideId)}.dzi?kb_target=${encodeURIComponent(kbTarget)}`,
 };
 
 async function postFormData(path, form, { timeoutMs = 30000 } = {}) {

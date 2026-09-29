@@ -230,6 +230,82 @@ class TileServerClient:
             body["tiling_params"] = tiling_params
         return self._post_json("/dataset-jobs", body)
 
+    def start_pipeline_run(
+        self,
+        dataset_path: str,
+        checkpoint: str,
+        *,
+        dataset_name: str | None = None,
+        max_concurrent: int = 10,
+        min_tissue: float | None = 30.0,
+        sample_size: int | None = None,
+        slide_names: list[str] | None = None,
+        seed: int | None = None,
+        partition: str | None = None,
+        notify_email: str | None = None,
+        model: str = "BarlowTwins_3",
+        extraction_shards: int = 1,
+        reference: str | None = None,
+        vote_preset: str | None = None,
+        vote_overrides: dict | None = None,
+        assignment_shards: int = 1,
+        device: str = "auto",
+        chain: int | None = None,
+        time_limit: str | None = None,
+        allow_incomplete: bool = False,
+    ) -> dict:
+        """One click: Stages 1-4 as a single Nextflow run (POST /pipeline-runs).
+
+        Every input a later stage used to ask for at its own button is sent
+        here, once, and the server refuses before queueing anything if one is
+        wrong — a checkpoint typo is a 400 now, not a failed GPU task after
+        hours of tiling. Returns a submission_id polled through
+        get_dataset_job_status like any run; its `pipeline` block says where
+        each stage is. Registration and the KB load stay manual.
+        """
+        body = {
+            "dataset_path": dataset_path,
+            "dataset_name": dataset_name,
+            "max_concurrent": max_concurrent,
+            "sample_size": sample_size,
+            "slide_names": slide_names,
+            "seed": seed,
+            "partition": partition,
+            "notify_email": notify_email,
+            "checkpoint": checkpoint,
+            "model": model,
+            "extraction_shards": extraction_shards,
+            "reference": reference,
+            "assignment_shards": assignment_shards,
+            "device": device,
+            "chain": chain,
+            "time_limit": time_limit,
+            "allow_incomplete": allow_incomplete,
+        }
+        if min_tissue is not None:
+            body["min_tissue"] = min_tissue
+        if vote_preset:
+            body["vote_preset"] = vote_preset
+        body.update({k: v for k, v in (vote_overrides or {}).items() if v is not None})
+        return self._post_json("/pipeline-runs", body)
+
+    def resume_pipeline_run(self, submission_id: str, chain: int | None = None,
+                            time_limit: str | None = None,
+                            allow_incomplete: bool | None = None) -> dict:
+        """Resubmit a stopped pipeline run with -resume: re-runs only what did
+        not finish, with the run's own recorded settings."""
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/pipeline-resume",
+            {"chain": chain, "time_limit": time_limit,
+             "allow_incomplete": allow_incomplete},
+        )
+
+    def check_pipeline_submit(self, partition: str | None = None) -> dict:
+        """Can a compute node run sbatch? The head job submits every task."""
+        return self._get_json("/pipeline-submit-check",
+                              params={"partition": partition} if partition else None,
+                              timeout=180)
+
     def list_dataset_jobs(self, with_state: bool = False) -> list[dict]:
         """Recent dataset runs, newest first.
 
@@ -435,6 +511,66 @@ class TileServerClient:
         body.update(vote_overrides or {})
         return self._post_json(
             f"/dataset-jobs/{submission_id}/assign-clusters", body,
+        )
+
+    def start_anorak(
+        self,
+        submission_id: str,
+        slides_csv: str,
+        scope: str = "full",
+        sample_size: int | None = None,
+        seed: int | None = None,
+        resume: bool = True,
+        overwrite: bool = False,
+        time_limit: str | None = None,
+        chain: int = 2,
+    ) -> dict:
+        """User-triggered: run the ANORAK Nextflow pipeline over a slide list.
+
+        scope="subset" samples `sample_size` slides at random rather than
+        taking the first N — the first N of a cohort sorted by slide id is
+        usually one or two patients, sharing a scanner, a batch and a stain
+        run, which is the least informative way to spend a test. A seed is
+        recorded whether or not one is given, so the sample can be asked for
+        again and a later disagreement has something to point at.
+
+        resume continues the run's cached Nextflow work directory, which is
+        what makes a resubmission after a fixed container re-run only what
+        failed.
+
+        overwrite only permits replacing a run that already has a valid
+        grading table. The server refuses while the previous head job is in
+        flight, or while Slurm cannot say whether it is, whatever this is set
+        to — so a caller cannot opt out of that check, and should not try.
+
+        chain is the number of head jobs: the first plus chain-1 standbys that
+        resume it if it reaches its walltime or runs out of watchdog restarts.
+        2 by default here, where the server's own default is 1 for old clients.
+        """
+        return self._post_json(
+            f"/dataset-jobs/{submission_id}/anorak",
+            {
+                "slides_csv": slides_csv,
+                "scope": scope,
+                "sample_size": sample_size,
+                "seed": seed,
+                "resume": resume,
+                "overwrite": overwrite,
+                "time_limit": time_limit,
+                "chain": chain,
+            },
+        )
+
+    def check_anorak_submit(self, partition: str | None = None) -> dict:
+        """Whether a compute node can reach the Slurm controller.
+
+        Worth once per cluster before the first ANORAK run: the Nextflow head
+        job submits every task itself, and on a cluster where compute nodes
+        cannot submit it waits out its time limit having done nothing.
+        """
+        return self._get_json(
+            "/anorak-submit-check",
+            params={"partition": partition} if partition else None,
         )
 
     def start_test_cluster_assignment(
@@ -660,10 +796,17 @@ class TileServerClient:
         )
 
     def check_kb_job_db(self) -> dict:
-        """Can a compute node reach Postgres? Queues a one-second srun, so it is
-        slow — minutes if the queue is busy — and is only worth calling when a
-        Slurm-backed KB write has been refused or has failed to connect."""
-        return self._get_json("/kb-job-db-check", timeout=300)
+        """Can a compute node reach *and use* Postgres? Queues a one-second srun,
+        so it is slow — minutes if the queue is busy — and is only worth calling
+        when a Slurm-backed KB write has been refused or has failed to connect.
+
+        Read "usable", not "reachable": the socket opening proves only that
+        something is listening, and a job that connects and then fails
+        authentication has already cost the queue time this call exists to save.
+        Probes whichever Knowledge Bank this client is pointed at, since the test
+        database not existing on that host is one of the answers."""
+        return self._get_json("/kb-job-db-check",
+                              params={"kb_target": self.kb_target}, timeout=300)
 
     def start_test_packaging(
         self,

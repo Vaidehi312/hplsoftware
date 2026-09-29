@@ -39,11 +39,16 @@ def _make_kb(tmp_path: Path, registry_tiles, clusters=("0", "1", "2"), existing=
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE tile_registry (
-                slide_tile TEXT, image_index INTEGER, hpc_id TEXT,
+                slide_tile TEXT, image_index INTEGER, hpc_id INTEGER,
                 hpc_vote_margin REAL, hpc_neighbor_distance REAL,
                 hpc_reference TEXT, hpc_assigned_at TIMESTAMP
             )"""))
-        conn.execute(text("CREATE TABLE hpc_dictionary (hpc_id TEXT, malignant TEXT)"))
+        # hpc_id INTEGER, matching kb_live_schema_2026-08-26.txt. It said TEXT
+        # here until 2026-09-10, following schema.sql — the stale dump CLAUDE.md
+        # warns about — and because SQLite types values dynamically, every test
+        # passed while the staged TEXT column could not be assigned into the
+        # real integer column at all. See kb_stage.cluster_stage_type.
+        conn.execute(text("CREATE TABLE hpc_dictionary (hpc_id INTEGER, malignant TEXT)"))
         for i, tile in enumerate(registry_tiles):
             conn.execute(
                 text("INSERT INTO tile_registry (slide_tile, image_index, hpc_id, "
@@ -69,6 +74,12 @@ def _make_csv(tmp_path: Path, n=20, slide=SLIDE, clusters=("0", "1", "2"), name=
     path = tmp_path / name
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
+
+
+def _table_names(engine):
+    """Every table, to prove a refused load left no scratch table behind."""
+    from sqlalchemy import inspect as sqlalchemy_inspect
+    return sqlalchemy_inspect(engine).get_table_names()
 
 
 def _registry_tiles(n=20, slide=SLIDE):
@@ -106,9 +117,12 @@ def test_load_populates_every_column_the_viewer_reads(tmp_path):
     assert got["hpc_neighbor_distance"].notna().all()
     assert (got["hpc_reference"] == REFERENCE).all()
     assert got["hpc_assigned_at"].notna().all()
-    # Row-for-row: tile i must carry the cluster the CSV gave tile i.
-    expected = pd.read_csv(csv)["leiden_2.5"].astype(str).tolist()
-    assert got["hpc_id"].tolist() == expected
+    # Row-for-row: tile i must carry the cluster the CSV gave tile i. Compared
+    # as integers because that is what tile_registry.hpc_id is — the reason
+    # this assertion used to read .astype(str) is the same stale schema.sql
+    # that made the staged column TEXT.
+    expected = pd.read_csv(csv)["leiden_2.5"].astype(int).tolist()
+    assert got["hpc_id"].astype(int).tolist() == expected
 
 
 def test_a_naming_mismatch_is_refused_not_reported_as_success(tmp_path):
@@ -612,6 +626,32 @@ def test_both_csv_readers_produce_the_same_assignments(tmp_path):
     for column in default.columns:
         assert (threaded[column].astype(str).tolist()
                 == default[column].astype(str).tolist()), column
+
+
+def test_both_csv_readers_keep_identifiers_as_text(tmp_path):
+    """And they must agree on the text, exactly, for the ids inference breaks.
+
+    The threaded reader is pyarrow's own, told the column types up front:
+    `pd.read_csv(engine="pyarrow", dtype=str)` infers first and casts after,
+    so an all-digit '007' column comes back as '7' from it while the default
+    reader returns '007' — the two readers disagreeing on exactly the value
+    the join key is built from, depending on what is installed."""
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        print("  (pyarrow not installed; the threaded reader is not exercised)")
+        return
+    rows = (_rows("007", 3) + _rows("1001", 3, start=3, sample="NA")
+            + _rows("None", 3, start=6, sample=""))
+    path = _text_csv(tmp_path, rows)
+
+    threaded = loader._read_csv_threaded(path)
+    default = loader._read_csv_default(path)
+
+    assert threaded.to_dict("list") == default.to_dict("list"), (
+        threaded.to_dict("list"), default.to_dict("list"))
+    assert threaded["slides"].tolist() == ["007"] * 3 + ["1001"] * 3 + ["None"] * 3
+    assert threaded["samples"].tolist() == ["S1"] * 3 + ["NA"] * 3 + [""] * 3
 
 
 # --- the per-slide aggregates --------------------------------------------
@@ -1242,6 +1282,319 @@ def test_a_clean_csv_still_loads(tmp_path):
 
 
 # --- standalone runner ---------------------------------------------------
+
+# --- the type the cluster IDs land in --------------------------------------
+
+def test_the_preview_reports_cluster_ids_the_column_cannot_hold(tmp_path):
+    """The preview stages only the join key, so it has to check this separately.
+
+    Job 1243334 is why: the dry run was clean, the operator committed, 18.5M
+    rows were COPYed, and the UPDATE then refused text for an integer column.
+    A number on the preview is the difference between finding that out now and
+    finding it out at the end.
+    """
+    csv = _make_csv(tmp_path, clusters=("0", "unknown", "2"))
+    engine = _make_kb(tmp_path, _registry_tiles(20), clusters=("0", "2"))
+    frame, column = loader.read_assignments(csv)
+
+    report = loader.inspect(engine, frame, column)
+
+    assert report["cluster_column_type"] == "BIGINT", report["cluster_column_type"]
+    assert report["unwritable_cluster_ids"] == 7, report["unwritable_cluster_ids"]
+    assert report["unwritable_cluster_examples"] == ["unknown"]
+
+
+def test_a_clean_cohort_reports_nothing_unwritable(tmp_path):
+    """The check has to be silent when there is nothing wrong with the CSV,
+    or it is noise on every load."""
+    csv = _make_csv(tmp_path)
+    engine = _make_kb(tmp_path, _registry_tiles(20))
+    frame, column = loader.read_assignments(csv)
+
+    report = loader.inspect(engine, frame, column)
+
+    assert report["unwritable_cluster_ids"] == 0
+    assert report["unwritable_cluster_examples"] == []
+    # And it still loads, into the integer column, row for row.
+    assert loader.load(engine, frame, column) == 20
+
+
+def test_the_load_refuses_before_staging_a_cohort_it_cannot_write(tmp_path):
+    """Not a partial load and not a coerced one: nothing staged, nothing
+    written, and the KB exactly as it was."""
+    csv = _make_csv(tmp_path, clusters=("0", "unknown", "2"))
+    engine = _make_kb(tmp_path, _registry_tiles(20))
+    frame, column = loader.read_assignments(csv)
+
+    try:
+        loader.load(engine, frame, column)
+    except ValueError as e:
+        assert "whole numbers" in str(e), str(e)
+    else:
+        raise AssertionError("loaded a cohort whose cluster IDs cannot be written")
+
+    with engine.connect() as conn:
+        written = conn.execute(
+            text("SELECT COUNT(*) FROM tile_registry WHERE hpc_id IS NOT NULL")
+        ).scalar()
+    assert written == 0, "the KB was touched by a load that refused"
+
+    leftovers = _table_names(engine)
+    assert not [t for t in leftovers if t.startswith("hpl_stage_")], leftovers
+
+
+def test_a_float_cluster_column_is_not_reported_as_unknown_clusters(tmp_path):
+    """A single missing value makes pandas read the column as float64.
+
+    Then astype(str) renders "45.0" where hpc_dictionary's integer column
+    renders "45", every ID in the cohort looks unknown, and the load refuses
+    with a message about missing dictionary rows — believable, and about the
+    wrong thing entirely. The comparison has to use the rendering the write
+    will use.
+    """
+    import numpy as np
+
+    rows = pd.read_csv(_make_csv(tmp_path, n=20))
+    rows["leiden_2.5"] = rows["leiden_2.5"].astype(float)
+    rows.loc[19, "leiden_2.5"] = np.nan          # what makes the dtype float
+    rows = rows.iloc[:19]                        # and drop the unusable row
+    csv = tmp_path / "float_clusters.csv"
+    rows.to_csv(csv, index=False)
+
+    engine = _make_kb(tmp_path, _registry_tiles(20))
+    frame, column = loader.read_assignments(csv)
+
+    report = loader.inspect(engine, frame, column)
+
+    assert report["unknown_clusters"] == [], report["unknown_clusters"]
+    assert all("." not in str(k) for k in report["distribution"]), \
+        report["distribution"]
+    # And it is writable, because 45.0 is a whole number.
+    assert report["unwritable_cluster_ids"] == 0
+
+
+# --- identifiers are read as text, not guessed at ---------------------------
+# pandas' type inference rewrites identifiers rather than reading them: an
+# all-digit slide id loses its zeros ('007' -> 7), one blank or 'NA' elsewhere
+# in the column turns every number in it into a float ('1001' -> 1001.0), and
+# 'NA' / 'None' / 'null' become NaN. The key built from those is
+# '7_0_0.JPEG' or '1001.0_0_0.JPEG', which joins nothing — or joins a
+# different slide that really is called '7'.
+
+_HEADER = ("samples", "slides", "tiles", "leiden_2.5", "vote_margin",
+           "neighbor_distance", "hpc_reference")
+
+
+def _text_csv(tmp_path: Path, rows, name="ids.csv"):
+    """rows of (samples, slides, tiles, cluster, vote_margin), written as the
+    literal text given — not through a DataFrame, whose own dtypes would decide
+    what the file says before the reader under test ever sees it."""
+    import csv as csv_module
+    path = tmp_path / name
+    with path.open("w", newline="") as handle:
+        writer = csv_module.writer(handle)
+        writer.writerow(_HEADER)
+        for sample, slide, tile, cluster, margin in rows:
+            writer.writerow([sample, slide, tile, cluster, margin, "1.2", REFERENCE])
+    return path
+
+
+def _rows(slide, n, sample="S1", start=0, clusters=("0", "1", "2")):
+    return [(sample, slide, f"{i}_{i}.jpeg", clusters[i % len(clusters)], "0.8")
+            for i in range(start, start + n)]
+
+
+def test_a_zero_padded_slide_id_round_trips(tmp_path):
+    """'007' is a slide id, not the number seven."""
+    csv = _text_csv(tmp_path, _rows("007", 20))
+    engine = _make_kb(tmp_path, _registry_tiles(20, slide="007"))
+
+    frame, column = loader.read_assignments(csv)
+
+    assert frame["slides"].iloc[0] == "007", frame["slides"].iloc[0]
+    assert frame["slide_tile"].iloc[0] == "007_0_0.JPEG", frame["slide_tile"].iloc[0]
+    report = loader.inspect(engine, frame, column)
+    assert report["matched"] == 20, report["unmatched_examples"]
+
+
+def test_the_key_built_from_a_numeric_slide_id_is_the_registrys_key(tmp_path):
+    """The registry side builds its key with make_slide_tile from the same text,
+    so the two must agree character for character — the same assertion as
+    test_join_key_matches_the_registrys_format, on the ids inference breaks."""
+    from slide_naming import make_slide_tile
+    csv = _text_csv(tmp_path, _rows("007", 3) + _rows("1001", 3, start=3)
+                    + _rows("NA", 3, start=6))
+
+    frame, _column = loader.read_assignments(csv)
+
+    expected = ([make_slide_tile("007", f"{i}_{i}.jpeg") for i in range(3)]
+                + [make_slide_tile("1001", f"{i}_{i}.jpeg") for i in range(3, 6)]
+                + [make_slide_tile("NA", f"{i}_{i}.jpeg") for i in range(6, 9)])
+    assert frame["slide_tile"].tolist() == expected, frame["slide_tile"].tolist()
+
+
+def test_a_numeric_slide_id_beside_an_na_slide_does_not_become_a_float(tmp_path):
+    """One 'NA' in the column is enough: pandas reads it as NaN, the column
+    becomes float64, and every other slide id in it gains a '.0'."""
+    csv = _text_csv(tmp_path, _rows("1001", 10) + _rows("NA", 10, start=10))
+    engine = _make_kb(tmp_path, _registry_tiles(10, slide="1001")
+                      + [f"NA_{i}_{i}.jpeg" for i in range(10, 20)])
+
+    frame, column = loader.read_assignments(csv)
+
+    assert set(frame["slides"]) == {"1001", "NA"}, set(frame["slides"])
+    assert not frame["slide_tile"].str.contains(r"\.0_").any(), \
+        frame["slide_tile"].tolist()
+    report = loader.inspect(engine, frame, column)
+    assert report["matched"] == 20, report["unmatched_examples"]
+
+
+def test_sample_ids_come_out_as_written(tmp_path):
+    """'NA' is a sample id, '007' keeps its zeros, and a blank sample elsewhere
+    in the column does not turn '1001' into '1001.0' — in the frame and in the
+    aggregates written from it."""
+    csv = _text_csv(tmp_path, _rows("SLIDE_A", 4, sample="NA")
+                    + _rows("SLIDE_B", 4, sample="007", start=4)
+                    + _rows("SLIDE_C", 4, sample="1001", start=8)
+                    + _rows("SLIDE_D", 4, sample="", start=12))
+
+    frame, column = loader.read_assignments(csv)
+
+    by_slide = frame.groupby("slides")["samples"].first().to_dict()
+    assert by_slide == {"SLIDE_A": "NA", "SLIDE_B": "007", "SLIDE_C": "1001",
+                        "SLIDE_D": ""}, by_slide
+    _proportions, summary = loader.compute_profiles(frame, column, None)
+    # Every slide still has its summary row: groupby drops a NaN key, which is
+    # what a blank or 'NA' sample used to become.
+    assert sorted(summary["samples"]) == ["", "007", "1001", "NA"], \
+        summary["samples"].tolist()
+
+
+def test_two_slides_that_only_differ_by_zero_padding_are_not_duplicates(tmp_path):
+    """'007' and '7' are different slides. Read as numbers they are the same
+    one, and the duplicate-tile guard refuses a clean file for the wrong
+    reason."""
+    csv = _text_csv(tmp_path, _rows("007", 5) + _rows("7", 5))
+
+    frame, _column = loader.read_assignments(csv)
+
+    assert frame["slide_tile"].is_unique
+    assert set(frame["slides"]) == {"007", "7"}
+
+
+def test_cluster_ids_are_read_as_written_and_compared_as_the_column_holds_them(tmp_path):
+    """The cluster column stays text in the frame, and the preview renders it
+    the way tile_registry.hpc_id (integer) will hold it before comparing it
+    with hpc_dictionary — so neither '1' vs 1 nor a stray blank elsewhere can
+    make known clusters look unknown."""
+    csv = _text_csv(tmp_path, _rows("S", 20))
+    engine = _make_kb(tmp_path, _registry_tiles(20, slide="S"))
+
+    frame, column = loader.read_assignments(csv)
+
+    assert frame[column].map(type).eq(str).all(), frame[column].map(type).unique()
+    report = loader.inspect(engine, frame, column)
+    assert report["unknown_clusters"] == [], report["unknown_clusters"]
+    assert loader.load(engine, frame, column) == 20
+    with engine.connect() as conn:
+        got = pd.read_sql(text("SELECT hpc_id FROM tile_registry "
+                               "ORDER BY image_index"), conn)["hpc_id"]
+    assert got.astype(int).tolist() == [i % 3 for i in range(20)]
+
+
+def test_an_unknown_cluster_id_is_still_flagged_when_read_as_text(tmp_path):
+    csv = _text_csv(tmp_path, _rows("S", 20, clusters=("0", "1", "99")))
+    engine = _make_kb(tmp_path, _registry_tiles(20, slide="S"))
+
+    frame, column = loader.read_assignments(csv)
+
+    assert loader.inspect(engine, frame, column)["unknown_clusters"] == ["99"]
+
+
+def test_an_empty_cluster_id_is_refused(tmp_path):
+    """A blank cluster id is a torn row. It used to become NaN, which is
+    written into a text hpc_id as the string 'nan' and survives every check."""
+    rows = _rows("S", 6)
+    rows[2] = (*rows[2][:3], "", rows[2][4])
+    csv = _text_csv(tmp_path, rows)
+
+    try:
+        loader.read_assignments(csv)
+    except SystemExit as e:
+        assert "empty leiden_2.5" in str(e), str(e)
+    else:
+        raise AssertionError("a CSV with a blank cluster id was accepted")
+
+
+def test_an_empty_slide_or_tile_is_refused(tmp_path):
+    """A row with no slide builds the key '_0_0.JPEG' (or, inferred, 'NAN_...'),
+    joins nothing, and hides inside the 5% the match-rate guard allows."""
+    for index in (1, 2):
+        rows = _rows("S", 40)
+        rows[7] = tuple("" if i == index else v for i, v in enumerate(rows[7]))
+        csv = _text_csv(tmp_path, rows, name=f"blank_{index}.csv")
+        column = _HEADER[index]
+        try:
+            loader.read_assignments(csv)
+        except SystemExit as e:
+            assert f"empty {column}" in str(e), str(e)
+        else:
+            raise AssertionError(f"a CSV with a blank {column} was accepted")
+
+
+def test_an_empty_vote_margin_written_as_text_is_still_refused_as_empty(tmp_path):
+    """Read as text, a blank margin is '' rather than NaN. It must still reach
+    the empty-margin refusal and not be mistaken for a non-numeric one or
+    coerced to 0."""
+    rows = _rows("S", 6)
+    rows[3] = (*rows[3][:4], "")
+    csv = _text_csv(tmp_path, rows)
+
+    try:
+        loader.read_assignments(csv)
+    except SystemExit as e:
+        assert "empty vote_margin" in str(e), str(e)
+    else:
+        raise AssertionError("a CSV with a blank vote_margin was accepted")
+
+
+def test_an_na_vote_margin_is_refused_rather_than_read_as_missing(tmp_path):
+    rows = _rows("S", 6)
+    rows[3] = (*rows[3][:4], "NA")
+    csv = _text_csv(tmp_path, rows)
+
+    try:
+        loader.read_assignments(csv)
+    except SystemExit as e:
+        assert "vote_margin" in str(e), str(e)
+    else:
+        raise AssertionError("a CSV with vote_margin 'NA' was accepted")
+
+
+def test_the_match_rate_guard_still_fires_on_text_ids(tmp_path):
+    """Half of '007' registered: the refusal has to see 50%, exactly as it
+    would for a TCGA barcode."""
+    csv = _text_csv(tmp_path, _rows("007", 20))
+    engine = _make_kb(tmp_path, _registry_tiles(10, slide="007"))
+
+    frame, column = loader.read_assignments(csv)
+    report = loader.inspect(engine, frame, column)
+
+    assert report["matched"] == 10
+    assert report["matched"] / report["rows"] < loader._MIN_MATCH_RATE
+
+
+def test_a_duplicated_zero_padded_tile_is_still_refused(tmp_path):
+    csv = _text_csv(tmp_path, _rows("007", 5) + _rows("007", 1, start=2))
+
+    try:
+        loader.read_assignments(csv)
+    except SystemExit as e:
+        assert "more than once" in str(e), str(e)
+        assert "007_2_2.JPEG" in str(e), str(e)
+    else:
+        raise AssertionError("a duplicated tile was accepted")
+
 
 def main():
     tests = [(n, o) for n, o in sorted(globals().items()) if n.startswith("test_")]

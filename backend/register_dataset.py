@@ -28,9 +28,18 @@ is the failure this codebase is written against. One command, one transaction,
 all five tables or none.
 
 Before this, the ONLY thing that ever inserted into wsi_registry was
-_register_uploaded_slide() on the interactive single-slide drag-and-drop path,
-which hard-codes dataset_id='UPLOADED'. No bulk Slurm dataset run has ever
-registered a slide.
+_register_uploaded_slide() on the interactive single-slide drag-and-drop path.
+No bulk Slurm dataset run has ever registered a slide.
+
+That upload path now runs through this script too: an uploaded slide gets its
+own run and its own dataset_id ("UPLOADED_<SLIDE_ID>", see
+tile_server_v2_.upload_dataset_name), so it reaches the Knowledge Bank the
+same way a cohort does. One consequence is worth knowing before reading a
+refusal here: the upload already wrote that slide's wsi_registry row at upload
+time, so the viewer could open it immediately, which means registering an
+upload always finds its own cohort occupied and needs --replace. The delete
+that follows is scoped to that one dataset_id, which for an upload is that one
+slide.
 
 image_index (tile_registry) / h5_index (tile_coordinates) is the tile's row
 position in the packaged .h5 — the actual array index, not anything derived
@@ -188,7 +197,7 @@ def read_tile_coordinates(tile_dir: Path, tile_dataset_name: str,
         if not meta.usable:
             missing.append(f"{slide_id} ({meta.status}: {meta.detail})")
             continue
-        frames.append(meta.frame)
+        frames.append(_with_identity_as_text(meta.frame, path))
 
     if not frames:
         return pd.DataFrame(columns=["slides", "tiles", "col", "row", "x_5x",
@@ -210,6 +219,32 @@ def read_tile_coordinates(tile_dir: Path, tile_dataset_name: str,
     coords["slide_tile"] = make_slide_tile_series(coords["slides"], coords["tiles"])
     coords.attrs["tile_names_normalized"] = renamed
     return coords, missing
+
+
+def _with_identity_as_text(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """`slides` and `tiles` exactly as Stage 1's CSV spells them.
+
+    tile_metadata.read_tile_metadata() lets pandas guess column types, which it
+    must for col/row — its null check is what catches a CSV truncated
+    mid-write. For the two identity columns that guess is a rewrite: an
+    all-digit slide id comes back as a number ('007' -> 7) and one called 'NA'
+    as NaN, so the coordinates' key is '7_1_1.JPEG' against the .h5's
+    '007_1_1.JPEG' and the slide registers with tiles_with_coordinates: 0 —
+    well-formed, and silently wrong. Only these two columns are re-read, as
+    text; the file is small, and the length check makes certain the two reads
+    line up row for row rather than assuming it.
+    """
+    identity = pd.read_csv(path, usecols=["slides", "tiles"], dtype=str,
+                           keep_default_na=False)
+    if len(identity) != len(frame) or not frame.index.equals(identity.index):
+        raise SystemExit(
+            f"{path}: re-reading slides/tiles as text gave {len(identity):,} "
+            f"row(s) against {len(frame):,} from the metadata reader, so the "
+            f"two cannot be attached to each other. Re-tile this slide.")
+    frame = frame.copy()
+    frame["slides"] = identity["slides"]
+    frame["tiles"] = identity["tiles"]
+    return frame
 
 
 def find_slide_files(raw_dir: Path, slide_ids) -> tuple[dict, list[str], list[str]]:
@@ -277,10 +312,13 @@ def read_slide_metadata(slide_files: dict, samples_by_slide: dict,
     """What OpenSlide reports about each slide, for wsi_metadata.
 
     Opens every slide, so it is opt-in (--slide-metadata): 14,044 headers is
-    minutes of network I/O, not seconds. Nothing reads wsi_metadata today, but
-    it is where the numbers live that would let the viewer stop assuming every
-    slide in every cohort was scanned at 0.252 mpp — tile_server_v2_.py:216-218
-    computes TILE_SIZE_NATIVE from that constant for all of them.
+    minutes of network I/O, not seconds. mpp_x is the column that stopped the
+    viewer assuming every slide in every cohort was scanned at 0.252 µm/px —
+    tile_server_v2_._tile_size_native() derives each slide's tile size from
+    the tiles' own coordinates, and falls back to the slide's mpp. It reads
+    mpp off the slide rather than out of this table, so wsi_metadata is still
+    on no read path; what this docstring used to describe as hypothetical is
+    the reason the numbers are worth capturing.
 
     A slide that fails to open is reported, not raised: one unreadable file out
     of thousands should not cost the registration of the rest, and the tile

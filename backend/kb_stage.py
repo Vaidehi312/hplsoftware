@@ -60,10 +60,12 @@ from sqlalchemy import text
 #: rows the single-buffer version is gigabytes of string.
 CHUNK_ROWS = 500_000
 
-#: Column types the scratch table is created with. Deliberately loose: this
-#: table is joined and read once, never constrained, and a type mismatch
-#: against tile_registry would be a refusal here rather than at the UPDATE,
-#: where the error would be about the wrong table.
+#: Column types the scratch table is created with. Loose where it can be —
+#: this table is joined and read once, never constrained — but NOT for
+#: cluster_id, which is assigned straight into tile_registry.hpc_id and so has
+#: to be a type PostgreSQL will accept there. TEXT is the fallback only;
+#: `cluster_stage_type` reads the real column. See its docstring for the load
+#: this got wrong.
 _STAGE_DDL_TYPES = {
     "slide_tile": "TEXT",
     # Named "cluster_id" and not "hpc_id" on purpose. app/hpc_chat_handlers_v23.py
@@ -98,8 +100,106 @@ def stage_table_name(purpose: str) -> str:
     return f"{_NAME_PREFIX}{safe}_{os.getpid()}_{int(time.time())}"
 
 
-def build_stage_frame(frame: pd.DataFrame, cluster_column: str) -> pd.DataFrame:
+#: PostgreSQL type names that mean "a whole number". A staged TEXT column
+#: cannot be assigned into any of them: there is no implicit cast from text to
+#: integer, unlike between the numeric types, which is why margin and distance
+#: never had this problem.
+_INTEGER_TYPES = ("integer", "bigint", "smallint", "int", "int2", "int4",
+                  "int8", "serial", "bigserial")
+
+
+def is_integer_type(sql_type: str) -> bool:
+    """Whether a column of this type holds whole numbers.
+
+    Public because the preview needs the same answer the staging does: how a
+    cluster ID should be *rendered* for comparison depends on it, not only how
+    it is stored.
+    """
+    return str(sql_type).strip().lower().split("(")[0] in _INTEGER_TYPES
+
+
+def cluster_stage_type(bind, table: str = "tile_registry",
+                       column: str = "hpc_id") -> str:
+    """The type to stage cluster IDs as: whatever the column they land in is.
+
+    Not a constant, because this repository has three disagreeing records of
+    that column and only one of them is the database. `schema.sql` says
+    varchar(100) and is a stale 2025-10-23 dump; the tests' fixture said TEXT;
+    kb_live_schema_2026-08-26.txt, transcribed from the live
+    database's own column listing, says integer — and the live database is the one the UPDATE runs
+    against. Staging TEXT sent job 1243334 into
+
+        column "hpc_id" is of type integer but expression is of type text
+
+    after COPYing 18.5M rows, because SQLite types columns dynamically and
+    accepted every test.
+
+    Read rather than assumed, so a KB where the column really is varchar keeps
+    working and neither has to be guessed at.
+    """
+    from sqlalchemy import inspect as sqlalchemy_inspect
+    try:
+        columns = sqlalchemy_inspect(bind).get_columns(table)
+    except Exception:  # noqa: BLE001 - a missing table is the caller's problem
+        return "TEXT"
+    for info in columns:
+        if info["name"] == column:
+            if is_integer_type(str(info["type"])):
+                # BIGINT rather than INTEGER: it is assignment-compatible with
+                # any narrower integer column, and a cluster ID that does not
+                # fit int4 is a refusal at the guard, not a silent overflow here.
+                return "BIGINT"
+            return "TEXT"
+    return "TEXT"
+
+
+def unwritable_cluster_ids(values: pd.Series, cluster_type: str) -> tuple:
+    """(count, examples) of cluster IDs the target column cannot hold.
+
+    Non-raising, so the preview can report the number *before* a commit
+    discovers it. The preview stages only the join key — it never touches
+    cluster_id — so without this a dry run passes and the write is the thing
+    that finds out, which is the order this pipeline exists to avoid.
+    """
+    if not is_integer_type(cluster_type):
+        return 0, []
+    text_values = values.astype(str).str.strip()
+    numbers = pd.to_numeric(text_values, errors="coerce")
+    unusable = numbers.isna() | (numbers != numbers.round())
+    if not unusable.any():
+        return 0, []
+    return (int(unusable.sum()),
+            text_values[unusable].drop_duplicates().head(5).tolist())
+
+
+def _integer_cluster_ids(values: pd.Series) -> pd.Series:
+    """Cluster IDs as whole numbers, refusing anything that is not one.
+
+    The refusal belongs here, before 18.5M rows are COPYed, and it has to name
+    the offending values: a cluster column holding '45.0', 'unknown' or an
+    empty string is a different defect in the assignment CSV each time, and the
+    examples in the message are what say which.
+    """
+    count, examples = unwritable_cluster_ids(values, "BIGINT")
+    if count:
+        raise ValueError(
+            f"{count:,} of {len(values):,} cluster ID(s) are not whole numbers, "
+            f"and tile_registry.hpc_id is an integer column, so they cannot be "
+            f"written: {examples}. Fix the assignment CSV's cluster column — "
+            f"this is refused before staging rather than after, because the "
+            f"alternative is a failed UPDATE at the end of a COPY of every row.")
+    return pd.to_numeric(values.astype(str).str.strip()).astype("int64")
+
+
+def build_stage_frame(frame: pd.DataFrame, cluster_column: str,
+                     cluster_type: str = "TEXT") -> pd.DataFrame:
     """The five columns the write needs, named as the scratch table names them.
+
+    `cluster_type` is what `cluster_stage_type` read off the target column. It
+    changes the *values*, not just the DDL: staged as an integer column, the
+    ids have to be written as `45` and not `45.0`, which is what
+    `frame[col].astype(str)` produces from a float dtype and what COPY then
+    rejects one row into the load.
 
     `hpc_assigned_at` is *not* here. The old loop put the same
     `datetime.now(timezone.utc)` on all 18.5M dicts; staging it would be 18.5M
@@ -107,21 +207,26 @@ def build_stage_frame(frame: pd.DataFrame, cluster_column: str) -> pd.DataFrame:
     passed to the UPDATE as a single bind parameter instead. Same value on every
     row, which is what it always was.
     """
+    cluster = frame[cluster_column]
+    cluster = (_integer_cluster_ids(cluster) if is_integer_type(cluster_type)
+               # str().strip() exactly as the old record-building loop did, for
+               # a KB whose hpc_id really is a text column.
+               else cluster.astype(str).str.strip())
     return pd.DataFrame({
         "slide_tile": frame["slide_tile"],
-        # str().strip() exactly as the old record-building loop did: the cluster
-        # column's values arrive as whatever the CSV held, and tile_registry's
-        # hpc_id is text. See _STAGE_DDL_TYPES for why this is not called
-        # hpc_id here.
-        "cluster_id": frame[cluster_column].astype(str).str.strip(),
+        # See _STAGE_DDL_TYPES for why this is not called hpc_id here.
+        "cluster_id": cluster,
         "margin": pd.to_numeric(frame["vote_margin"], errors="coerce"),
         "distance": pd.to_numeric(frame["neighbor_distance"], errors="coerce"),
         "reference": frame["hpc_reference"].astype(str),
     })
 
 
-def create_stage(conn, table: str, columns: Sequence[str]) -> None:
-    types = _STAGE_DDL_TYPES if is_postgres(conn) else _SQLITE_TYPES
+def create_stage(conn, table: str, columns: Sequence[str],
+                 cluster_type: str | None = None) -> None:
+    types = dict(_STAGE_DDL_TYPES if is_postgres(conn) else _SQLITE_TYPES)
+    if cluster_type:
+        types["cluster_id"] = cluster_type
     body = ", ".join(f"{c} {types[c]}" for c in columns)
     unlogged = "UNLOGGED " if is_postgres(conn) else ""
     conn.execute(text(f"CREATE {unlogged}TABLE {table} ({body})"))
@@ -188,7 +293,8 @@ def _slice_bounds(total: int, parts: int) -> list[tuple[int, int]]:
 
 
 def stage_frame(engine, table: str, frame: pd.DataFrame, *,
-                workers: int = 1, index: bool = True) -> float:
+                workers: int = 1, index: bool = True,
+                cluster_type: str | None = None) -> float:
     """Create `table`, fill it from `frame`, index it. Returns seconds taken.
 
     Runs outside any Knowledge Bank transaction, on its own connections, and
@@ -202,7 +308,7 @@ def stage_frame(engine, table: str, frame: pd.DataFrame, *,
     columns = list(frame.columns)
 
     with engine.begin() as conn:
-        create_stage(conn, table, columns)
+        create_stage(conn, table, columns, cluster_type)
 
     bounds = _slice_bounds(len(frame), max(1, workers)) if workers > 1 else None
 

@@ -128,6 +128,18 @@ export const api = {
   // once; the server refuses before queueing anything if one is wrong. Polled
   // through getDatasetJobStatus like any run — its `pipeline` block says where
   // each stage is. Registration and the KB load stay manual.
+  // One click: ANORAK on its own over a dataset path. Without slidesCsv every
+  // slide in the directory is graded, recorded as tumour-unverified.
+  startAnorakRun: ({ datasetPath, slidesCsv = null, sampleSize = null, seed = null }) =>
+    postJson(
+      "/anorak-runs",
+      cleanBody({ dataset_path: datasetPath, slides_csv: slidesCsv, sample_size: sampleSize, seed }),
+      { timeoutMs: 300000 },
+    ),
+  // Resubmit a stopped ANORAK run exactly as it was, with -resume.
+  resumeAnorakRun: (submissionId) =>
+    postJson(`/dataset-jobs/${submissionId}/anorak-resume`, {}, { timeoutMs: 300000 }),
+
   // The settings a one-click run uses — all the server's own.
   getPipelineDefaults: () => getJson("/pipeline-defaults"),
   startPipelineRun: (body) => postJson("/pipeline-runs", cleanBody(body), { timeoutMs: 120000 }),

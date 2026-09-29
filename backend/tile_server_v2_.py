@@ -113,6 +113,7 @@ from submit_kb_write import (
 
 from submit_anorak_nf import (
     SUPERVISOR_STOP_MARKER,
+    slide_list_from_directory as _anorak_directory_slide_list,
     check_submit_from_compute_node as _check_slurm_submit_from_compute_node,
     grades_csv_path as _anorak_grades_csv_path,
     read_slide_csv as _anorak_read_slide_csv,
@@ -5381,6 +5382,7 @@ def _anorak_status_fields(row: dict) -> dict:
         anorak_seed=row.get("anorak_seed"),
         anorak_slides=row.get("anorak_slides"),
         anorak_stop_reason=_anorak_stop_reason(anorak_out),
+        anorak_tumour_verified=_anorak_tumour_verified(anorak_out),
     )
     # Shown only once the job is known to have stopped and the output is not
     # usable — while it is running (or its state is unknown) there is no
@@ -5391,6 +5393,17 @@ def _anorak_status_fields(row: dict) -> dict:
             not_ready_reason or _validate_anorak_output(anorak_grades)[1] or None
         )
     return fields
+
+
+def _anorak_tumour_verified(out_dir: Path | None) -> bool | None:
+    """Whether this ANORAK run's slides were a tumour-slide list (True), every
+    slide in the directory (False), or unknown (None, a run from before this
+    was recorded)."""
+    try:
+        selection = json.loads((out_dir / "slide_list.selection.json").read_text(encoding="utf-8"))
+    except (TypeError, OSError, ValueError):
+        return None
+    return selection.get("tumour_verified", True)
 
 
 def _anorak_retry_seed(row: dict, slides_csv: Path, sample_size: int | None) -> int | None:
@@ -5523,7 +5536,15 @@ def check_anorak_submit(partition: str | None = None):
 
 @app.post("/dataset-jobs/{submission_id}/anorak")
 def start_anorak_job(submission_id: str, req: AnorakRequest):
-    """Stage 7: submit the ANORAK Nextflow pipeline for this run.
+    """Stage 7: submit the ANORAK Nextflow pipeline for this run."""
+    return _submit_anorak(submission_id, req)
+
+
+def _submit_anorak(submission_id: str, req: AnorakRequest, *, tumour_verified: bool = True):
+    """Submit the ANORAK Nextflow pipeline for a run (Stage 7, or an ANORAK run).
+
+    tumour_verified=False only for POST /anorak-runs' own directory-wide list
+    (slide_list_from_directory), never for a list a caller supplied.
 
     Gated on nothing this pipeline produces. ANORAK does its own tiling at its
     own resolution (0.44 um/px against HPL's 1.8) and reads the raw slides, so
@@ -5602,6 +5623,7 @@ def start_anorak_job(submission_id: str, req: AnorakRequest):
                 job_name=f"anorak_{submission_id}",
                 time_limit=req.time_limit,
                 chain=req.chain,
+                tumour_verified=tumour_verified,
             )
         except ValueError as e:
             # A bad scope, a sample larger than the list, a missing pipeline
@@ -5660,6 +5682,132 @@ def start_anorak_job(submission_id: str, req: AnorakRequest):
             "grades_csv": result["grades_csv"],
             "selection": selection,
         }
+
+
+# --- ANORAK on its own: POST /anorak-runs -------------------------------------
+#
+# The UI's "Run ANORAK" beside "Run HPL", for someone who wants growth-pattern
+# grading without the HPL pipeline. It is its own run — a slurm_dataset_runs
+# row whose status is ANORAK_ONLY_STATUS and whose Stages 1-6 were never
+# started — so it is listed, polled, stopped and kept in history like any
+# other, and the ANORAK submission itself is Stage 7's own code path
+# (_submit_anorak), with every check that carries.
+#
+# The one thing it adds is a slide list when none is given: every slide in the
+# directory, grouped into tumours by the rule HPL packaging uses, with tumour
+# status recorded as unverified — the recorded choice for a cohort nobody has
+# selected tumour slides from yet. A tumour-slide list, when given, is checked
+# exactly as Stage 7 checks one.
+ANORAK_ONLY_STATUS = "anorak_only"
+
+
+class AnorakRunRequest(BaseModel):
+    dataset_path: str
+    dataset_name: str | None = None
+    # Optional: select_tumour_slides.py's output. Blank grades every slide.
+    slides_csv: str | None = None
+    # A test run: a random sample of this many slides, with a recorded seed.
+    sample_size: int | None = None
+    seed: int | None = None
+    chain: int = 2
+    time_limit: str | None = None
+
+
+@app.post("/anorak-runs")
+def create_anorak_run(req: AnorakRunRequest):
+    try:
+        raw_dir = _resolve_dataset_path(req.dataset_path)
+        dataset_name = (_sanitize_dataset_name(req.dataset_name)
+                        if req.dataset_name else raw_dir.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    submission_id = str(uuid.uuid4())
+    slides_csv = (req.slides_csv or "").strip() or None
+    listed: dict = {}
+    # Built before the row exists, so a refusal (no readable slides, two files
+    # with one name) leaves nothing behind.
+    if slides_csv is None:
+        try:
+            frame, listed = _anorak_directory_slide_list(raw_dir)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        # Beside the run's output directory, never inside it: the submitter
+        # refuses a source list inside out_dir as a previous attempt's output.
+        source = ANORAK_RESULTS_ROOT / dataset_name / f"{submission_id}.all_slides.csv"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(source, index=False)
+        slides_csv = str(source)
+
+    eng = _get_engine()
+    with eng.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO slurm_dataset_runs
+                    (submission_id, raw_dir, mask_dir, tile_dir, status, is_subset,
+                     dataset_name)
+                VALUES
+                    (:submission_id, :raw_dir, :mask_dir, :tile_dir, :status,
+                     :is_subset, :dataset_name)
+            """),
+            {"submission_id": submission_id, "raw_dir": str(raw_dir),
+             "mask_dir": str(TISSUE_MASK_DIR), "tile_dir": str(PROCESSED_TILES_DIR),
+             "status": ANORAK_ONLY_STATUS, "is_subset": bool(req.sample_size),
+             "dataset_name": dataset_name},
+        )
+
+    anorak_req = AnorakRequest(
+        slides_csv=slides_csv,
+        scope="subset" if req.sample_size else "full",
+        sample_size=req.sample_size,
+        seed=req.seed,
+        chain=req.chain,
+        time_limit=req.time_limit,
+    )
+    try:
+        result = _submit_anorak(submission_id, anorak_req,
+                                tumour_verified=req.slides_csv is not None
+                                and bool(req.slides_csv.strip()))
+    except HTTPException as e:
+        # The status stays ANORAK_ONLY_STATUS (it is the run's kind); the
+        # refusal is recorded where the run's panel shows it.
+        _update_dataset_run_best_effort(submission_id, error=str(e.detail)[:2000])
+        raise
+    return {
+        **result,
+        "dataset_name": dataset_name,
+        "tumour_verified": bool((req.slides_csv or "").strip()),
+        "skipped_unsupported": listed.get("skipped_unsupported", []),
+    }
+
+
+@app.post("/dataset-jobs/{submission_id}/anorak-resume")
+def resume_anorak_run(submission_id: str):
+    """Resubmit a stopped ANORAK run exactly as it was: the same source list,
+    scope, sample, seed and tumour-verified choice, read back from the run's
+    own slide_list.selection.json, with -resume so only unfinished slides run.
+    """
+    row = _get_dataset_run_row(submission_id)
+    out = Path(row["anorak_out_dir"]) if row.get("anorak_out_dir") else None
+    selection_path = out / "slide_list.selection.json" if out else None
+    try:
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    except (AttributeError, OSError, ValueError):
+        raise HTTPException(400, "This run never recorded which slides it was given, "
+                                 "so it cannot be resumed as it was — start a new run.")
+    source = selection.get("source_csv")
+    if not source or not Path(source).is_file():
+        raise HTTPException(400, f"The slide list this run was given is gone: {source}")
+    anorak_req = AnorakRequest(
+        slides_csv=source,
+        scope=selection.get("scope", "full"),
+        sample_size=selection.get("sample_size"),
+        seed=selection.get("seed"),
+        resume=True,
+        chain=2,
+    )
+    return _submit_anorak(submission_id, anorak_req,
+                          tumour_verified=bool(selection.get("tumour_verified", True)))
 
 
 @app.post("/dataset-jobs/{submission_id}/assign-clusters")
@@ -6440,6 +6588,23 @@ def cancel_dataset_job(submission_id: str):
     if not row:
         raise HTTPException(404, f"No dataset job found with id {submission_id}")
 
+    if row.get("status") == ANORAK_ONLY_STATUS:
+        # An ANORAK run: its head chain, then what it had queued, found by its
+        # work directory exactly as for the HPL pipeline. The status stays
+        # ANORAK_ONLY_STATUS — it is what makes the run an ANORAK run — and the
+        # head job's CANCELLED state is what says it was stopped.
+        out = Path(row["anorak_out_dir"]) if row.get("anorak_out_dir") else None
+        try:
+            outcome = (submit_hpl_nf.cancel_run(out, _split_job_ids(row.get("anorak_job_id")))
+                       if out else {"cancelled_job_ids": [], "errors": []})
+        except (OSError, subprocess.SubprocessError) as e:
+            outcome = {"cancelled_job_ids": [], "errors": [str(e)]}
+        return {
+            "submission_id": submission_id,
+            "cancelled_job_ids": outcome["cancelled_job_ids"],
+            "scancel_error": "; ".join(outcome["errors"]) or None,
+        }
+
     if _is_nf_job_id(row["job_id"]):
         # A pipeline run: the head chain, then whatever it had queued (found by
         # work directory, as the watchdog finds them). Its stage columns hold
@@ -6740,7 +6905,7 @@ def dataset_job_status(submission_id: str):
         raise HTTPException(404, f"No dataset job found with id {submission_id}")
     row = dict(row)
 
-    if not row["job_id"]:
+    if not row["job_id"] and row.get("status") != ANORAK_ONLY_STATUS:
         # No job_id on record doesn't prove tiling was never submitted — it's
         # also what a crash between submit_dataset_array's sbatch call(s) and
         # _run_dataset_submission's own follow-up DB write looks like (see
@@ -6794,6 +6959,11 @@ def dataset_job_status(submission_id: str):
     # sentinels the helpers below resolve like any job id, and this block says
     # the rest — the head job, the per-stage markers, and why it stopped.
     base["pipeline"] = _pipeline_status(submission_id) if _is_pipeline_row(row) else None
+    # What kind of run this is, for the UI: the one-click HPL pipeline, an
+    # ANORAK run on its own, or a run from before either.
+    base["run_kind"] = ("hpl_pipeline" if _is_pipeline_row(row)
+                        else "anorak" if row.get("status") == ANORAK_ONLY_STATUS
+                        else "hpl_legacy")
 
     if row["h5_job_id"]:
         # Three independent conditions, none sufficient alone: the file is

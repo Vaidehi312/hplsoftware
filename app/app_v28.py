@@ -44,8 +44,8 @@ from db_url import database_url, safe_text  # noqa: E402
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="HPC Chatbot", page_icon="💬", layout="wide")
-st.title("🧠 HPC Chatbot")
+st.set_page_config(page_title="HPC Chatbot", layout="wide")
+st.title("HPC Chatbot")
 
 
 # ---------------------------------------------------------------------------
@@ -342,23 +342,9 @@ def _job_label(job: dict) -> str:
     return f"submission {job.get('submission_id', '')[:8]}"
 
 
-_RUN_STATE_ICONS = {
-    "running": "🔵",
-    "pending": "🟡",
-    "complete": "🟢",
-    "failed": "🔴",
-    "error": "🔴",
-    "cancelled": "⚪",
-    "no record": "⚫",
-    "unknown": "❔",
-    # Pre-Slurm row statuses, which reach here before any job ID exists. Without
-    # these a freshly submitted run showed "❔" — the icon meaning "we cannot
-    # tell" — when its state was in fact known and simply not yet on the cluster.
-    "queued": "🟡",
-    "discovering": "🟡",
-    "submitting": "🟡",
-    "submitted": "🔵",
-}
+# A run's state is written out as a word wherever it is shown; there is no
+# icon for it. (These were coloured-circle emoji, which the UI no longer uses.)
+_RUN_STATE_ICONS: dict[str, str] = {}
 
 
 _STAGE_LABELS = {
@@ -433,11 +419,10 @@ def _render_job_history(submission_id: str, key_prefix: str):
     for job in history:
         stage = job.get("stage", "?")
         state = (job.get("slurm_state") or "unknown").lower()
-        icon = _RUN_STATE_ICONS.get(state, "❔")
         when = (job.get("submitted_at") or "")[:16].replace("T", " ")
         batches = job.get("batch_count") or 1
 
-        header = f"{icon} {_STAGE_LABELS.get(stage, stage)} · {state}"
+        header = f"{_STAGE_LABELS.get(stage, stage)} · {state}"
         if batches > 1:
             header += f" · {batches} batches"
         if when:
@@ -513,7 +498,7 @@ def _dataset_option_label(dataset: dict) -> str:
     point of this list is to answer "which of these still needs something from
     me" without opening each one.
     """
-    icon = _STEP_ICON.get(_dataset_overall_state(dataset), "•")
+    icon = _STEP_ICON.get(_dataset_overall_state(dataset), "")
     bits = [f"{icon} {dataset.get('dataset_name') or '?'}"]
 
     total = dataset.get("total_slides")
@@ -627,7 +612,7 @@ def _render_dataset_rollup(dataset: dict):
         st.caption(" · ".join(provenance))
 
     for step in dataset.get("steps", []):
-        icon = _STEP_ICON.get(step["state"], "•")
+        icon = _STEP_ICON.get(step["state"], "")
         st.markdown(f"{icon} **{step['title']}** — {step['summary']}")
 
     if dataset.get("coverage_checked_at"):
@@ -638,9 +623,9 @@ def _render_dataset_rollup(dataset: dict):
 
 
 _DELIVERABLE_ICON = {
-    "ready": "✅",
-    "running": "🔄",
-    "interrupted": "🟠",
+    "ready": "[Ready]",
+    "running": "[Packaging]",
+    "interrupted": "[Interrupted]",
 }
 
 
@@ -664,7 +649,7 @@ def _render_deliverables(dataset: dict):
 
     st.markdown("**.h5 files**")
     for item in deliverables:
-        icon = _DELIVERABLE_ICON.get(item.get("status"), "•")
+        icon = _DELIVERABLE_ICON.get(item.get("status"), "")
         bits = []
 
         slides = item.get("total_slides")
@@ -708,7 +693,7 @@ def _render_next_action(dataset: dict):
     action = dataset.get("next_action") or {}
     kind = action.get("kind")
     if kind in ("complete", "none", "wait"):
-        prefix = "⏳ " if kind == "wait" else ""
+        prefix = ""
         st.caption(f"{prefix}{action.get('label', '')} — {action.get('detail', '')}")
     elif kind == "submit":
         st.caption("Nothing has been run for this dataset yet.")
@@ -721,50 +706,24 @@ def _render_next_action(dataset: dict):
 
 
 def _render_dataset_runs(dataset: dict):
-    """This dataset's runs, cancelled ones excluded, one shown at a time.
-
-    A selectbox rather than one expander per run, which is what this replaced.
-    Beyond being unreadable at ten runs, that nested a run's own step expanders
-    inside a per-run expander inside the sidebar's — three deep, which
-    Streamlit does not allow.
-
-    Cancelled runs are dropped because they are dead ends: nothing about them
-    can be advanced, and they were mostly cancelled precisely to stop looking
-    at them. Errored runs deliberately stay, because an errored run is normally
-    the one you resume. Whatever a cancelled run finished before it stopped is
-    still counted in the rollup above — this hides the row, not the work.
-    """
-    runs = [r for r in dataset.get("runs", []) if r.get("status") != "cancelled"]
-    hidden = len(dataset.get("runs", [])) - len(runs)
-
+    """Every run this dataset has had — HPL, ANORAK and runs from before the
+    pipeline, cancelled ones included — one shown at a time, newest first."""
+    runs = list(reversed(dataset.get("runs", [])))
     if not runs:
-        st.caption(
-            f"No active runs for this dataset"
-            + (f" ({hidden} cancelled, hidden)." if hidden else ".")
-        )
+        st.caption("No runs for this dataset yet.")
         return
-
     key = _dataset_key(dataset)
     options = [r["submission_id"] for r in runs]
     by_id = {r["submission_id"]: r for r in runs}
     widget_key = f"dataset_run_pick_{key}"
-
-    # A next-action button may have pointed us at a specific run; drop the
-    # pointer if that run is one of the hidden ones rather than letting
-    # Streamlit raise on a value outside the options.
     if st.session_state.get(widget_key) not in options:
         st.session_state.pop(widget_key, None)
-
     chosen = st.selectbox(
         "Run",
         options,
         key=widget_key,
         format_func=lambda sid: _dataset_run_label(by_id[sid]),
-        help="Each resume starts a new run, so a dataset usually has several.",
     )
-    if hidden:
-        st.caption(f"{hidden} cancelled run(s) hidden.")
-
     _render_job_progress(by_id[chosen], key_prefix=f"ds_{key}_")
 
 
@@ -776,8 +735,10 @@ def _dataset_run_label(run: dict) -> str:
     is choosing between.
     """
     state = (run.get("slurm_state") or run.get("status") or "unknown").lower()
-    bits = [f"{_RUN_STATE_ICONS.get(state, '❔')} {(run.get('submitted_at') or '')[:16].replace('T', ' ')}"]
+    bits = [(run.get('submitted_at') or '')[:16].replace('T', ' ')]
 
+    bits.append("ANORAK" if _is_anorak_run(run) else "HPL" if _is_pipeline_run(run)
+                else "HPL (before the pipeline)")
     total = run.get("total_slides")
     if total is not None:
         bits.append(f"{int(total):,} slides" + (" (subset)" if run.get("is_subset") else ""))
@@ -856,14 +817,19 @@ def _render_dataset_workspace(path: str):
 
     dataset = _apply_stored_coverage(dataset)
 
-    # The newest live pipeline run is what someone opening this path is
-    # following; everything before it is history, kept but out of the way.
-    pipeline_runs = [r for r in dataset.get("runs", [])
-                     if _is_pipeline_run(r) and r.get("status") != "cancelled"]
-    if pipeline_runs:
-        st.markdown("**Pipeline run**")
-        _render_job_progress(pipeline_runs[-1], key_prefix=f"pl_{_dataset_key(dataset)}_")
-    with st.expander("Earlier runs (read-only)", expanded=False):
+    # The newest HPL run and the newest ANORAK run are what someone opening
+    # this path is following; every run, those included, is in History.
+    key = _dataset_key(dataset)
+    runs = dataset.get("runs", [])
+    latest_hpl = [r for r in runs if _is_pipeline_run(r)]
+    latest_anorak = [r for r in runs if _is_anorak_run(r)]
+    if latest_hpl:
+        st.markdown("**Latest HPL run**")
+        _render_job_progress(latest_hpl[-1], key_prefix=f"hpl_{key}_")
+    if latest_anorak:
+        st.markdown("**Latest ANORAK run**")
+        _render_job_progress(latest_anorak[-1], key_prefix=f"an_{key}_")
+    with st.expander("History", expanded=False):
         _render_dataset_rollup(dataset)
         st.divider()
         _render_dataset_runs(dataset)
@@ -871,6 +837,11 @@ def _render_dataset_workspace(path: str):
 
 def _is_pipeline_run(run: dict) -> bool:
     return str(run.get("job_id") or "").startswith("nf:")
+
+
+def _is_anorak_run(run: dict) -> bool:
+    """An ANORAK run on its own (POST /anorak-runs)."""
+    return run.get("status") == "anorak_only" or run.get("run_kind") == "anorak"
 
 
 def _is_upload_run(status: dict) -> bool:
@@ -924,55 +895,46 @@ def render_dataset_job_panel():
             ),
         ).strip()
 
-        # The one-click pipeline first, as ANORAK's button is the first thing in
-        # its step; what has already been done to the dataset follows.
-        _render_dataset_submit_section(dataset_path)
+        # The two one-click runs first; what has already been done to the
+        # dataset follows.
+        _render_run_buttons(dataset_path)
         st.divider()
         _render_dataset_workspace(dataset_path)
 
 
-def _render_dataset_submit_section(dataset_path: str):
-    """Run the pipeline (Stages 1-4) — one click, first in the panel.
+def _render_run_buttons(dataset_path: str):
+    """Run HPL, and below it Run ANORAK — each one click, each on its own.
 
-    This used to sit below the dataset view, and behind an opt-in expander
-    whenever the path already had runs, to guard against submitting a second
-    full re-tiling of a directory that was already done. A pipeline run cannot
-    do that: every slide whose tiles are already complete on disk is skipped
-    by its tiling task, so a new run over a tiled dataset tiles only what is
-    missing and goes straight on. What it can still collide with — another
-    run's finished .h5 at the same path — is refused by the server, with the
-    choice to move those outputs aside.
+    Nothing is asked for but the dataset path. HPL runs on the server's own
+    settings (GET /pipeline-defaults), shown beside its button. ANORAK grades
+    every slide in the directory unless a tumour-slide list is given. One
+    shared option makes either a test run on a random, seeded subset.
     """
-    st.markdown("**Run the pipeline (Stages 1-4)**")
     if not dataset_path:
         st.caption("Enter a dataset path above.")
         return
 
-    existing_job = _find_existing_job_for_path(dataset_path)
-    if existing_job:
-        st.caption(
-            f"This path already has runs (newest {existing_job.get('submitted_at', '')}), "
-            f"listed below. A new pipeline run reuses every slide already tiled — only "
-            f"slides without tiles are tiled again. If a pipeline run is still going, "
-            f"follow or resume it below instead of starting another."
-        )
-    _render_new_dataset_submission_form(dataset_path)
+    subset = st.checkbox(
+        "Test on a random subset", value=False, key="run_subset",
+        help="Run on a random sample of the directory's slides instead of all of "
+             "them — the same pipeline, fewer slides. The seed is recorded, so the "
+             "same sample can be asked for again.",
+    )
+    sample_size = seed = None
+    if subset:
+        columns = st.columns(2)
+        sample_size = int(columns[0].number_input(
+            "Slides", min_value=1, value=10, step=1, key="run_subset_n"))
+        seed_text = columns[1].text_input("Seed (optional)", value="", key="run_subset_seed")
+        seed = int(seed_text) if seed_text.strip().isdigit() else None
 
-
-def _render_new_dataset_submission_form(dataset_path: str):
-    """One path, one click: Stages 1-4 as a Nextflow run, on the server's settings.
-
-    Nothing is asked for but the path. The tile folder is the directory's own
-    name; the checkpoint, reference, vote, output locations and concurrency are
-    the server's (GET /pipeline-defaults) and shown here so a click is never a
-    guess about what it will use. The server still checks every one of them
-    before queueing anything, exactly as the per-stage forms did.
-    """
+    # --- HPL -------------------------------------------------------------------
+    st.markdown("**Run HPL** (tiling, packaging, feature extraction, classification)")
     try:
         defaults = client.get_pipeline_defaults()
     except Exception as e:
         defaults = None
-        st.caption(f"Could not load the pipeline's settings ({e}); the server applies them anyway.")
+        st.caption(f"Could not load HPL's settings ({e}); the server applies them anyway.")
     if defaults:
         name = Path(dataset_path.rstrip("/")).name or "?"
         st.caption(
@@ -983,24 +945,51 @@ def _render_new_dataset_submission_form(dataset_path: str):
             f"minimum tissue. Slides already tiled are reused; earlier outputs in the "
             f"way are moved aside, never deleted."
         )
-
-    if st.button("Run pipeline", key="dataset_job_submit", type="primary",
-                 use_container_width=True):
+    if st.button("Run HPL", key="run_hpl", type="primary", use_container_width=True):
         try:
-            result = client.start_pipeline_run(dataset_path=dataset_path.strip())
+            result = client.start_pipeline_run(
+                dataset_path=dataset_path, sample_size=sample_size, seed=seed)
         except requests.exceptions.HTTPError as e:
             st.error(f"Refused: {_http_detail(e)}")
-            return
         except Exception as e:
             st.error(f"Submission failed: {e}")
-            return
-        st.success(
-            f"Pipeline queued — run {result['submission_id']} for "
-            f"'{result.get('dataset_name')}'. Slides are being found and the head job "
-            f"submitted; its progress appears below."
+        else:
+            st.success(f"HPL queued — run {result['submission_id']} for "
+                       f"'{result.get('dataset_name')}'. Its progress appears below.")
+            for entry in result.get("superseded") or []:
+                st.caption(f"Moved aside: {entry['from']} -> {entry['to']}")
+
+    # --- ANORAK ------------------------------------------------------------------
+    st.markdown("**Run ANORAK** (growth-pattern grading)")
+    slides_csv = st.text_input(
+        "Tumour-slide list (optional)", value="", key="run_anorak_csv",
+        help="select_tumour_slides.py's output, optionally filtered by "
+             "filter_slides_by_tile_count.py. Blank grades every slide in the "
+             "directory.",
+    ).strip()
+    if not slides_csv:
+        st.caption(
+            "Blank: every slide in the directory is graded, grouped into tumours by "
+            "the part of the slide name before the first space. Tumour status is not "
+            "checked, so non-tumour slides are graded too — give a tumour-slide list "
+            "for a proper run."
         )
-        for entry in result.get("superseded") or []:
-            st.caption(f"Moved aside: {entry['from']} → {entry['to']}")
+    if st.button("Run ANORAK", key="run_anorak", type="primary", use_container_width=True):
+        try:
+            result = client.start_anorak_run(
+                dataset_path, slides_csv=slides_csv or None,
+                sample_size=sample_size, seed=seed)
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Refused: {_http_detail(e)}")
+        except Exception as e:
+            st.error(f"Submission failed: {e}")
+        else:
+            selection = result.get("selection") or {}
+            st.success(f"ANORAK queued — run {result['submission_id']}, "
+                       f"{selection.get('slides')} slides. Its progress appears below.")
+            if result.get("skipped_unsupported"):
+                st.caption(f"{len(result['skipped_unsupported'])} .scn slide(s) left out: "
+                           f"ANORAK cannot read that format.")
 
 
 def _dataset_job_display_stage(status: dict) -> str:
@@ -1035,12 +1024,12 @@ def _dataset_job_display_stage(status: dict) -> str:
 # current stage's widget, so "what's left?" could not be answered without
 # reading the code.
 _STEP_ICON = {
-    "done": "✅",
-    "running": "🔄",
-    "action": "🔵",       # ready for you to start
-    "attention": "🟠",    # finished or stalled, but needs a decision
-    "failed": "❌",
-    "blocked": "⚪",      # can't start yet, an earlier step must finish
+    "done": "[Done]",
+    "running": "[Running]",
+    "action": "[Ready]",             # ready for you to start
+    "attention": "[Needs attention]",  # finished or stalled, but needs a decision
+    "failed": "[Failed]",
+    "blocked": "[Waiting]",          # can't start yet, an earlier step must finish
 }
 # Must match IN_FLIGHT_SLURM_STATES in tile_server_v2_.py. It lacked
 # CONFIGURING (nodes allocated, prologue still running — squeue reports it
@@ -1196,7 +1185,7 @@ def _test_packaging_note(status: dict) -> str:
     if not status.get("test_h5_job_id"):
         return ""
     if status.get("test_h5_ready"):
-        return " · test subset: ✅ ready"
+        return " · test subset: ready"
     test_state = status.get("test_h5_slurm_state")
     if test_state in _SLURM_IN_FLIGHT:
         return f" · test subset: running ({test_state})"
@@ -2727,6 +2716,47 @@ def _render_anorak_step(status: dict, submission_id: str, key_prefix: str, state
     )
 
 
+def _render_anorak_run_step(status: dict, submission_id: str, key_prefix: str):
+    """An ANORAK run started on its own (Run ANORAK): what it graded, where its
+    outputs are, and — if it stopped short — why, and Resume."""
+    if status.get("anorak_tumour_verified") is False:
+        st.warning("Every slide in the directory was graded; tumour status was not "
+                   "checked, so non-tumour slides are in the grading table too.")
+    if status.get("anorak_scope") == "subset":
+        st.caption(f"Test run: {status.get('anorak_slides')} slides sampled at random, "
+                   f"seed {status.get('anorak_seed')}.")
+    elif status.get("anorak_slides"):
+        st.caption(f"{status['anorak_slides']:,} slides.")
+    if status.get("anorak_error"):
+        st.error(status["anorak_error"])
+    if status.get("anorak_ready"):
+        st.success("Growth-pattern grading complete:")
+        st.code(status.get("anorak_grades_csv"), language=None)
+    elif status.get("anorak_in_flight"):
+        st.info(f"ANORAK running (head job {status.get('anorak_job_id')}, "
+                f"{status.get('anorak_slurm_state')}).")
+    elif status.get("anorak_job_id"):
+        st.warning(f"ANORAK stopped ({status.get('anorak_slurm_state') or 'no Slurm record'}).")
+        if status.get("anorak_stop_reason"):
+            st.caption("Why it stopped (the supervisor's stop marker):")
+            st.code(status["anorak_stop_reason"], language=None)
+        if status.get("anorak_invalid_reason"):
+            st.caption(f"Output not usable: {status['anorak_invalid_reason']}")
+        if not status.get("anorak_submit_blocked") and st.button(
+                "Resume ANORAK", type="primary", key=f"{key_prefix}anorak_resume_{submission_id}"):
+            try:
+                result = client.resume_anorak_run(submission_id)
+            except requests.exceptions.HTTPError as e:
+                st.error(f"Refused: {_http_detail(e)}")
+            except Exception as e:
+                st.error(f"Resume failed: {e}")
+            else:
+                st.success(f"Resumed — head job {result.get('anorak_job_id')}.")
+    if status.get("anorak_out_dir"):
+        st.caption("Run directory (masks, proportions, nextflow.log, report):")
+        st.code(status["anorak_out_dir"], language=None)
+
+
 def _render_anorak_form(status: dict, submission_id: str, key_prefix: str,
                         button_label: str = "Run ANORAK", expanded: bool = True,
                         overwrite: bool = False):
@@ -2899,9 +2929,9 @@ def _http_detail(error) -> str:
 
 
 _SHIFT_STYLE = {
-    "consistent": ("✅", st.success),
-    "notice": ("⚠️", st.warning),
-    "alarm": ("🛑", st.error),
+    "consistent": ("", st.success),
+    "notice": ("", st.warning),
+    "alarm": ("", st.error),
 }
 
 
@@ -2954,7 +2984,7 @@ def _render_cohort_shift(submission_id: str, key_prefix: str) -> None:
             return
 
         icon, box = _SHIFT_STYLE.get(result.get("level"), ("", st.info))
-        box(f"{icon} {result.get('level', '?').upper()} — {result.get('verdict', '')}")
+        box(f"{result.get('level', '?').upper()} — {result.get('verdict', '')}")
 
         left, middle, right = st.columns(3)
         left.metric(
@@ -3505,7 +3535,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
     ):
         items = report.get(field) or []
         if items:
-            with st.expander(f"⚠️ {len(items):,} {label}", expanded=False):
+            with st.expander(f"{len(items):,} {label}", expanded=False):
                 for item in items[:200]:
                     st.text(item)
                 if len(items) > 200:
@@ -3911,7 +3941,11 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
         "kb_load": lambda s: _render_kb_load_step(status, submission_id, key_prefix, s["state"]),
         "anorak": lambda s: _render_anorak_step(status, submission_id, key_prefix, s["state"]),
     }
-    if status.get("pipeline"):
+    if status.get("run_kind") == "anorak":
+        # An ANORAK run on its own: Stages 1-6 were never part of it.
+        steps = [s for s in steps if s["key"] == "anorak"]
+        renderers["anorak"] = lambda s: _render_anorak_run_step(status, submission_id, key_prefix)
+    elif status.get("pipeline"):
         # A pipeline run: Stages 1-4 have no buttons of their own — the
         # pipeline starts each once the one before it has verified its output.
         _render_pipeline_overview(status, submission_id, key_prefix)
@@ -3927,7 +3961,7 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
             renderers[stage] = (lambda stage: lambda s: _render_legacy_stage_readonly(
                 status, stage))(stage)
     for step in steps:
-        icon = _STEP_ICON.get(step["state"], "•")
+        icon = _STEP_ICON.get(step["state"], "")
         # Auto-open whichever step is waiting on the user, so the next action
         # is visible without hunting for it; finished and blocked steps stay
         # collapsed but still show their state in the label.
@@ -3950,7 +3984,8 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
     with st.expander("Slurm job history", expanded=False):
         _render_job_history(submission_id, key_prefix)
 
-    if stage not in ("error", "cancelled"):
+    finished_anorak = status.get("run_kind") == "anorak" and not status.get("anorak_in_flight")
+    if stage not in ("error", "cancelled") and not finished_anorak:
         if st.button("Stop run", key=f"{key_prefix}dataset_job_cancel_{submission_id}"):
             try:
                 cancel_result = client.cancel_dataset_job(submission_id)
@@ -5379,7 +5414,7 @@ def show_wsi(slide_id, ui_suffix=""):
                         unsafe_allow_html=True,
                     )
 
-                with st.expander("🧠 HPC Biological Interpretation", expanded=True):
+                with st.expander("HPC Biological Interpretation", expanded=True):
                     render_hpc_annotation(selected_hpc)
 
     # Filters
@@ -6273,7 +6308,7 @@ def build_legend_panel_html(mode: str, df: pd.DataFrame, heat_hpc: int | None) -
 # ---------------------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hi! 👋 Ask me about your H&E cancer slides — I'll fetch insights instantly."}
+        {"role": "assistant", "content": "Hi! Ask me about your H&E cancer slides — I'll fetch insights instantly."}
     ]
 if "active_slide" not in st.session_state:
     st.session_state.active_slide = None
@@ -6346,7 +6381,7 @@ if prompt:
 
     slide_id = _ensure_active_slide(prompt)
 
-    with st.expander("🧩 Query Plan (debug)", expanded=False):
+    with st.expander("Query Plan (debug)", expanded=False):
         st.json(plan)
         st.caption(f"Saved → {path} · planner: {plan.get('planner', '?')}")
 
@@ -6368,7 +6403,7 @@ if prompt:
         try:
             structured_answer = chat_fetch_answer_from_db(query_for_db, engine, client)
         except Exception as e:
-            structured_answer = f"⚠️ DB query failed: {e}"
+            structured_answer = f"DB query failed: {e}"
     else:
         structured_answer = None
 

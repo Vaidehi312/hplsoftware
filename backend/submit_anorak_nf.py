@@ -214,7 +214,60 @@ def read_slide_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, dtype=str, keep_default_na=False)
 
 
-def check_slide_list(frame: pd.DataFrame, source: Path) -> None:
+#: What slide_list_from_directory writes in is_tumour: not a verdict, a
+#: statement that nobody has made one. check_slide_list accepts it only when
+#: the caller says the list is unverified on purpose (tumour_verified=False).
+UNVERIFIED = "unverified"
+
+#: Extensions ANORAK's main.nf resolves (its SUPPORTED list). A slide in any
+#: other format is left out of a directory list and counted, rather than handed
+#: to a pipeline that would refuse the whole cohort at launch.
+ANORAK_EXTENSIONS = (".svs", ".ndpi", ".mrxs", ".tif", ".tiff", ".png", ".qptiff")
+
+
+def slide_list_from_directory(raw_dir: Path) -> tuple[pd.DataFrame, dict]:
+    """Every slide under raw_dir as an ANORAK slide list, tumour status unverified.
+
+    For running ANORAK on a dataset nobody has selected tumour slides from yet —
+    a brand-new cohort before HPL has run. Each slide is grouped into a tumour
+    by the rule HPL's packaging uses for its samples column
+    (make_hpl_hdf5.sample_from_slide_id), and slide_id is the file's stem,
+    which is what main.nf resolves a slide by. Refuses two files with one stem:
+    main.nf would refuse the whole cohort for the ambiguity at launch.
+    """
+    from make_hpl_hdf5 import sample_from_slide_id
+    from slide_naming import slide_id_from_raw_path
+
+    files = sorted(
+        (p for p in Path(raw_dir).rglob("*") if p.is_file()),
+        key=lambda p: str(p).lower(),
+    )
+    usable = [p for p in files if p.suffix.lower() in ANORAK_EXTENSIONS]
+    # Slides HPL tiles but ANORAK cannot open: counted, not silently absent.
+    skipped = [p.name for p in files if p.suffix.lower() == ".scn"]
+    by_stem: dict[str, list[Path]] = {}
+    for path in usable:
+        by_stem.setdefault(path.stem, []).append(path)
+    clashes = {stem: paths for stem, paths in by_stem.items() if len(paths) > 1}
+    if clashes:
+        example = next(iter(clashes.items()))
+        raise ValueError(
+            f"{len(clashes)} slide name(s) under {raw_dir} belong to more than one "
+            f"file (e.g. {example[0]!r}: {', '.join(str(p) for p in example[1][:3])}). "
+            f"ANORAK finds a slide by its name, so it would refuse the cohort; give "
+            f"it a tumour-slide list that names one of each."
+        )
+    if not usable:
+        raise ValueError(f"No slides ANORAK can read ({', '.join(ANORAK_EXTENSIONS)}) under {raw_dir}.")
+    frame = pd.DataFrame({
+        SLIDE_COLUMN: [p.stem for p in usable],
+        SAMPLE_COLUMN: [sample_from_slide_id(slide_id_from_raw_path(p)) for p in usable],
+        TUMOUR_COLUMN: [UNVERIFIED] * len(usable),
+    })
+    return frame, {"slides": len(usable), "skipped_unsupported": skipped}
+
+
+def check_slide_list(frame: pd.DataFrame, source: Path, *, tumour_verified: bool = True) -> None:
     """Refuse a slide list that would grade the wrong thing without failing.
 
     Non-tumour rows: select_tumour_slides.py writes every slide by default,
@@ -245,6 +298,11 @@ def check_slide_list(frame: pd.DataFrame, source: Path) -> None:
             f"the run would be short a slide nobody named."
         )
     not_tumour = ~frame[TUMOUR_COLUMN].str.strip().str.lower().isin(_TRUE_STRINGS)
+    if not tumour_verified:
+        # A directory-wide list, run on purpose before any tumour selection
+        # exists. Only its own "unverified" is excused: a list that says some
+        # slides are NOT tumour is a verdict, and still refused.
+        not_tumour &= frame[TUMOUR_COLUMN].str.strip().str.lower() != UNVERIFIED
     if not_tumour.any():
         raise ValueError(
             f"{source} has {int(not_tumour.sum())} of {len(frame)} slide(s) whose "
@@ -580,8 +638,14 @@ def submit_anorak_job(
     notify_email: str | None = None,
     extra_args: list[str] | None = None,
     dry_run: bool = False,
+    tumour_verified: bool = True,
 ) -> dict:
-    """Choose the slides, write the run's own list, and submit the head job."""
+    """Choose the slides, write the run's own list, and submit the head job.
+
+    tumour_verified=False is for a list from slide_list_from_directory: every
+    slide in a cohort nobody has selected tumour slides from yet. It is
+    recorded in the run's selection, so the grading table can always say so.
+    """
     # Each missing path gets the sentence that fixes it. Two of the four are
     # deployment-level locations the caller never typed — they come from the
     # server's environment — so naming the path alone leaves someone looking at
@@ -669,12 +733,13 @@ def submit_anorak_job(
     frame = read_slide_csv(slides_csv)
     if frame.empty:
         raise ValueError(f"{slides_csv} lists no slides")
-    check_slide_list(frame, slides_csv)
+    check_slide_list(frame, slides_csv, tumour_verified=tumour_verified)
 
     chosen, selection = select_slide_rows(
         frame, scope=scope, sample_size=sample_size, seed=seed
     )
     selection["source_csv"] = str(slides_csv)
+    selection["tumour_verified"] = bool(tumour_verified)
     write_slide_list(chosen, run_list, selection)
 
     work_dir = out_dir / "work"

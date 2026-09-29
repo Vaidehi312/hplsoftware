@@ -36,22 +36,14 @@ function SubmitSection({ datasetPath }) {
 
   return (
     <div className="pipeline-run-card">
-      <h4 className="pipeline-subheading">Run the pipeline (Stages 1-4)</h4>
-      {!datasetPath ? (
-        <div className="pipeline-caption">Enter a dataset path above.</div>
-      ) : (
-        <>
-          {existingJob && (
-            <div className="pipeline-caption">
-              This path already has runs (newest {existingJob.submitted_at || ""}), listed below. A new
-              pipeline run reuses every slide already tiled — only slides without tiles are tiled
-              again. If a pipeline run is still going, follow or resume it below instead of starting
-              another.
-            </div>
-          )}
-          <NewRunForm datasetPath={datasetPath} onSubmitted={() => setRefreshTick((t) => t + 1)} />
-        </>
+      {datasetPath && existingJob && (
+        <div className="pipeline-caption">
+          This path already has runs (newest {existingJob.submitted_at || ""}), in History below. A new HPL run
+          reuses every slide already tiled. If a run is still going, follow or resume it below instead of
+          starting another.
+        </div>
       )}
+      <NewRunForm datasetPath={datasetPath} onSubmitted={() => setRefreshTick((t) => t + 1)} />
     </div>
   );
 }

@@ -94,8 +94,11 @@ make that work, and each is the kind that fails silently if changed back:
 `backend/tests/test_upload_pipeline.py` pins all three.
 
 **New runs are one click: Stages 1-4 as one Nextflow run, like ANORAK.** The dataset panel in both
-UIs takes one input — the dataset path — and one button, **Run pipeline**, first in the panel. The
-request carries only the path; everything else is the server's (`GET /pipeline-defaults`): tile
+UIs takes one input — the dataset path — and two buttons, **Run HPL** and below it **Run ANORAK**,
+either usable on its own; one shared "Test on a random subset" option (slide count + recorded seed)
+applies to both. Below them: the latest HPL run, the latest ANORAK run, and a collapsed **History**
+with every run (cancelled included). The panel uses no emoji — states are words (`[Done]`). The
+HPL request carries only the path; everything else is the server's (`GET /pipeline-defaults`): tile
 folder = the directory's name, `HPL_CHECKPOINT`, `HPC_REFERENCE_PATH`, the tuned vote,
 `HPL_NF_MAX_TILING` (50) slides at a time, and earlier complete outputs at the run's paths *moved*
 into `superseded-<stamp>/` beside them (never deleted; refused while any recorded job may be
@@ -128,6 +131,13 @@ and 6 stay manual, with their dry runs. How the rest of the server sees such a r
   with `allow_incomplete`, in which case the tiling gate leaves it out of
   `manifest.packaged.txt` (what packaging reads) and names it in the marker. Resume reuses the
   Nextflow params recorded in `run_config.json` (`resume_params`), re-choosing only the GPU type.
+- **Run ANORAK** (`POST /anorak-runs`) is its own run: a `slurm_dataset_runs` row whose status is
+  `anorak_only` for life (it is the run's kind — cancel and errors do not overwrite it), submitted
+  through Stage 7's own `_submit_anorak`. With no tumour-slide list it grades every slide ANORAK can
+  read (`slide_list_from_directory`: slide_id = file stem, samples by HPL's
+  `sample_from_slide_id`, `is_tumour = unverified`); only that server-built list may pass
+  `tumour_verified=False`, and a list that says a slide is *not* tumour is refused regardless.
+  `/anorak-resume` repeats a run from its own `slide_list.selection.json`.
 - `hpl-nf/tools/test_workflow_*.py` make each per-stage guard fail and run real Nextflow in
   `-stub` mode; `backend/tests/test_hpl_nf_pipeline.py` covers the sentinels and the stepper.
 

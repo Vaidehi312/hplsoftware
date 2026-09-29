@@ -15,13 +15,12 @@ import {
   errorDetail,
   jobLabel,
   pipelineSteps,
-  RUN_STATE_ICONS,
   STAGE_LABELS,
   STEP_ICON,
 } from "./utils";
 import { Alert, Button, Expander } from "./widgets";
 import { STAGE_RENDERERS } from "./stages/index.js";
-import PipelineStage, { LegacyStage, PipelineOverview } from "./stages/PipelineStage.jsx";
+import PipelineStage, { AnorakRunStage, LegacyStage, PipelineOverview } from "./stages/PipelineStage.jsx";
 
 // Port of _render_job_history(): every Slurm job this run has submitted,
 // across every stage — the run's own status fields only hold one attempt
@@ -62,10 +61,9 @@ function JobHistory({ submissionId }) {
       {history.map((job, i) => {
         const stage = job.stage || "?";
         const stateStr = String(job.slurm_state || "unknown").toLowerCase();
-        const icon = RUN_STATE_ICONS[stateStr] || "❔";
         const when = (job.submitted_at || "").slice(0, 16).replace("T", " ");
         const batches = job.batch_count || 1;
-        let header = `${icon} ${STAGE_LABELS[stage] || stage} · ${stateStr}`;
+        let header = `${STAGE_LABELS[stage] || stage} · ${stateStr}`;
         if (batches > 1) header += ` · ${batches} batches`;
         if (when) header += ` · ${when}`;
         const detail = describeJobParams(stage, job.params);
@@ -141,12 +139,17 @@ export default function RunProgress({ submissionId, job }) {
   const totalSlides = job && job.total_slides != null ? job.total_slides : status.total_slides;
   const submittedAt = (job && job.submitted_at) || status.submitted_at || "";
   const stage = status.status;
-  const steps = pipelineSteps(status);
+  // An ANORAK run on its own: Stages 1-6 were never part of it.
+  const isAnorakOnly = status.run_kind === "anorak";
+  const steps = pipelineSteps(status).filter((s) => !isAnorakOnly || s.key === "anorak");
 
   // Built from STAGE_RENDERERS so the key set lives in one importable place —
   // see that module for why. Every stage gets the same props and ignores what
   // it does not use.
   const renderStep = (s) => {
+    if (isAnorakOnly) {
+      return <AnorakRunStage status={status} submissionId={submissionId} onChanged={refresh} />;
+    }
     // A pipeline run's Stages 1-4 have no buttons of their own — the pipeline
     // starts each once the one before has verified its output.
     if (status.pipeline && PIPELINE_STAGES.includes(s.key)) {
@@ -199,7 +202,7 @@ export default function RunProgress({ submissionId, job }) {
           resetKey={`${step.state}|${step.summary}`}
           title={
             <span className="pipeline-step-header">
-              <span className="pipeline-step-icon">{STEP_ICON[step.state] || "•"}</span>
+              <span className="pipeline-step-icon">{STEP_ICON[step.state] || ""}</span>
               <span className="pipeline-step-title">{step.title}</span>
               <span className="pipeline-step-summary">— {step.summary}</span>
             </span>
@@ -213,7 +216,7 @@ export default function RunProgress({ submissionId, job }) {
         <JobHistory submissionId={submissionId} />
       </Expander>
 
-      {stage !== "error" && stage !== "cancelled" && (
+      {stage !== "error" && stage !== "cancelled" && !(isAnorakOnly && !status.anorak_in_flight) && (
         <Button kind="danger" onClick={handleCancel} disabled={cancelBusy}>
           {cancelBusy ? "Stopping…" : "Stop run"}
         </Button>

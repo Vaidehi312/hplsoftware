@@ -122,6 +122,80 @@ function PipelineResume({ status, submissionId, onChanged }) {
   );
 }
 
+// An ANORAK run started on its own (Run ANORAK) — port of
+// _render_anorak_run_step: what it graded, where its outputs are, and — if it
+// stopped short — why, and Resume.
+export function AnorakRunStage({ status, submissionId, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState(null);
+
+  async function resume() {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await api.resumeAnorakRun(submissionId);
+      setMessage({ type: "success", text: `Resumed — head job ${result.anorak_job_id}.` });
+      if (onChanged) onChanged();
+    } catch (e) {
+      setMessage({ type: "error", text: `Refused: ${httpDetail(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      {status.anorak_tumour_verified === false && (
+        <Alert type="warning">
+          Every slide in the directory was graded; tumour status was not checked, so non-tumour slides are in the
+          grading table too.
+        </Alert>
+      )}
+      {status.anorak_scope === "subset" ? (
+        <Caption>
+          Test run: {status.anorak_slides} slides sampled at random, seed {status.anorak_seed}.
+        </Caption>
+      ) : status.anorak_slides ? (
+        <Caption>{Number(status.anorak_slides).toLocaleString()} slides.</Caption>
+      ) : null}
+      {status.anorak_error && <Alert type="error">{status.anorak_error}</Alert>}
+      {status.anorak_ready ? (
+        <>
+          <Alert type="success">Growth-pattern grading complete:</Alert>
+          <CodeBlock>{status.anorak_grades_csv}</CodeBlock>
+        </>
+      ) : status.anorak_in_flight ? (
+        <Alert type="info">
+          ANORAK running (head job {status.anorak_job_id}, {status.anorak_slurm_state}).
+        </Alert>
+      ) : status.anorak_job_id ? (
+        <>
+          <Alert type="warning">ANORAK stopped ({status.anorak_slurm_state || "no Slurm record"}).</Alert>
+          {status.anorak_stop_reason && (
+            <>
+              <Caption>Why it stopped (the supervisor&apos;s stop marker):</Caption>
+              <CodeBlock>{status.anorak_stop_reason}</CodeBlock>
+            </>
+          )}
+          {status.anorak_invalid_reason && <Caption>Output not usable: {status.anorak_invalid_reason}</Caption>}
+          {!status.anorak_submit_blocked && (
+            <Button kind="primary" onClick={resume} disabled={busy}>
+              {busy ? "Resuming…" : "Resume ANORAK"}
+            </Button>
+          )}
+        </>
+      ) : null}
+      {message && <Alert type={message.type}>{message.text}</Alert>}
+      {status.anorak_out_dir && (
+        <>
+          <Caption>Run directory (masks, proportions, nextflow.log, report):</Caption>
+          <CodeBlock>{status.anorak_out_dir}</CodeBlock>
+        </>
+      )}
+    </div>
+  );
+}
+
 // Stages 1-4 of a run from before the pipeline: what it did, no buttons.
 // Port of _render_legacy_stage_readonly.
 export function LegacyStage({ stage, status }) {

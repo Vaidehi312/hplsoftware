@@ -631,7 +631,7 @@ def all_job_ids(out_dir: Path) -> list[str]:
     return hpl_nf_state.read_head_job_ids(out_dir)
 
 
-def cancel_run(out_dir: Path) -> dict:
+def cancel_run(out_dir: Path, head_job_ids: list[str] | None = None) -> dict:
     """scancel the head chain, then anything still queued from this run.
 
     TERM to the head job lets Nextflow cancel what it submitted, but a head job
@@ -639,7 +639,7 @@ def cancel_run(out_dir: Path) -> dict:
     run's task jobs are also found the way nf_supervise.sh finds them — by
     working directory, which no other run shares — and cancelled directly.
     """
-    head = all_job_ids(out_dir)
+    head = list(head_job_ids) if head_job_ids is not None else all_job_ids(out_dir)
     cancelled, errors = [], []
     if head:
         result = subprocess.run(["scancel", *head], capture_output=True, text=True, timeout=30)

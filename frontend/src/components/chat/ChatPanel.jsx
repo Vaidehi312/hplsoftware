@@ -105,7 +105,7 @@ export default function ChatPanel({ slideId, onOpenSlide }) {
       setMessages((m) => [...m, { role: "assistant", content: finalAnswer, tileImages }]);
     } catch (e) {
       const message = e instanceof api.ApiError ? e.message : String((e && e.message) || e);
-      setMessages((m) => [...m, { role: "assistant", content: `⚠️ Query failed: ${message}` }]);
+      setMessages((m) => [...m, { role: "assistant", content: `Query failed: ${message}` }]);
     } finally {
       setSending(false);
     }
@@ -142,7 +142,7 @@ export default function ChatPanel({ slideId, onOpenSlide }) {
 
       {lastPlan && (
         <details className="chat-debug">
-          <summary>🧩 Query Plan (debug)</summary>
+          <summary>Query Plan (debug)</summary>
           <pre>{JSON.stringify(lastPlan, null, 2)}</pre>
           <div className="chat-debug-caption">planner: {lastPlan.planner || "?"}</div>
         </details>

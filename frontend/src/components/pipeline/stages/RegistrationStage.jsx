@@ -413,7 +413,7 @@ export default function RegistrationStage({ status, submissionId, state, onChang
             const items = report[field] || [];
             if (!items.length) return null;
             return (
-              <Expander key={field} title={`⚠️ ${fmtInt(items.length)} ${label}`}>
+              <Expander key={field} title={`${fmtInt(items.length)} ${label}`}>
                 {items.slice(0, 200).map((item, i) => (
                   <div key={i} className="pipeline-code">
                     {item}

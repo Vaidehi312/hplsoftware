@@ -17,6 +17,7 @@ import {
   datasetOptionLabel,
   datasetRunLabel,
   datasetsUnderPath,
+  isAnorakRun,
   DELIVERABLE_ICON,
   STEP_ICON,
 } from "./utils";
@@ -38,7 +39,7 @@ function Deliverables({ dataset }) {
         <strong>.h5 files</strong>
       </div>
       {deliverables.map((item, i) => {
-        const icon = DELIVERABLE_ICON[item.status] || "•";
+        const icon = DELIVERABLE_ICON[item.status] || "";
         const bits = [];
         const slides = item.total_slides;
         if (slides != null) bits.push(`${Number(slides).toLocaleString()} slides`);
@@ -78,7 +79,6 @@ function NextAction({ dataset }) {
   if (kind === "complete" || kind === "none" || kind === "wait") {
     return (
       <div className="pipeline-caption">
-        {kind === "wait" ? "⏳ " : ""}
         {action.label} — {action.detail || ""}
       </div>
     );
@@ -113,7 +113,7 @@ function DatasetRollup({ dataset }) {
 
       {(dataset.steps || []).map((step, i) => (
         <div key={i} className="pipeline-caption pipeline-caption-strong">
-          {STEP_ICON[step.state] || "•"} <strong>{step.title}</strong> — {step.summary}
+          {STEP_ICON[step.state] || ""} <strong>{step.title}</strong> — {step.summary}
         </div>
       ))}
 
@@ -131,16 +131,10 @@ function DatasetRollup({ dataset }) {
 // dead ends, nothing about them can be advanced), one shown at a time via a
 // picker, handed off to RunProgress.
 function DatasetRuns({ dataset, selectedRunId, onSelectRun }) {
-  const runs = (dataset.runs || []).filter((r) => r.status !== "cancelled");
-  const hidden = (dataset.runs || []).length - runs.length;
-
-  if (!runs.length) {
-    return (
-      <div className="pipeline-caption">
-        No active runs for this dataset{hidden ? ` (${hidden} cancelled, hidden).` : "."}
-      </div>
-    );
-  }
+  // Every run this dataset has had — HPL, ANORAK, runs from before the
+  // pipeline, cancelled ones included — newest first.
+  const runs = [...(dataset.runs || [])].reverse();
+  if (!runs.length) return <div className="pipeline-caption">No runs for this dataset yet.</div>;
 
   const validSelection = runs.find((r) => r.submission_id === selectedRunId) ? selectedRunId : runs[0].submission_id;
   const chosenJob = runs.find((r) => r.submission_id === validSelection);
@@ -156,10 +150,7 @@ function DatasetRuns({ dataset, selectedRunId, onSelectRun }) {
             </option>
           ))}
         </select>
-        <span className="pipeline-field-help">Each resume starts a new run, so a dataset usually has several.</span>
       </div>
-      {hidden > 0 && <div className="pipeline-caption">{hidden} cancelled run(s) hidden.</div>}
-
       <RunProgress submissionId={validSelection} job={chosenJob} />
     </div>
   );
@@ -187,7 +178,7 @@ export default function DatasetWorkspace({ path }) {
     if (!matches.length) {
       return (
         <Alert type="info">
-          No runs recorded for this path yet. Run the pipeline above to start the first one.
+          No runs recorded for this path yet. Run HPL or ANORAK above to start the first one.
         </Alert>
       );
     }
@@ -228,10 +219,13 @@ export default function DatasetWorkspace({ path }) {
       }
     : rawDataset;
 
-  const pipelineRuns = (dataset.runs || []).filter(
-    (r) => String(r.job_id || "").startsWith("nf:") && r.status !== "cancelled",
-  );
-  const latestPipeline = pipelineRuns.length ? pipelineRuns[pipelineRuns.length - 1] : null;
+  // The newest HPL run and the newest ANORAK run are what someone opening this
+  // path is following; every run, those included, is in History.
+  const runsHere = dataset.runs || [];
+  const hplRuns = runsHere.filter((r) => String(r.job_id || "").startsWith("nf:"));
+  const anorakRuns = runsHere.filter(isAnorakRun);
+  const latestHpl = hplRuns.length ? hplRuns[hplRuns.length - 1] : null;
+  const latestAnorak = anorakRuns.length ? anorakRuns[anorakRuns.length - 1] : null;
 
   return (
     <div>
@@ -263,18 +257,24 @@ export default function DatasetWorkspace({ path }) {
         </div>
       )}
 
-      {/* The newest live pipeline run is what someone opening this path is
-          following; everything before it is history, kept but out of the way. */}
-      {latestPipeline && (
+      {latestHpl && (
         <div>
           <div className="pipeline-caption pipeline-caption-strong">
-            <strong>Pipeline run</strong>
+            <strong>Latest HPL run</strong>
           </div>
-          <RunProgress submissionId={latestPipeline.submission_id} job={latestPipeline} />
+          <RunProgress submissionId={latestHpl.submission_id} job={latestHpl} />
+        </div>
+      )}
+      {latestAnorak && (
+        <div>
+          <div className="pipeline-caption pipeline-caption-strong">
+            <strong>Latest ANORAK run</strong>
+          </div>
+          <RunProgress submissionId={latestAnorak.submission_id} job={latestAnorak} />
         </div>
       )}
 
-      <Expander title="Earlier runs (read-only)">
+      <Expander title="History">
         <DatasetRollup dataset={dataset} />
         <hr className="pipeline-divider" />
         <DatasetRuns dataset={dataset} selectedRunId={selectedRunId} onSelectRun={setSelectedRunId} />

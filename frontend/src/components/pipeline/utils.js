@@ -70,20 +70,9 @@ export function jobLabel(job) {
   return `submission ${(job.submission_id || "").slice(0, 8)}`;
 }
 
-export const RUN_STATE_ICONS = {
-  running: "\u{1F535}",
-  pending: "\u{1F7E1}",
-  complete: "\u{1F7E2}",
-  failed: "\u{1F534}",
-  error: "\u{1F534}",
-  cancelled: "⚪",
-  "no record": "⚫",
-  unknown: "❔",
-  queued: "\u{1F7E1}",
-  discovering: "\u{1F7E1}",
-  submitting: "\u{1F7E1}",
-  submitted: "\u{1F535}",
-};
+// A run's state is written out as a word wherever it is shown; there is no
+// icon for it (these were coloured-circle emoji, which the UI no longer uses).
+export const RUN_STATE_ICONS = {};
 
 export const STAGE_LABELS = {
   tiling: "Tiling",
@@ -98,18 +87,18 @@ export const STAGE_LABELS = {
 // Step state -> icon. The point (per app_v28.py) is that all 6 stages are
 // visible at once with their state, not just whichever one is "current".
 export const STEP_ICON = {
-  done: "✅",
-  running: "\u{1F504}",
-  action: "\u{1F535}", // ready for you to start
-  attention: "\u{1F7E0}", // finished or stalled, needs a decision
-  failed: "❌",
-  blocked: "⚪", // can't start yet, an earlier step must finish
+  done: "[Done]",
+  running: "[Running]",
+  action: "[Ready]", // ready for you to start
+  attention: "[Needs attention]", // finished or stalled, needs a decision
+  failed: "[Failed]",
+  blocked: "[Waiting]", // can't start yet, an earlier step must finish
 };
 
 export const DELIVERABLE_ICON = {
-  ready: "✅",
-  running: "\u{1F504}",
-  interrupted: "\u{1F7E0}",
+  ready: "[Ready]",
+  running: "[Packaging]",
+  interrupted: "[Interrupted]",
 };
 
 // Must match IN_FLIGHT_SLURM_STATES in tile_server_v2_.py. It lacked
@@ -181,9 +170,15 @@ export function datasetOptionLabel(dataset) {
   return bits.join(" · ");
 }
 
+// An ANORAK run on its own (POST /anorak-runs).
+export function isAnorakRun(run) {
+  return run.status === "anorak_only" || run.run_kind === "anorak";
+}
+
 export function datasetRunLabel(run) {
   const state = String(run.slurm_state || run.status || "unknown").toLowerCase();
-  const bits = [`${RUN_STATE_ICONS[state] || "❔"} ${(run.submitted_at || "").slice(0, 16).replace("T", " ")}`];
+  const bits = [(run.submitted_at || "").slice(0, 16).replace("T", " ")];
+  bits.push(isAnorakRun(run) ? "ANORAK" : String(run.job_id || "").startsWith("nf:") ? "HPL" : "HPL (before the pipeline)");
   const total = run.total_slides;
   if (total != null) bits.push(`${fmtInt(total)} slides${run.is_subset ? " (subset)" : ""}`);
   if (run.resumed_from_submission_id) bits.push("resume");
@@ -212,7 +207,7 @@ export function fullPackagingScopeCaption(status) {
 // tried the subset option doesn't read as "packaging never touched".
 export function testPackagingNote(status) {
   if (!status.test_h5_job_id) return "";
-  if (status.test_h5_ready) return " · test subset: ✅ ready";
+  if (status.test_h5_ready) return " · test subset: ready";
   const state = status.test_h5_slurm_state;
   if (SLURM_IN_FLIGHT.has(state)) return ` · test subset: running (${state})`;
   return ` · test subset: ${state || "interrupted"}`;

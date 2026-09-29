@@ -298,6 +298,24 @@ class TileServerClient:
         body = {k: v for k, v in body.items() if v is not None}
         return self._post_json("/pipeline-runs", body)
 
+    def start_anorak_run(self, dataset_path: str, *, slides_csv: str | None = None,
+                         sample_size: int | None = None, seed: int | None = None) -> dict:
+        """One click: ANORAK on its own over a dataset path (POST /anorak-runs).
+
+        Without slides_csv every slide in the directory is graded, grouped into
+        tumours by HPL's slide-id rule, and recorded as tumour-unverified. With
+        one (select_tumour_slides.py's output) it is checked as Stage 7 checks
+        it. sample_size makes it a test run on a random, seeded subset.
+        """
+        body = {"dataset_path": dataset_path, "slides_csv": slides_csv,
+                "sample_size": sample_size, "seed": seed}
+        return self._post_json("/anorak-runs", {k: v for k, v in body.items() if v is not None},
+                               timeout=300)
+
+    def resume_anorak_run(self, submission_id: str) -> dict:
+        """Resubmit a stopped ANORAK run exactly as it was, with -resume."""
+        return self._post_json(f"/dataset-jobs/{submission_id}/anorak-resume", {}, timeout=300)
+
     def resume_pipeline_run(self, submission_id: str, chain: int | None = None,
                             time_limit: str | None = None,
                             allow_incomplete: bool | None = None) -> dict:

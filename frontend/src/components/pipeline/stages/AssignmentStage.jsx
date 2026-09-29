@@ -7,9 +7,9 @@ import { errorDetail, httpDetail, SLURM_IN_FLIGHT } from "../utils";
 import { Alert, Button, CodeBlock, Expander, Field, Metric, RadioGroup } from "../widgets";
 
 const SHIFT_STYLE = {
-  consistent: { icon: "✅", type: "success" },
-  notice: { icon: "⚠️", type: "warning" },
-  alarm: { icon: "🛑", type: "error" },
+  consistent: { icon: "", type: "success" },
+  notice: { icon: "", type: "warning" },
+  alarm: { icon: "", type: "error" },
 };
 
 // "Is this cohort represented in the reference?" — a distinct question from

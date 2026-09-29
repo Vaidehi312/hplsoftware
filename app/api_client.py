@@ -230,14 +230,18 @@ class TileServerClient:
             body["tiling_params"] = tiling_params
         return self._post_json("/dataset-jobs", body)
 
+    def get_pipeline_defaults(self) -> dict:
+        """The settings a one-click run uses — all the server's own."""
+        return self._get_json("/pipeline-defaults")
+
     def start_pipeline_run(
         self,
         dataset_path: str,
-        checkpoint: str,
+        checkpoint: str | None = None,
         *,
         dataset_name: str | None = None,
-        max_concurrent: int = 10,
-        min_tissue: float | None = 30.0,
+        max_concurrent: int | None = None,
+        min_tissue: float | None = None,
         sample_size: int | None = None,
         slide_names: list[str] | None = None,
         seed: int | None = None,
@@ -253,6 +257,7 @@ class TileServerClient:
         chain: int | None = None,
         time_limit: str | None = None,
         allow_incomplete: bool = False,
+        move_existing_outputs: bool = True,
     ) -> dict:
         """One click: Stages 1-4 as a single Nextflow run (POST /pipeline-runs).
 
@@ -281,12 +286,16 @@ class TileServerClient:
             "chain": chain,
             "time_limit": time_limit,
             "allow_incomplete": allow_incomplete,
+            "move_existing_outputs": move_existing_outputs,
         }
         if min_tissue is not None:
             body["min_tissue"] = min_tissue
         if vote_preset:
             body["vote_preset"] = vote_preset
         body.update({k: v for k, v in (vote_overrides or {}).items() if v is not None})
+        # Unset means "the server's default": dropped rather than sent as null,
+        # so a one-click call carries only the path.
+        body = {k: v for k, v in body.items() if v is not None}
         return self._post_json("/pipeline-runs", body)
 
     def resume_pipeline_run(self, submission_id: str, chain: int | None = None,

@@ -21,7 +21,7 @@ import {
 } from "./utils";
 import { Alert, Button, Expander } from "./widgets";
 import { STAGE_RENDERERS } from "./stages/index.js";
-import PipelineStage, { PipelineOverview } from "./stages/PipelineStage.jsx";
+import PipelineStage, { LegacyStage, PipelineOverview } from "./stages/PipelineStage.jsx";
 
 // Port of _render_job_history(): every Slurm job this run has submitted,
 // across every stage — the run's own status fields only hold one attempt
@@ -153,6 +153,13 @@ export default function RunProgress({ submissionId, job }) {
       return (
         <PipelineStage stage={s.key} status={status} submissionId={submissionId} state={s.state} onChanged={refresh} />
       );
+    }
+    // A run from before the pipeline: its Stages 1-4 are history, read-only.
+    // Upload runs keep their Stage 3/4 buttons — an uploaded slide does not
+    // go through the pipeline.
+    const isUpload = String(status.job_id || "").startsWith("local:");
+    if (!status.pipeline && !isUpload && PIPELINE_STAGES.includes(s.key)) {
+      return <LegacyStage stage={s.key} status={status} />;
     }
     const Stage = STAGE_RENDERERS[s.key];
     if (!Stage) return null;

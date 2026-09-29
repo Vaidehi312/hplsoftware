@@ -68,7 +68,7 @@ function PipelineResume({ status, submissionId, onChanged }) {
         allowIncomplete: allowIncomplete && !already ? true : null,
       });
       setMessage({ type: "success", text: `Resumed — head job ${result.nf_job_id}.` });
-      onChanged && onChanged();
+      if (onChanged) onChanged();
     } catch (e) {
       setMessage({ type: "error", text: `Refused: ${httpDetail(e)}` });
     } finally {
@@ -118,6 +118,39 @@ function PipelineResume({ status, submissionId, onChanged }) {
         </>
       )}
       {message && <Alert type={message.type}>{message.text}</Alert>}
+    </div>
+  );
+}
+
+// Stages 1-4 of a run from before the pipeline: what it did, no buttons.
+// Port of _render_legacy_stage_readonly.
+export function LegacyStage({ stage, status }) {
+  const [jobKey, pathKey, reasonKey] = {
+    tiling: ["job_id", null, null],
+    packaging: ["h5_job_id", "h5_output_path", "h5_invalid_reason"],
+    extraction: ["extraction_job_id", "extraction_output_path", "extraction_invalid_reason"],
+    assignment: ["assignment_job_id", "assignment_output_path", "assignment_invalid_reason"],
+  }[stage];
+  return (
+    <div>
+      {status[jobKey] && <Caption>Slurm job(s): {status[jobKey]}</Caption>}
+      {stage === "tiling" && status.succeeded != null && (
+        <Caption>
+          {Number(status.succeeded).toLocaleString()} of {Number(status.total_slides || 0).toLocaleString()} slides
+          have tiles.
+        </Caption>
+      )}
+      {pathKey && status[pathKey] && (
+        <>
+          <Caption>Output:</Caption>
+          <CodeBlock>{status[pathKey]}</CodeBlock>
+        </>
+      )}
+      {reasonKey && status[reasonKey] && <Caption>Not usable: {status[reasonKey]}</Caption>}
+      <Caption>
+        Read-only: Stages 1-4 now run as one pipeline. Run the pipeline for this dataset to carry it on; it
+        reuses whatever this run produced.
+      </Caption>
     </div>
   );
 }

@@ -93,8 +93,16 @@ make that work, and each is the kind that fails silently if changed back:
 
 `backend/tests/test_upload_pipeline.py` pins all three.
 
-**New runs are one click: Stages 1-4 as one Nextflow run, like ANORAK.** The UI's "Run pipeline"
-(both UIs) calls `POST /pipeline-runs`, which submits `hpl-nf/` through `submit_hpl_nf.py`: one
+**New runs are one click: Stages 1-4 as one Nextflow run, like ANORAK.** The dataset panel in both
+UIs takes one input — the dataset path — and one button, **Run pipeline**, first in the panel. The
+request carries only the path; everything else is the server's (`GET /pipeline-defaults`): tile
+folder = the directory's name, `HPL_CHECKPOINT`, `HPC_REFERENCE_PATH`, the tuned vote,
+`HPL_NF_MAX_TILING` (50) slides at a time, and earlier complete outputs at the run's paths *moved*
+into `superseded-<stamp>/` beside them (never deleted; refused while any recorded job may be
+writing them). Runs from before the pipeline are shown read-only under "Earlier runs"; their
+per-stage buttons are gone. Upload runs keep their Stage 3/4 buttons — an uploaded slide does not
+go through the pipeline — and Stages 5-7 keep theirs everywhere. `POST /pipeline-runs`
+submits `hpl-nf/` through `submit_hpl_nf.py`: one
 supervised head job (`head_sbatch_command()`, chain of standbys, and the watchdog at
 `hpl-nf/tools/nf_supervise.sh`, a symlink to ANORAK's that submission refuses if it has drifted),
 whose tasks run the per-stage wrappers in `hpl-nf/bin/` — which import and call the *same* tiler,

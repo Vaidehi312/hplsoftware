@@ -120,6 +120,54 @@ def test_the_submission_records_its_settings_for_a_resume(tmp_path):
     assert written["nf_params"] == {"max_tiling_forks": 50}
 
 
+def test_moving_outputs_aside_keeps_them_and_only_them(tmp_path):
+    """A full run over a dataset an earlier run packaged is refused, or — when
+    asked — moves that run's outputs into superseded-<stamp>/. Nothing is
+    deleted, the stage's leftovers go with their output, and a neighbour that
+    only shares the stem (a test .h5) is left where it is."""
+    ds = tmp_path / "model_input" / "DS"
+    ds.mkdir(parents=True)
+    h5 = ds / "hdf5_DS_he_train.h5"
+    family = [h5, ds / "hdf5_DS_he_train.h5.partial", ds / "hdf5_DS_he_train.h5.completed.txt"]
+    neighbour = ds / "hdf5_DS_he_train_test_sample_ab12.h5"
+    for f in (*family, neighbour):
+        f.write_text("x")
+    res = tmp_path / "results"
+    res.mkdir()
+    csv = res / "DS_hpc_assignments.csv"
+    parts = [csv, res / "DS_hpc_assignments.rows0-5.csv", res / "DS_hpc_assignments.query_mean.npy"]
+    for f in parts:
+        f.write_text("x")
+    (res / "DS_hpc_assignments.csv.chunks").mkdir()
+
+    moved = submit_hpl_nf.move_outputs_aside(
+        {"h5": h5, "projections": res / "absent.h5", "assignments": csv}, "20260929-120000")
+
+    assert neighbour.exists(), "a file that only shares the stem was moved"
+    for f in (*family, *parts, res / "DS_hpc_assignments.csv.chunks"):
+        assert not f.exists(), f"{f.name} was left in the new run's way"
+        assert (f.parent / "superseded-20260929-120000" / f.name).exists(), f"{f.name} was lost"
+    assert len(moved) == len(family) + len(parts) + 1
+
+
+def test_a_complete_earlier_output_is_refused_without_the_move(tmp_path):
+    import h5py
+    import numpy as np
+
+    h5 = tmp_path / "hdf5_DS_he_train.h5"
+    with h5py.File(h5, "w") as f:
+        f.create_dataset("img", (2, 4, 4, 3), dtype="uint8")
+        for name in ("samples", "slides", "tiles"):
+            f.create_dataset(name, data=np.array([b"x", b"y"]))
+    paths = {"h5": h5, "projections": tmp_path / "p.h5", "assignments": tmp_path / "a.csv"}
+    try:
+        submit_hpl_nf.refuse_foreign_outputs(paths)
+    except FileExistsError as e:
+        assert "Move earlier outputs aside" in str(e), "the refusal does not name the way out"
+        return
+    raise AssertionError("a fresh run was allowed to adopt another run's complete .h5")
+
+
 # --- standalone runner ------------------------------------------------------
 
 def main():

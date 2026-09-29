@@ -3299,9 +3299,13 @@ class PipelineRunRequest(DatasetJobRequest):
     """A new run, Stages 1-4 in one submission. Every field a later stage used
     to ask for at its own button is asked for here, once."""
 
-    # Stage 3. The one input with no deployment default: which encoder weights
-    # produced the reference's embeddings is a per-study fact.
-    checkpoint: str
+    # Stage 3. A deployment setting (HPL_CHECKPOINT), not something the UI
+    # asks for: the reference's clusters were built from this checkpoint's
+    # embeddings. Overridable per request for a deliberate comparison.
+    checkpoint: str | None = None
+    # How many slides tile at once (HPL_NF_MAX_TILING); the per-stage form's 10
+    # would take weeks on a large cohort.
+    max_concurrent: int = submit_hpl_nf.DEFAULT_MAX_TILING
     model: str = "BarlowTwins_3"
     marker: str = "he"
     # Split the encode across N GPU tasks — the lever that scales extraction,
@@ -3335,6 +3339,13 @@ class PipelineRunRequest(DatasetJobRequest):
     # per-stage path's afterok was; on, the failures are named on the tiling
     # step rather than silently absent from the .h5.
     allow_incomplete: bool = False
+
+    # When this run's output paths already hold another run's complete
+    # outputs (a full run over a dataset an earlier run packaged), move them
+    # into a superseded-<date> folder beside them instead of refusing. On by
+    # default, because the UI's one click has no other way forward: it is never
+    # a delete, and is refused while any recorded job may still be writing them.
+    move_existing_outputs: bool = True
 
     def vote_overrides(self) -> dict:
         return {
@@ -3436,6 +3447,25 @@ def _run_pipeline_submission(submission_id: str, raw_dir: str,
         _update_dataset_run(submission_id, status="error", error=str(e))
 
 
+@app.get("/pipeline-defaults")
+def pipeline_defaults():
+    """What a one-click pipeline run uses, so the UI can say so beside the
+    button: every setting is the server's, and nothing is asked for but a
+    dataset path."""
+    import submit_cluster_assignment as sca
+    return {
+        "checkpoint": submit_hpl_nf.DEFAULT_CHECKPOINT,
+        "reference": str(sca._reference_path(None)),
+        "vote_preset": DEFAULT_VOTE_PRESET,
+        "max_tiling": submit_hpl_nf.DEFAULT_MAX_TILING,
+        "min_tissue": _default_tiling_params().get("min_tissue"),
+        "tile_root": str(PROCESSED_TILES_DIR),
+        "h5_root": str(HPL_DATASETS_ROOT),
+        "runs_root": str(HPL_NF_RESULTS_ROOT),
+        "head_jobs": submit_hpl_nf.DEFAULT_CHAIN,
+    }
+
+
 @app.get("/pipeline-submit-check")
 def check_pipeline_submit(partition: str | None = None):
     """Can a compute node run sbatch? The pipeline's head job submits every
@@ -3480,7 +3510,7 @@ def create_pipeline_run(req: PipelineRunRequest, background_tasks: BackgroundTas
                 tile_dataset_name=dataset_name,
                 h5_dataset_name=h5_dataset_name,
                 tiling_params=tiling_params,
-                checkpoint=req.checkpoint,
+                checkpoint=req.checkpoint or submit_hpl_nf.DEFAULT_CHECKPOINT,
                 model=req.model,
                 marker=req.marker,
                 reference=Path(req.reference) if req.reference else None,
@@ -3493,11 +3523,21 @@ def create_pipeline_run(req: PipelineRunRequest, background_tasks: BackgroundTas
                 max_tiling_forks=req.max_concurrent,
                 allow_incomplete=req.allow_incomplete,
             )
-            submit_hpl_nf.refuse_foreign_outputs({
+            targets = {
                 "h5": Path(config["packaging"]["h5_path"]),
                 "projections": Path(config["extraction"]["output_path"]),
                 "assignments": Path(config["assignment"]["out_csv"]),
-            })
+            }
+            try:
+                submit_hpl_nf.refuse_foreign_outputs(targets)
+            except FileExistsError:
+                if not req.move_existing_outputs:
+                    raise
+                _refuse_if_outputs_in_use(targets)
+                # Recorded with the run, so where its predecessor's outputs
+                # went is answerable from the run itself.
+                config["superseded"] = submit_hpl_nf.move_outputs_aside(
+                    targets, datetime.now().strftime("%Y%m%d-%H%M%S"))
         except (ValueError, FileNotFoundError, FileExistsError,
                 NotADirectoryError, KeyError) as e:
             raise HTTPException(400, str(e))
@@ -3569,7 +3609,39 @@ def create_pipeline_run(req: PipelineRunRequest, background_tasks: BackgroundTas
         "device": config["assignment"]["device"],
         "device_reason": config["assignment"]["device_reason"],
         "vote": config["assignment"]["vote"],
+        "superseded": config.get("superseded") or [],
     }
+
+
+def _refuse_if_outputs_in_use(targets: dict[str, Path]) -> None:
+    """Refuse to move outputs any recorded run may still be writing.
+
+    Every run that records one of these paths is asked for its stage's state
+    (sentinels included, so a live pipeline run counts). In flight, or
+    unknown because Slurm cannot be reached, is a refusal: moving a file out
+    from under a writer is the one thing worse than refusing the run.
+    """
+    columns = {"h5": ("h5_output_path", "h5_job_id"),
+               "projections": ("extraction_output_path", "extraction_job_id"),
+               "assignments": ("assignment_output_path", "assignment_job_id")}
+    eng = _get_engine()
+    with eng.connect() as conn:
+        for key, (path_col, job_col) in columns.items():
+            rows = conn.execute(
+                text(f"SELECT submission_id, {job_col} AS job_id FROM slurm_dataset_runs "
+                     f"WHERE {path_col} = :path AND {job_col} IS NOT NULL"),
+                {"path": str(targets[key])},
+            ).mappings().fetchall()
+            for row in rows:
+                for job_id in _split_job_ids(row["job_id"]) or [row["job_id"]]:
+                    state = _get_slurm_job_state(job_id)
+                    if state is None or state in IN_FLIGHT_SLURM_STATES:
+                        shown = state or "unknown — Slurm unreachable"
+                        raise HTTPException(
+                            400,
+                            f"Run {row['submission_id']} may still be writing "
+                            f"{targets[key]} (state: {shown}). Stop it, or wait for "
+                            f"it, before moving its outputs aside.")
 
 
 class PipelineResumeRequest(BaseModel):

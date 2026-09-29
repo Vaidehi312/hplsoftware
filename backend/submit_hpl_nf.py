@@ -122,6 +122,20 @@ TIME_LIMITS = {
 
 RUN_CONFIG_NAME = "run_config.json"
 
+#: The encoder weights every one-click run uses. A deployment setting, not a
+#: per-run choice: the reference's clusters were built from embeddings of this
+#: checkpoint, so a run under different weights would classify into the wrong
+#: space. Checked at every submission (and by tools/preflight.py).
+DEFAULT_CHECKPOINT = os.getenv(
+    "HPL_CHECKPOINT",
+    "/hpc-home/home/users/vpandya/long-term-scratch/Vaidehi/weights/BarlowTwins_3.ckt",
+)
+
+#: Slides tiled at once. 50 rather than the per-stage form's 10: tiling is one
+#: CPU per slide and throughput-bound across the cohort, and at 10 a
+#: 14,000-slide cohort's tiling alone is the better part of two weeks.
+DEFAULT_MAX_TILING = int(os.getenv("HPL_NF_MAX_TILING", "50"))
+
 
 # --- where a run's outputs go ----------------------------------------------
 
@@ -181,8 +195,52 @@ def refuse_foreign_outputs(paths: dict[str, Path], expected_h5_rows: int | None 
             + ". A pipeline run adopts outputs that already validate rather than "
               "rebuilding them, so starting here would mix another run's results "
               "into this one. Continue the run that made them (its Resume "
-              "button), or move them aside first."
+              "button), or start this one with 'Move earlier outputs aside', "
+              "which moves them into a superseded-<date> folder beside them — "
+              "nothing is deleted."
         )
+
+
+def _output_family(target: Path) -> list[Path]:
+    """The target and the files a stage leaves beside it: .partial, packaging's
+    checkpoint sidecars (<name>.completed.txt ...), shard parts
+    (<stem>.rows<lo>-<hi>.*), the assigner's <name>.chunks/ and the shared
+    query mean. Matched by exact prefix, so a neighbour that merely shares the
+    stem — a test .h5 named <stem>_test_sample_<sig>.h5 — is left alone."""
+    if not target.parent.is_dir():
+        return []
+    name, stem = target.name, target.stem
+    return sorted(
+        entry for entry in target.parent.iterdir()
+        if entry.name == name
+        or entry.name.startswith(name + ".")
+        or entry.name.startswith(stem + ".rows")
+        or entry.name.startswith(stem + ".query_mean")
+    )
+
+
+def move_outputs_aside(paths: dict[str, Path], stamp: str) -> list[dict]:
+    """Move a dataset's earlier outputs out of this run's way, keeping them.
+
+    For a fresh run that would otherwise be refused by refuse_foreign_outputs —
+    typically a full-cohort run over a dataset whose earlier (smaller) run left
+    a complete .h5 at the same path. Each family goes into
+    <its directory>/superseded-<stamp>/ on the same filesystem, so it is one
+    rename, reversible by moving it back, and nothing is deleted. The caller
+    must first establish no live job is writing these (the server does, from
+    the run table).
+    """
+    moved = []
+    for target in paths.values():
+        family = _output_family(Path(target))
+        if not family:
+            continue
+        dest = Path(target).parent / f"superseded-{stamp}"
+        dest.mkdir(exist_ok=True)
+        for entry in family:
+            os.replace(entry, dest / entry.name)
+            moved.append({"from": str(entry), "to": str(dest / entry.name)})
+    return moved
 
 
 # --- resolving everything up front --------------------------------------------

@@ -18,11 +18,9 @@ import {
   datasetRunLabel,
   datasetsUnderPath,
   DELIVERABLE_ICON,
-  errorDetail,
-  resumeResultMessage,
   STEP_ICON,
 } from "./utils";
-import { Alert, Button } from "./widgets";
+import { Alert, Expander } from "./widgets";
 import RunProgress from "./RunProgress";
 
 // Port of _render_deliverables(): every .h5 this dataset has produced or
@@ -70,100 +68,27 @@ function Deliverables({ dataset }) {
   );
 }
 
-// Port of _render_next_action(): the one button that moves a dataset
-// forward. Actions needing no further input fire directly; packaging and
-// extraction take real parameters whose guards already live in the run's own
-// step form, so those just select the relevant run instead of duplicating
-// that logic here.
-function NextAction({ dataset, onCoverageChecked, onResumed, onGotoRun }) {
+// Port of _render_next_action(): where this dataset stands, in one line — no
+// button. The per-stage actions it used to offer (resume tiling, start
+// packaging, start extraction) are gone: Stages 1-4 are one pipeline run,
+// started from the button above, which reuses every slide already tiled.
+function NextAction({ dataset }) {
   const action = dataset.next_action || {};
   const kind = action.kind;
-  const key = datasetKey(dataset);
-  const submissionId = action.submission_id;
-
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState(null);
-
-  if (kind === "complete" || kind === "none") {
-    return action.detail ? <div className="pipeline-caption">{action.detail}</div> : null;
-  }
-  if (kind === "wait") {
+  if (kind === "complete" || kind === "none" || kind === "wait") {
     return (
       <div className="pipeline-caption">
-        ⏳ {action.label} — {action.detail || ""}
+        {kind === "wait" ? "⏳ " : ""}
+        {action.label} — {action.detail || ""}
       </div>
     );
   }
-  if (kind === "submit") {
-    return <Alert type="info">Nothing has been submitted for this dataset yet.</Alert>;
-  }
-
-  if (kind === "check_coverage") {
-    return (
-      <div>
-        {action.detail && <div className="pipeline-caption">{action.detail}</div>}
-        <Button
-          onClick={async () => {
-            setBusy(true);
-            setMessage(null);
-            try {
-              const found = await api.getDatasetCoverage(dataset.dataset_name, dataset.raw_dir);
-              if (found && found.length) {
-                onCoverageChecked(key, { rollup: found[0], at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
-              } else {
-                setMessage({ type: "warning", text: "The server returned no rollup for this dataset." });
-              }
-            } catch (e) {
-              setMessage({ type: "error", text: `Coverage check failed: ${errorDetail(e).message}` });
-            } finally {
-              setBusy(false);
-            }
-          }}
-          disabled={busy}
-        >
-          {busy ? "Checking…" : action.label || "Check coverage"}
-        </Button>
-        {message && <Alert type={message.type}>{message.text}</Alert>}
-      </div>
-    );
-  }
-
-  if (kind === "resume_tiling") {
-    return (
-      <div>
-        {action.detail && <div className="pipeline-caption">{action.detail}</div>}
-        <Button
-          onClick={async () => {
-            setBusy(true);
-            setMessage(null);
-            try {
-              const result = await api.resumeDatasetJob(submissionId);
-              const described = resumeResultMessage(result);
-              setMessage(described.alert);
-              if (described.queued) onResumed(key);
-            } catch (e) {
-              setMessage({ type: "error", text: `Resume failed: ${errorDetail(e).message}` });
-            } finally {
-              setBusy(false);
-            }
-          }}
-          disabled={busy}
-        >
-          {busy ? "Resuming…" : `${action.label} (resumes the slides with no tiles)`}
-        </Button>
-        {message && <Alert type={message.type}>{message.text}</Alert>}
-      </div>
-    );
-  }
-
-  // start_packaging / resume_packaging / start_extraction — navigate to the
-  // run that owns this step, where its options already live.
+  if (kind === "submit") return <div className="pipeline-caption">Nothing has been run for this dataset yet.</div>;
+  if (!kind) return null;
   return (
-    <div>
-      <Button onClick={() => onGotoRun(submissionId)} title="Opens the run that owns this step, where its options live.">
-        {action.label} →
-      </Button>
-      {action.detail && <div className="pipeline-caption">{action.detail}</div>}
+    <div className="pipeline-caption">
+      Earlier runs stopped at: {(action.label || "").replace(/ →$/, "")}. Run the pipeline above to carry this
+      dataset through — it reuses every slide already tiled.
     </div>
   );
 }
@@ -172,7 +97,7 @@ function NextAction({ dataset, onCoverageChecked, onResumed, onGotoRun }) {
 // not it's the active one — the aggregate across every run that has touched
 // it (a resume forks a run in two, so this is the only level "finished vs.
 // left" can be answered at).
-function DatasetRollup({ dataset, onCoverageChecked, onResumed, onGotoRun }) {
+function DatasetRollup({ dataset }) {
   const provenance = [];
   if (dataset.has_full_run) provenance.push("full-dataset run");
   if (dataset.has_subset_run) provenance.push("subset run(s)");
@@ -197,7 +122,7 @@ function DatasetRollup({ dataset, onCoverageChecked, onResumed, onGotoRun }) {
       )}
 
       <Deliverables dataset={dataset} />
-      <NextAction dataset={dataset} onCoverageChecked={onCoverageChecked} onResumed={onResumed} onGotoRun={onGotoRun} />
+      <NextAction dataset={dataset} />
     </div>
   );
 }
@@ -246,7 +171,7 @@ export default function DatasetWorkspace({ path }) {
     deps: [],
   });
 
-  const [coverageOverrides, setCoverageOverrides] = useState({}); // { [datasetKey]: {rollup, at} }
+  const [coverageOverrides] = useState({}); // { [datasetKey]: {rollup, at} } — no longer set here
   const [pickedKey, setPickedKey] = useState(null);
   const [selectedRunId, setSelectedRunId] = useState(null);
 
@@ -262,7 +187,7 @@ export default function DatasetWorkspace({ path }) {
     if (!matches.length) {
       return (
         <Alert type="info">
-          No runs recorded for this path yet. The submit form below will start the first one.
+          No runs recorded for this path yet. Run the pipeline above to start the first one.
         </Alert>
       );
     }
@@ -303,6 +228,11 @@ export default function DatasetWorkspace({ path }) {
       }
     : rawDataset;
 
+  const pipelineRuns = (dataset.runs || []).filter(
+    (r) => String(r.job_id || "").startsWith("nf:") && r.status !== "cancelled",
+  );
+  const latestPipeline = pipelineRuns.length ? pipelineRuns[pipelineRuns.length - 1] : null;
+
   return (
     <div>
       {payload.slurm_reachable === false ? (
@@ -333,25 +263,22 @@ export default function DatasetWorkspace({ path }) {
         </div>
       )}
 
-      <DatasetRollup
-        dataset={dataset}
-        onCoverageChecked={(key, entry) => setCoverageOverrides((prev) => ({ ...prev, [key]: entry }))}
-        onResumed={(key) =>
-          setCoverageOverrides((prev) => {
-            // The coverage snapshot described the state before this resume;
-            // keeping it would show a stale "N still need tiling" beside a
-            // job that is already working on them.
-            const next = { ...prev };
-            delete next[key];
-            return next;
-          })
-        }
-        onGotoRun={setSelectedRunId}
-      />
+      {/* The newest live pipeline run is what someone opening this path is
+          following; everything before it is history, kept but out of the way. */}
+      {latestPipeline && (
+        <div>
+          <div className="pipeline-caption pipeline-caption-strong">
+            <strong>Pipeline run</strong>
+          </div>
+          <RunProgress submissionId={latestPipeline.submission_id} job={latestPipeline} />
+        </div>
+      )}
 
-      <hr className="pipeline-divider" />
-
-      <DatasetRuns dataset={dataset} selectedRunId={selectedRunId} onSelectRun={setSelectedRunId} />
+      <Expander title="Earlier runs (read-only)">
+        <DatasetRollup dataset={dataset} />
+        <hr className="pipeline-divider" />
+        <DatasetRuns dataset={dataset} selectedRunId={selectedRunId} onSelectRun={setSelectedRunId} />
+      </Expander>
     </div>
   );
 }

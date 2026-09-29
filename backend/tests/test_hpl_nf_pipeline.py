@@ -145,6 +145,27 @@ def test_the_server_resolves_pipeline_stages_without_asking_slurm(tmp_path):
         srv.HPL_NF_RESULTS_ROOT, srv.subprocess.run = original_root, original_run
 
 
+def test_a_path_alone_is_a_complete_pipeline_request(_tmp=None):
+    """The UI sends only the dataset path. Everything else is the server's:
+    the checkpoint (HPL_CHECKPOINT), 50 slides at a time, and earlier outputs
+    moved aside rather than refused, since a one-click run has no other way
+    forward — never deleted."""
+    try:
+        import tile_server_v2_ as srv
+        import submit_hpl_nf
+    except Exception as e:  # noqa: BLE001 - no openslide/DB on this machine
+        print(f"  (skipped: tile server not importable here: {e})")
+        return
+    req = srv.PipelineRunRequest(dataset_path="/data/NewCohort")
+    assert req.checkpoint is None and submit_hpl_nf.DEFAULT_CHECKPOINT
+    assert req.max_concurrent == submit_hpl_nf.DEFAULT_MAX_TILING
+    assert req.move_existing_outputs is True
+    assert req.allow_incomplete is False, "a one-click run must not drop slides unasked"
+    defaults = srv.pipeline_defaults()
+    assert defaults["checkpoint"] == submit_hpl_nf.DEFAULT_CHECKPOINT
+    assert defaults["reference"].endswith(".npz")
+
+
 # --- standalone runner ------------------------------------------------------
 
 def main():

@@ -697,93 +697,27 @@ def _render_deliverables(dataset: dict):
 
 
 def _render_next_action(dataset: dict):
-    """The one button that moves this dataset forward.
+    """Where this dataset stands, in one line — no button.
 
-    Only actions that need no further input fire directly. Packaging and
-    extraction both take real parameters — resume-versus-fresh, whether to
-    accept missing slides, which checkpoint — and their existing per-run forms
-    already handle the failure modes that come with those (a 400
-    tiling_incomplete, a stale checkpoint). Re-implementing that here would be
-    a second, worse copy of it, so those actions select the relevant run
-    instead and let the step's own form do the work. The step will already be
-    open when it lands: _render_job_progress auto-expands anything in an
-    'action' or 'attention' state.
+    This used to be the one button that moved a dataset forward a stage at a
+    time (resume tiling, start packaging, start extraction). Stages 1-4 are
+    one pipeline run now, started from the button above, which reuses every
+    slide already tiled; so the per-stage actions are gone and this only says
+    what state the history is in.
     """
     action = dataset.get("next_action") or {}
     kind = action.get("kind")
-    key = _dataset_key(dataset)
-    submission_id = action.get("submission_id")
-
-    if kind in ("complete", "none"):
-        st.caption(action.get("detail", ""))
-        return
-
-    if kind == "wait":
-        st.caption(f"⏳ {action.get('label')} — {action.get('detail', '')}")
-        return
-
-    if kind == "submit":
-        st.info("Nothing has been submitted for this dataset yet.")
-        return
-
-    if kind == "check_coverage":
-        st.caption(action.get("detail", ""))
-        if st.button(
-            action.get("label", "Check coverage"),
-            key=f"dataset_action_coverage_{key}",
-            use_container_width=True,
-        ):
-            with st.spinner("Walking the directory — this stats every slide…"):
-                try:
-                    found = client.get_dataset_coverage(
-                        dataset["dataset_name"], dataset["raw_dir"]
-                    )
-                except Exception as e:
-                    st.error(f"Coverage check failed: {e}")
-                    return
-            if found:
-                st.session_state[f"dataset_coverage_{key}"] = {
-                    "rollup": found[0],
-                    "at": time.strftime("%H:%M"),
-                }
-                st.rerun()
-            else:
-                st.warning("The server returned no rollup for this dataset.")
-        return
-
-    if kind == "resume_tiling":
-        st.caption(action.get("detail", ""))
-        if st.button(
-            f"{action.get('label')} (resumes the slides with no tiles)",
-            key=f"dataset_action_resume_{key}",
-            use_container_width=True,
-        ):
-            try:
-                queued = _report_resume_result(client.resume_dataset_job(submission_id))
-            except requests.exceptions.HTTPError as e:
-                st.error(f"Resume failed: {_error_detail(e)[1]}")
-                return
-            except Exception as e:
-                st.error(f"Resume failed: {e}")
-                return
-            if queued:
-                # The coverage snapshot described the state before this resume,
-                # so keeping it would show a stale "N still need tiling" beside
-                # a job that is already working on them.
-                st.session_state.pop(f"dataset_coverage_{key}", None)
-        return
-
-    # start_packaging / resume_packaging / start_extraction — navigate.
-    if st.button(
-        f"{action.get('label')} →",
-        key=f"dataset_action_goto_{key}",
-        use_container_width=True,
-        help="Opens the run that owns this step, where its options live.",
-    ):
-        st.session_state[f"dataset_run_pick_{key}"] = submission_id
-        st.rerun()
-    if action.get("detail"):
-        st.caption(action["detail"])
+    if kind in ("complete", "none", "wait"):
+        prefix = "⏳ " if kind == "wait" else ""
+        st.caption(f"{prefix}{action.get('label', '')} — {action.get('detail', '')}")
+    elif kind == "submit":
+        st.caption("Nothing has been run for this dataset yet.")
+    elif kind:
+        st.caption(
+            f"Earlier runs stopped at: {action.get('label', '').rstrip(' →')}. Run the "
+            f"pipeline above to carry this dataset through — it reuses every slide "
+            f"already tiled."
+        )
 
 
 def _render_dataset_runs(dataset: dict):
@@ -921,9 +855,27 @@ def _render_dataset_workspace(path: str):
         return
 
     dataset = _apply_stored_coverage(dataset)
-    _render_dataset_rollup(dataset)
-    st.divider()
-    _render_dataset_runs(dataset)
+
+    # The newest live pipeline run is what someone opening this path is
+    # following; everything before it is history, kept but out of the way.
+    pipeline_runs = [r for r in dataset.get("runs", [])
+                     if _is_pipeline_run(r) and r.get("status") != "cancelled"]
+    if pipeline_runs:
+        st.markdown("**Pipeline run**")
+        _render_job_progress(pipeline_runs[-1], key_prefix=f"pl_{_dataset_key(dataset)}_")
+    with st.expander("Earlier runs (read-only)", expanded=False):
+        _render_dataset_rollup(dataset)
+        st.divider()
+        _render_dataset_runs(dataset)
+
+
+def _is_pipeline_run(run: dict) -> bool:
+    return str(run.get("job_id") or "").startswith("nf:")
+
+
+def _is_upload_run(status: dict) -> bool:
+    """An uploaded slide's one-slide run: Stages 1-2 ran in-process (local:)."""
+    return str(status.get("job_id") or "").startswith("local:")
 
 
 def _pick_dataset(datasets: list[dict], *, key_suffix: str) -> dict:
@@ -972,305 +924,83 @@ def render_dataset_job_panel():
             ),
         ).strip()
 
-        _render_dataset_workspace(dataset_path)
-        st.divider()
+        # The one-click pipeline first, as ANORAK's button is the first thing in
+        # its step; what has already been done to the dataset follows.
         _render_dataset_submit_section(dataset_path)
+        st.divider()
+        _render_dataset_workspace(dataset_path)
 
 
 def _render_dataset_submit_section(dataset_path: str):
-    """The "start something new" half of the panel.
+    """Run the pipeline (Stages 1-4) — one click, first in the panel.
 
-    Kept below the dataset view on purpose. The common case is carrying on with
-    a dataset that already exists, and the accident this guards against —
-    submitting a second full re-tiling of a directory that was already done —
-    happens when the form is the first thing on screen and an existing run is
-    not.
+    This used to sit below the dataset view, and behind an opt-in expander
+    whenever the path already had runs, to guard against submitting a second
+    full re-tiling of a directory that was already done. A pipeline run cannot
+    do that: every slide whose tiles are already complete on disk is skipped
+    by its tiling task, so a new run over a tiled dataset tiles only what is
+    missing and goes straight on. What it can still collide with — another
+    run's finished .h5 at the same path — is refused by the server, with the
+    choice to move those outputs aside.
     """
+    st.markdown("**Run the pipeline (Stages 1-4)**")
     if not dataset_path:
-        st.caption("Enter a dataset path above to start a new run.")
+        st.caption("Enter a dataset path above.")
         return
 
     existing_job = _find_existing_job_for_path(dataset_path)
-
-    if not existing_job:
-        st.caption("Start a new dataset run")
-        _render_new_dataset_submission_form(dataset_path)
-        return
-
-    st.caption(
-        f"This path already has runs — the newest went in "
-        f"{existing_job.get('submitted_at', '')}. Their progress is above; "
-        f"resume from there rather than starting again."
-    )
-
-    with st.expander("Submit a separate NEW run for this same path anyway", expanded=False):
+    if existing_job:
         st.caption(
-            "Only use this if you deliberately want a second, "
-            "independent run (e.g. a different tissue threshold) — "
-            "it will NOT resume or affect the runs shown above."
+            f"This path already has runs (newest {existing_job.get('submitted_at', '')}), "
+            f"listed below. A new pipeline run reuses every slide already tiled — only "
+            f"slides without tiles are tiled again. If a pipeline run is still going, "
+            f"follow or resume it below instead of starting another."
         )
-        _render_new_dataset_submission_form(dataset_path)
+    _render_new_dataset_submission_form(dataset_path)
 
 
 def _render_new_dataset_submission_form(dataset_path: str):
-    """The 'start a brand-new run' form: dataset folder choice, Slurm
-    options, slide selection, and the Submit button. Split out from
-    render_dataset_job_panel() so it can be shown either as the primary
-    action (no existing run for this path) or tucked behind an explicit
-    opt-in expander (an existing run was found for this path).
+    """One path, one click: Stages 1-4 as a Nextflow run, on the server's settings.
+
+    Nothing is asked for but the path. The tile folder is the directory's own
+    name; the checkpoint, reference, vote, output locations and concurrency are
+    the server's (GET /pipeline-defaults) and shown here so a click is never a
+    guess about what it will use. The server still checks every one of them
+    before queueing anything, exactly as the per-stage forms did.
     """
-    dataset_names_fetch_error = None
     try:
-        existing_dataset_names = client.get_tile_dataset_names()
+        defaults = client.get_pipeline_defaults()
     except Exception as e:
-        # Tile server unreachable, the route 404s (e.g. server hasn't
-        # been restarted since this endpoint was added), etc. — fall
-        # back to "always create new" rather than blocking the whole
-        # form, but keep the error instead of silently treating it the
-        # same as "genuinely no folders exist yet" (misleading below).
-        existing_dataset_names = []
-        dataset_names_fetch_error = str(e)
-
-    dataset_folder_help = (
-        "Which folder under processed_tiles this run's tiles land in, "
-        "e.g. TCGA or Radiogenomics — keeps different datasets from "
-        "mixing together on disk."
-    )
-
-    dataset_folder_mode = st.radio(
-        "Tiles go into",
-        ["Existing dataset folder", "New dataset folder"],
-        key="dataset_job_folder_mode",
-        horizontal=True,
-        help=dataset_folder_help,
-    )
-    if dataset_folder_mode == "Existing dataset folder":
-        if existing_dataset_names:
-            dataset_name = st.selectbox(
-                "Dataset folder",
-                existing_dataset_names,
-                key="dataset_job_folder_existing",
-            )
-        elif dataset_names_fetch_error:
-            st.warning(f"Couldn't load existing dataset folders: {dataset_names_fetch_error}")
-            dataset_name = ""
-        else:
-            # Nothing tiled under the new per-dataset layout yet, so
-            # there's nothing to pick — leave the toggle itself alone
-            # (still clickable, still visible) and just say so here.
-            st.info("No dataset folders exist yet — switch to 'New dataset folder' to create one.")
-            dataset_name = ""
-    else:
-        dataset_name = st.text_input(
-            "New dataset folder name",
-            key="dataset_job_folder_new",
-            help="Letters, numbers, '.', '_', '-' only, e.g. TCGA or Radiogenomics.",
-        )
-
-    partition = st.text_input(
-        "Slurm partition (optional)",
-        value="",
-        key="dataset_job_partition",
-        help=(
-            "Leave blank to use the cluster's default partition. Only "
-            "set this to override it (e.g. a low-priority queue for a "
-            "large non-urgent run) — masking/tiling is CPU-only, no "
-            "GPU partition needed."
-        ),
-    )
-    notify_email = st.text_input(
-        "Email me when the job finishes (optional)",
-        value="",
-        key="dataset_job_notify_email",
-        help=(
-            "Uses Slurm's own end-of-job notification (one email for the "
-            "whole array, on completion or failure) — not a summary or "
-            "the log files themselves. Only works if your cluster has a "
-            "mail relay configured; test with a throwaway job first if "
-            "you're not sure."
-        ),
-    )
-    max_concurrent = st.number_input(
-        "Max concurrent Slurm tasks",
-        min_value=1, max_value=200, value=10,
-        key="dataset_job_max_concurrent",
-    )
-    min_tissue = st.slider(
-        "Minimum tissue % per tile",
-        min_value=0.0, max_value=100.0, value=30.0, step=5.0,
-        key="dataset_job_min_tissue",
-        help=(
-            "Tiles below this tissue coverage are skipped. Lower this "
-            "if a dataset comes back with mostly zero-tile slides."
-        ),
-    )
-
-    selection_mode = st.radio(
-        "Slides to run",
-        ["All slides", "Random subset", "Specific slides"],
-        key="dataset_job_selection_mode",
-        horizontal=True,
-    )
-
-    sample_size = None
-    slide_names = None
-
-    if selection_mode == "Random subset":
-        sample_size = st.number_input(
-            "Number of random slides",
-            min_value=1, value=10,
-            key="dataset_job_sample_size",
-        )
-    elif selection_mode == "Specific slides":
-        slide_names_raw = st.text_area(
-            "Slides to run (one per line)",
-            key="dataset_job_slide_names",
-            help="Match by original filename (e.g. slide1.ndpi) or slide ID.",
-        )
-        slide_names = [
-            line.strip() for line in slide_names_raw.splitlines() if line.strip()
-        ]
-
-    seed = None
-    if selection_mode == "Random subset":
-        seed_text = st.text_input(
-            "Sampling seed (optional)", value="", key="dataset_job_seed",
-            help="Leave blank and one is chosen and recorded with the run, so the "
-                 "same slides can be asked for again — a subset is how a test "
-                 "run is done, exactly as for ANORAK.",
-        )
-        seed = int(seed_text) if seed_text.strip().isdigit() else None
-
-    # --- Stages 3 and 4, asked for once, here --------------------------------
-    # One click runs tiling, packaging, feature extraction and classification
-    # as a single Nextflow pipeline (hpl-nf/), the way ANORAK runs. Every input
-    # a later stage used to ask for at its own button is asked for now, and the
-    # server refuses before queueing anything if one is wrong. Each stage is
-    # still checked on its own: the pipeline marks a stage done only after the
-    # same validator the server's gate uses, and the stepper shows every stage
-    # with its own state. Registration and the Knowledge Bank load stay manual,
-    # with their dry runs.
-    st.markdown("**Feature extraction (Stage 3)**")
-    checkpoint = st.text_input(
-        "Model checkpoint path",
-        key="dataset_job_pipeline_checkpoint",
-        help="Absolute path to the frozen encoder checkpoint, e.g. "
-             ".../weights/BarlowTwins_3.ckt (a TensorFlow prefix — the .index / "
-             ".data files beside it are what exist on disk).",
-    )
-    extraction_shards = st.number_input(
-        "GPU shards", min_value=1, max_value=64, value=1, step=1,
-        key="dataset_job_pipeline_ext_shards",
-        help="Split the encode across this many GPU tasks. Extraction is "
-             "read-bound, and separate processes are the only lever that "
-             "scales it; one shard is fine for a small cohort.",
-    )
-
-    st.markdown("**Cluster classification (Stage 4)**")
-    vote_preset, vote_overrides = _render_vote_picker("new_run", "dataset_job_")
-    reference = st.text_input(
-        "Reference .npz (optional)", value="", key="dataset_job_pipeline_reference",
-        help="Leave blank for the configured reference. Cluster IDs only mean "
-             "anything relative to one reference, so change this deliberately.",
-    )
-    columns = st.columns(2)
-    assignment_shards = columns[0].number_input(
-        "Assignment shards", min_value=1, max_value=64, value=1, step=1,
-        key="dataset_job_pipeline_asg_shards",
-        help="More than one computes a shared query mean first, so every shard "
-             "centres identically.",
-    )
-    device = columns[1].radio(
-        "Search device", ["auto", "cpu", "gpu"], horizontal=True,
-        key="dataset_job_pipeline_device",
-        help="auto uses a GPU only when the GPU faiss extras are installed. The "
-             "GPU search is the same exact scan, verified against the CPU one.",
-    )
-
-    allow_incomplete = st.checkbox(
-        "Package without slides that fail to tile", value=False,
-        key="dataset_job_pipeline_allow_incomplete",
-        help="Off: one slide that cannot be tiled (after retries) stops the run "
-             "before packaging, so the .h5 is never missing slides silently. On: "
-             "those slides are left out and named on the tiling step. Can also be "
-             "switched on when resuming a run that stopped on them.",
-    )
-
-    with st.expander("Head job", expanded=False):
+        defaults = None
+        st.caption(f"Could not load the pipeline's settings ({e}); the server applies them anyway.")
+    if defaults:
+        name = Path(dataset_path.rstrip("/")).name or "?"
         st.caption(
-            "The pipeline runs as one Slurm head job that submits every task "
-            "itself, supervised by the same stall watchdog as ANORAK."
-        )
-        chain = st.number_input(
-            "Head jobs", min_value=1, max_value=10, value=3, step=1,
-            key="dataset_job_pipeline_chain",
-            help="The head job plus standbys. A standby starts only if the one "
-                 "before it ended without finishing (walltime, or watchdog "
-                 "restarts spent) and resumes it. A real failure or a Stop stops "
-                 "the whole chain.",
-        )
-        time_limit = st.text_input(
-            "Head job walltime (optional)", value="",
-            key="dataset_job_pipeline_time",
-            help="Slurm format, e.g. 2-00:00:00. Blank uses the server default. "
-                 "Must be within the partition's MaxTime (sinfo -o '%P %l').",
+            f"Tiles into `{defaults['tile_root']}/{name}`, the .h5 into "
+            f"`{defaults['h5_root']}/{name}` · checkpoint `{defaults['checkpoint']}` · "
+            f"reference `{defaults['reference']}` · {defaults['vote_preset']} vote · "
+            f"{defaults['max_tiling']} slides at a time · {defaults['min_tissue']:g}% "
+            f"minimum tissue. Slides already tiled are reused; earlier outputs in the "
+            f"way are moved aside, never deleted."
         )
 
-    if st.button("Run pipeline (Stages 1-4)", key="dataset_job_submit",
-                 type="primary", use_container_width=True):
-        if not dataset_path.strip():
-            st.error("Enter a dataset path first.")
-        elif selection_mode == "Specific slides" and not slide_names:
-            st.error("Enter at least one slide filename or ID.")
-        elif not dataset_name.strip():
-            st.error("Enter a name for the new dataset folder, or switch to an existing one.")
-        elif not checkpoint.strip():
-            st.error("A model checkpoint is required — feature extraction cannot run without one.")
-        else:
-            try:
-                result = client.start_pipeline_run(
-                    dataset_path=dataset_path.strip(),
-                    checkpoint=checkpoint.strip(),
-                    dataset_name=dataset_name.strip() or None,
-                    max_concurrent=int(max_concurrent),
-                    min_tissue=float(min_tissue),
-                    sample_size=int(sample_size) if sample_size else None,
-                    slide_names=slide_names,
-                    seed=seed,
-                    partition=partition.strip() or None,
-                    notify_email=notify_email.strip() or None,
-                    extraction_shards=int(extraction_shards),
-                    reference=reference.strip() or None,
-                    vote_preset=vote_preset or None,
-                    vote_overrides=vote_overrides,
-                    assignment_shards=int(assignment_shards),
-                    device=device,
-                    chain=int(chain),
-                    time_limit=time_limit.strip() or None,
-                    allow_incomplete=bool(allow_incomplete),
-                )
-            except requests.exceptions.HTTPError as e:
-                st.error(f"Refused: {_http_detail(e)}")
-            except Exception as e:
-                st.error(f"Submission failed: {e}")
-            else:
-                st.success(
-                    f"Pipeline queued — run {result['submission_id']} into dataset "
-                    f"folder '{result.get('dataset_name', dataset_name.strip())}'. "
-                    f"Slides are being found and the head job submitted in the "
-                    f"background; follow each stage under 'Recent dataset jobs'."
-                )
-                st.caption(
-                    f"GPU: {result.get('gpu_gres')} ({result.get('gpu_gres_reason')}) · "
-                    f"search: {result.get('device')} ({result.get('device_reason')}) · "
-                    f"vote: {result.get('vote')}"
-                )
-                st.caption("Outputs will land at:")
-                st.code("\n".join(filter(None, (
-                    result.get("h5_output_path"),
-                    result.get("extraction_output_path"),
-                    result.get("assignment_output_path"),
-                ))), language=None)
+    if st.button("Run pipeline", key="dataset_job_submit", type="primary",
+                 use_container_width=True):
+        try:
+            result = client.start_pipeline_run(dataset_path=dataset_path.strip())
+        except requests.exceptions.HTTPError as e:
+            st.error(f"Refused: {_http_detail(e)}")
+            return
+        except Exception as e:
+            st.error(f"Submission failed: {e}")
+            return
+        st.success(
+            f"Pipeline queued — run {result['submission_id']} for "
+            f"'{result.get('dataset_name')}'. Slides are being found and the head job "
+            f"submitted; its progress appears below."
+        )
+        for entry in result.get("superseded") or []:
+            st.caption(f"Moved aside: {entry['from']} → {entry['to']}")
 
 
 def _dataset_job_display_stage(status: dict) -> str:
@@ -1777,6 +1507,27 @@ def _pipeline_stage_states(status: dict, computed: tuple) -> tuple:
             out.append(("blocked", "not reached"))
         previous_done = out[-1][0] == "done"
     return tuple(out)
+
+
+def _render_legacy_stage_readonly(status: dict, stage: str):
+    """Stages 1-4 of a run from before the pipeline: what it did, no buttons."""
+    job_key, path_key, reason_key = {
+        "tiling": ("job_id", None, None),
+        "packaging": ("h5_job_id", "h5_output_path", "h5_invalid_reason"),
+        "extraction": ("extraction_job_id", "extraction_output_path", "extraction_invalid_reason"),
+        "assignment": ("assignment_job_id", "assignment_output_path", "assignment_invalid_reason"),
+    }[stage]
+    if status.get(job_key):
+        st.caption(f"Slurm job(s): `{status[job_key]}`")
+    if stage == "tiling" and status.get("succeeded") is not None:
+        st.caption(f"{status['succeeded']:,} of {status.get('total_slides') or 0:,} slides have tiles.")
+    if path_key and status.get(path_key):
+        st.caption("Output:")
+        st.code(status[path_key], language=None)
+    if reason_key and status.get(reason_key):
+        st.caption(f"Not usable: {status[reason_key]}")
+    st.caption("Read-only: Stages 1-4 now run as one pipeline. Run the pipeline for "
+               "this dataset to carry it on; it reuses whatever this run produced.")
 
 
 def _render_pipeline_overview(status: dict, submission_id: str, key_prefix: str):
@@ -4167,6 +3918,14 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
         for stage in _PIPELINE_STAGES:
             renderers[stage] = (lambda stage: lambda s: _render_pipeline_stage_step(
                 status, submission_id, key_prefix, stage, s["state"]))(stage)
+    elif not _is_upload_run(status):
+        # A run from before the pipeline: its Stages 1-4 are history. Shown
+        # read-only — a new pipeline run carries the dataset on and reuses
+        # whatever these produced. Upload runs keep their Stage 3/4 buttons:
+        # an uploaded slide does not go through the pipeline.
+        for stage in _PIPELINE_STAGES:
+            renderers[stage] = (lambda stage: lambda s: _render_legacy_stage_readonly(
+                status, stage))(stage)
     for step in steps:
         icon = _STEP_ICON.get(step["state"], "•")
         # Auto-open whichever step is waiting on the user, so the next action

@@ -128,6 +128,8 @@ export const api = {
   // once; the server refuses before queueing anything if one is wrong. Polled
   // through getDatasetJobStatus like any run — its `pipeline` block says where
   // each stage is. Registration and the KB load stay manual.
+  // The settings a one-click run uses — all the server's own.
+  getPipelineDefaults: () => getJson("/pipeline-defaults"),
   startPipelineRun: (body) => postJson("/pipeline-runs", cleanBody(body), { timeoutMs: 120000 }),
   // Resubmit a stopped pipeline run with -resume: re-runs only what did not
   // finish, with the run's own recorded settings.

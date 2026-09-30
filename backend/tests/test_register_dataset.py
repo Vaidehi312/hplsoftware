@@ -902,6 +902,59 @@ def test_a_dataset_id_alone_does_not_stand_in_for_the_tile_folder(tmp_path):
         raise AssertionError("a run with no tile folder anywhere was accepted")
 
 
+def test_both_names_for_the_tile_folder_are_one_field(tmp_path):
+    """dataset_name (main's override) and tile_dataset_name (the older field)
+    name the same folder. Either works; two different values are refused
+    rather than one silently winning — the preview and the commit would
+    otherwise disagree about which folder they read."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    plan, _, _ = srv._registration_plan(row, srv.RegistrationRequest(
+        dataset_id="TCGA", dataset_name="TCGA"))
+    assert plan["tile_dataset_name"] == "TCGA"
+    assert plan["sources"]["dataset_name"] == "supplied"
+
+    try:
+        srv._registration_plan(row, srv.RegistrationRequest(
+            dataset_id="TCGA", dataset_name="TCGA", tile_dataset_name="OTHER"))
+    except HTTPException as e:
+        assert e.status_code == 400 and "different" in str(e.detail)
+    else:
+        raise AssertionError("two different tile folders were accepted")
+
+
+def test_main_s_dataset_name_override_is_charset_checked_too(tmp_path):
+    """The override becomes a path segment under tile_dir, whichever field
+    carries it."""
+    from fastapi import HTTPException
+
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name=None)
+    try:
+        srv._registration_plan(row, srv.RegistrationRequest(
+            dataset_id="TCGA", dataset_name="../TCGA"))
+    except HTTPException as e:
+        assert e.status_code == 400
+    else:
+        raise AssertionError("a tile folder name with '..' reached the filesystem")
+
+
+def test_the_slurm_path_reads_the_same_files_as_the_preview(tmp_path):
+    """/register-submit resolves its paths through _registration_inputs, the
+    function the preview uses, so an h5_path override reaches the job too."""
+    srv = _server()
+    row = _run_row(tmp_path, dataset_name="TCGA")
+    other_h5 = tmp_path / "elsewhere.h5"
+    other_h5.write_bytes(Path(row["h5_output_path"]).read_bytes())
+    inputs = srv._registration_inputs(row, srv.RegistrationRequest(
+        dataset_id="TCGA", h5_path=str(other_h5)))
+    assert inputs["h5_path"] == other_h5
+    assert inputs["sources"]["h5_path"] == "supplied"
+    assert inputs["sources"]["dataset_name"] == "run record"
+
+
 def test_a_supplied_folder_name_cannot_escape_the_tile_directory(tmp_path):
     """It becomes a literal path segment under tile_dir, so it is charset-checked
     the same way /submit-dataset-job checks it."""

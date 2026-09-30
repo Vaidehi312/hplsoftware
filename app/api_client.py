@@ -696,6 +696,10 @@ class TileServerClient:
     def preview_registration(self, submission_id: str,
                          dataset_id: str | None = None,
                          tile_dataset_name: str | None = None,
+                         dataset_name: str | None = None,
+                         raw_dir: str | None = None,
+                         tile_dir: str | None = None,
+                         h5_path: str | None = None,
                          scope: str = "full",
                          slide_names: list[str] | None = None,
                          slide_metadata: bool = False,
@@ -722,6 +726,13 @@ class TileServerClient:
             "dataset_id": dataset_id,
             "tile_dataset_name": tile_dataset_name,
             "kb_target": self.kb_target,
+            # None means "take it from the run record", which is what every run
+            # driven through this UI holds. Supplied only for runs predating a
+            # column, or work done on the cluster before the pipeline existed.
+            "dataset_name": dataset_name,
+            "raw_dir": raw_dir,
+            "tile_dir": tile_dir,
+            "h5_path": h5_path,
             "scope": scope,
             "slide_names": slide_names,
             "slide_metadata": slide_metadata,
@@ -734,6 +745,10 @@ class TileServerClient:
     def commit_registration(self, submission_id: str,
                         dataset_id: str | None = None,
                         tile_dataset_name: str | None = None,
+                        dataset_name: str | None = None,
+                        raw_dir: str | None = None,
+                        tile_dir: str | None = None,
+                        h5_path: str | None = None,
                         scope: str = "full",
                         slide_names: list[str] | None = None,
                         slide_metadata: bool = False,
@@ -758,6 +773,13 @@ class TileServerClient:
             # did not write.
             "tile_dataset_name": tile_dataset_name,
             "kb_target": self.kb_target,
+            # None means "take it from the run record", which is what every run
+            # driven through this UI holds. Supplied only for runs predating a
+            # column, or work done on the cluster before the pipeline existed.
+            "dataset_name": dataset_name,
+            "raw_dir": raw_dir,
+            "tile_dir": tile_dir,
+            "h5_path": h5_path,
             # scope and slide_names were accepted by this method and then left
             # out of the body, so a subset previewed as three slides committed
             # as the whole dataset — silently, because registering more than
@@ -775,6 +797,9 @@ class TileServerClient:
     def submit_registration(self, submission_id: str,
                             dataset_id: str | None = None,
                             tile_dataset_name: str | None = None,
+                            raw_dir: str | None = None,
+                            tile_dir: str | None = None,
+                            h5_path: str | None = None,
                             scope: str = "full",
                             slide_names: list[str] | None = None,
                             slide_metadata: bool = False,
@@ -795,6 +820,11 @@ class TileServerClient:
                 "dataset_id": dataset_id,
                 "tile_dataset_name": tile_dataset_name,
                 "kb_target": self.kb_target,
+                # The same overrides as the in-server path; the server resolves
+                # both through one function, so they read the same files.
+                "raw_dir": raw_dir,
+                "tile_dir": tile_dir,
+                "h5_path": h5_path,
                 "scope": scope,
                 "slide_names": slide_names,
                 "slide_metadata": slide_metadata,

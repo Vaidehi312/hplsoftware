@@ -3414,6 +3414,58 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             if line.strip()
         ]
 
+    # Registration normally takes these four off the run record. A run that
+    # predates a column — or work done on the cluster before this pipeline
+    # existed — has no dataset_name and sometimes no packaged .h5, and until now
+    # the only thing this step could say was "register it with the CLI instead".
+    #
+    # Pre-filled from the run and left blank where it holds nothing, so the
+    # common case is untouched. Blank means "use the run's value", so clearing a
+    # box does not silently override with an empty string.
+    with st.expander(
+        "Where the data is — normally taken from the run record",
+        expanded=not status.get("dataset_name"),
+    ):
+        st.caption(
+            "The tile folder itself is chosen above; these are the other three "
+            "paths registration reads. Blank uses the run's own value."
+        )
+        ov_tile_dir = st.text_input(
+            "Tile root",
+            value=status.get("tile_dir") or "",
+            key=f"{key_prefix}reg_ov_tiledir_{submission_id}",
+            help="The directory the tile folder sits in — the --tile-dir Stage 1 "
+                 "was given.",
+        )
+        ov_h5 = st.text_input(
+            "Packaged .h5",
+            value=status.get("h5_output_path") or "",
+            key=f"{key_prefix}reg_ov_h5_{submission_id}",
+            help="Tile identity and each tile's row position are read out of this "
+                 "file. It must be the .h5 the assignment CSV was produced from, or "
+                 "image_index points at the wrong tiles.",
+        )
+        ov_raw_dir = st.text_input(
+            "Raw slide directory",
+            value=status.get("raw_dir") or "",
+            key=f"{key_prefix}reg_ov_rawdir_{submission_id}",
+            help="Searched recursively for each slide's file. Without it "
+                 "wsi_registry is not written and the cohort's slides will not open "
+                 "in the viewer.",
+        )
+
+    # One set of path arguments for all three calls — preview, commit and the
+    # Slurm submit — so they cannot read different folders. The tile folder is
+    # sent only when it differs from the run's own, so the preview's "from"
+    # column says "supplied" only for a real override.
+    chosen_folder = tile_dataset_name.strip()
+    _overrides = dict(
+        tile_dataset_name=chosen_folder if chosen_folder != recorded_dataset_name else None,
+        tile_dir=ov_tile_dir.strip() or None,
+        h5_path=ov_h5.strip() or None,
+        raw_dir=ov_raw_dir.strip() or None,
+    )
+
     col_a, col_b = st.columns(2)
     with col_a:
         slide_metadata = st.checkbox(
@@ -3477,11 +3529,11 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
                     st.session_state[preview_key] = client.preview_registration(
                         submission_id,
                         dataset_id=dataset_id.strip(),
-                        tile_dataset_name=tile_dataset_name.strip(),
                         scope="subset" if registration_scope == "Subset" else "full",
                         slide_names=registration_slide_names,
                         slide_metadata=slide_metadata,
                         write_dataset_config=write_dataset_config,
+                        **_overrides,
                         replace=replace,
                     )
             except Exception as e:  # noqa: BLE001 — surfaced, not swallowed
@@ -3493,6 +3545,13 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
         st.caption("Preview first — this writes to the shared Knowledge Bank, so "
                    "it never commits without showing you the numbers.")
         return
+
+    resolved, sources = report.get("resolved") or {}, report.get("sources") or {}
+    if resolved:
+        st.caption("Reading from — an override is a chance to register the wrong "
+                   "directory, so this is what will actually be opened:")
+        st.table([{"input": k, "value": v or "—", "from": sources.get(k, "")}
+                  for k, v in resolved.items()])
 
     cols = st.columns(4)
     cols[0].metric("Slides", f"{report.get('slides', 0):,}")
@@ -3548,6 +3607,16 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
             f"the Knowledge Bank's tables had no CREATE TABLE in git until that "
             f"file existed."
         )
+    if report.get("missing_run_tracking_columns"):
+        st.error(
+            "`slurm_dataset_runs` is missing "
+            f"{', '.join(report['missing_run_tracking_columns'])} in the "
+            "**production** database. Run tracking lives there whichever "
+            "Knowledge Bank you write to, so registering would succeed and then "
+            "fail recording it — leaving the rows in place and this run saying "
+            "it never registered. Run `psql ... -f backend/migrate_all.sql` "
+            "against production first."
+        )
     if report.get("would_refuse_collision"):
         st.error(
             "Refusing: some of these tiles or slides already belong to a "
@@ -3563,7 +3632,8 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
 
     blocked = bool(report.get("would_refuse_collision")
                    or report.get("needs_replace")
-                   or report.get("missing_tables"))
+                   or report.get("missing_tables")
+                   or report.get("missing_run_tracking_columns"))
     write_mode = _render_write_mode(submission_id, key_prefix, "reg")
     if st.button(
         "Register subset in the Knowledge Bank"
@@ -3588,7 +3658,7 @@ def _render_registration_step(status: dict, submission_id: str, key_prefix: str,
 
         kwargs = dict(
             dataset_id=dataset_id.strip(),
-            tile_dataset_name=tile_dataset_name.strip(),
+            **_overrides,
             scope="subset" if registration_scope == "Subset" else "full",
             slide_names=registration_slide_names,
             slide_metadata=slide_metadata,

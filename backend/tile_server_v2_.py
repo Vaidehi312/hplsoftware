@@ -56,6 +56,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy import inspect as sqlalchemy_inspect
 from db_url import database_url
 from openslide.deepzoom import DeepZoomGenerator
 import shutil
@@ -2885,6 +2886,26 @@ def _run_job_history(submission_id: str) -> list[dict]:
             "slurm_state": state,
         })
     return history
+
+
+# Columns the run record needs before a stage can record where it wrote. They
+# live in PRODUCTION for every target, because run tracking is not split across
+# databases — so a deployment that migrated hpl_kb_test but forgot hpl_kb would
+# register into test successfully and then fail writing the run row, leaving the
+# rows in place and the run claiming it never registered. Checked at preview.
+_RUN_TRACKING_COLUMNS = ("registration_done", "registration_at",
+                         "registration_dataset_id", "registration_raw_dir",
+                         "registration_rows", "registration_kb_target")
+
+
+def _missing_run_tracking_columns() -> list[str]:
+    """Which of the above slurm_dataset_runs does not have, in production."""
+    try:
+        existing = {c["name"] for c in sqlalchemy_inspect(
+            _get_engine(KB_PRODUCTION)).get_columns("slurm_dataset_runs")}
+    except Exception:
+        return []
+    return [c for c in _RUN_TRACKING_COLUMNS if c not in existing]
 
 
 def _update_dataset_run(submission_id: str, **fields):
@@ -6190,6 +6211,22 @@ class RegistrationRequest(BaseModel):
     kb_target: str = KB_PRODUCTION
     scope: str = "full"
     slide_names: list[str] | None = None
+    # --- overrides for what the run record does not hold ---------------------
+    #
+    # Registration reads these four off slurm_dataset_runs, which is right when
+    # the run was driven through this UI. Runs that predate a column, or work
+    # done on the cluster before the pipeline existed, have no dataset_name and
+    # sometimes no h5_output_path — and the only advice the endpoint could give
+    # was to leave the UI and use the CLI.
+    #
+    # None means "take it from the run", which is what every existing caller
+    # sends. Supplied values are used as given and are still checked to exist,
+    # so an override can be wrong in ways that are noticed, not in ways that
+    # register the wrong cohort quietly.
+    dataset_name: str | None = None
+    raw_dir: str | None = None
+    tile_dir: str | None = None
+    h5_path: str | None = None
     # Opens every slide file, so it is opt-in for the same reason as the CLI
     # flag: 14,044 headers is minutes, not seconds.
     slide_metadata: bool = False
@@ -6201,61 +6238,100 @@ class RegistrationRequest(BaseModel):
     replace: bool = False
 
 
-def _registration_plan(row, req: "RegistrationRequest"):
-    """Build register_dataset.py's plan from what the run already recorded."""
-    packaged = row.get("h5_output_path")
+def _registration_inputs(row, req: "RegistrationRequest") -> dict:
+    """The four paths registration reads, from the run record or the request.
+
+    Shared by the in-server registration (_registration_plan) and the Slurm one
+    (/register-submit), so the two cannot read different files for one run.
+    Returns h5_path, tile_dir, dataset_name, raw_dir and a `sources` map saying,
+    per input, whether the value came from the run or was supplied — an override
+    is a chance to register the wrong directory, so the preview shows it.
+    """
+    sources = {}
+
+    def _resolve(name, override, recorded):
+        value = (override or "").strip() if isinstance(override, str) else override
+        if value:
+            sources[name] = "supplied"
+            return value
+        sources[name] = "run record"
+        return recorded
+
+    packaged = _resolve("h5_path", req.h5_path, row.get("h5_output_path"))
     if not packaged:
-        raise HTTPException(400, "This run has no packaged .h5 yet — registration "
-                                 "reads tile identity out of it. Finish Stage 2 first.")
+        raise HTTPException(400,
+            "This run has no packaged .h5 recorded. Finish Stage 2, or give the "
+            "path to an .h5 packaged elsewhere in 'Packaged .h5' below.")
     h5_path = Path(packaged)
     if not h5_path.is_file():
-        raise HTTPException(400, f"The recorded .h5 is not on disk: {h5_path}")
+        raise HTTPException(400, f"No .h5 at {h5_path} ({sources['h5_path']}).")
 
-    tile_dir = Path(row.get("tile_dir") or PROCESSED_TILES_DIR)
-    # An explicitly supplied name wins over the recorded one: it is the only way
-    # to register a run whose dataset_name is NULL, and it is charset-checked
-    # here because it becomes a literal path segment under tile_dir.
-    supplied_name = (req.tile_dataset_name or "").strip()
+    tile_dir = Path(_resolve("tile_dir", req.tile_dir,
+                             row.get("tile_dir") or str(PROCESSED_TILES_DIR)))
+    if not tile_dir.is_dir():
+        raise HTTPException(400, f"No such directory: {tile_dir} ({sources['tile_dir']}).")
+
+    # The tile folder: dataset_name, or tile_dataset_name — the same thing under
+    # the name some clients send, accepted so neither breaks, and refused if the
+    # two disagree. A supplied name is charset-checked before anything else,
+    # because it becomes a literal path segment under tile_dir.
+    by_name = (req.dataset_name or "").strip()
+    by_tile_name = (req.tile_dataset_name or "").strip()
+    if by_name and by_tile_name and by_name != by_tile_name:
+        raise HTTPException(400,
+            f"dataset_name ({by_name!r}) and tile_dataset_name ({by_tile_name!r}) "
+            f"name different tile folders; send one.")
+    supplied_name = by_name or by_tile_name
     if supplied_name:
         try:
-            dataset_name = _sanitize_dataset_name(supplied_name)
+            supplied_name = _sanitize_dataset_name(supplied_name)
         except ValueError as e:
             raise HTTPException(400, str(e))
-    else:
-        dataset_name = row.get("dataset_name")
+    dataset_name = _resolve("dataset_name", supplied_name or None, row.get("dataset_name"))
     if not dataset_name:
-        raise HTTPException(
-            400,
+        raise HTTPException(400,
             "This run has no recorded dataset_name, so the folder its tiles live "
-            "under cannot be determined. Send tile_dataset_name: the folder under "
-            f"{tile_dir} holding this run's per-slide _tile_metadata.csv files. "
-            "It is not the same as dataset_id — that is the Knowledge Bank cohort "
-            "key, this is the directory on disk.",
-        )
+            "under is not known. Choose it as 'Tile folder' (over the API, send "
+            "tile_dataset_name) — the directory under "
+            f"{tile_dir} holding one folder per slide, e.g. 'Radiogenomics'. It is "
+            "not the same as dataset_id: that is the Knowledge Bank cohort key, "
+            "this is the directory on disk.")
 
     # Refuse a folder that is not on disk, rather than reading no metadata out
     # of it. A wrong name does not fail anywhere downstream — it registers every
     # tile with no coordinates, which is the shape of a successful run. Case is
     # the likely way to get it wrong: macOS matches RADIOGENOMICS to
-    # Radiogenomics and the cluster's Linux filesystem does not, so a name that
-    # works locally can come back empty there.
+    # Radiogenomics and the cluster's Linux filesystem does not.
     if not (tile_dir / dataset_name).is_dir():
         near = [p.name for p in tile_dir.iterdir()
-                if p.is_dir() and p.name.lower() == dataset_name.lower()] \
-            if tile_dir.is_dir() else []
+                if p.is_dir() and p.name.lower() == dataset_name.lower()]
         hint = (f" Did you mean '{near[0]}'? Folder names are case-sensitive here."
                 if near else
-                " Registration reads every tile's coordinates from that folder, so "
-                "continuing would register tiles with no coordinates at all.")
+                " It is a folder name, not a path — it is joined onto the tile "
+                "root — and registration reads every tile's coordinates from it, "
+                "so continuing would register tiles with no coordinates at all.")
         raise HTTPException(
-            400, f"No tile folder '{dataset_name}' under {tile_dir}.{hint}")
+            400, f"No tile folder '{dataset_name}' under {tile_dir} "
+                 f"({sources['dataset_name']}).{hint}")
 
-    raw_dir = Path(row["raw_dir"]) if row.get("raw_dir") else None
+    raw_override = _resolve("raw_dir", req.raw_dir, row.get("raw_dir"))
+    raw_dir = Path(raw_override) if raw_override else None
     if raw_dir is not None and not raw_dir.is_dir():
         # Reported rather than fatal: the tile tables are still registerable,
         # and saying so is more useful than refusing everything because the
         # slides have been moved off scratch.
         raw_dir = None
+
+
+    return {"h5_path": h5_path, "tile_dir": tile_dir, "dataset_name": dataset_name,
+            "raw_dir": raw_dir, "sources": sources}
+
+
+def _registration_plan(row, req: "RegistrationRequest"):
+    """Build register_dataset.py's plan from _registration_inputs()."""
+    inputs = _registration_inputs(row, req)
+    h5_path, tile_dir = inputs["h5_path"], inputs["tile_dir"]
+    dataset_name, raw_dir, sources = inputs["dataset_name"], inputs["raw_dir"], inputs["sources"]
 
     dataset_id = (req.dataset_id or dataset_name).strip().upper()
     scope = (req.scope or "full").strip().lower()
@@ -6295,9 +6371,17 @@ def _registration_plan(row, req: "RegistrationRequest"):
         scope=scope,
         slide_names=slide_names,
     )
-    # Carried on the plan so both endpoints can report which tile folder was
-    # actually read, without re-deriving it.
+    # Carried on the plan so both endpoints can report what was actually read,
+    # and where each value came from — an override is a chance to register the
+    # wrong directory, so it has to be visible before anything is written.
     plan["tile_dataset_name"] = dataset_name
+    plan["sources"] = sources
+    plan["resolved"] = {
+        "h5_path": str(h5_path),
+        "tile_dir": str(tile_dir),
+        "dataset_name": dataset_name,
+        "raw_dir": str(raw_dir) if raw_dir else None,
+    }
     return plan, dataset_id, raw_dir
 
 
@@ -6322,6 +6406,9 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
         "submission_id": submission_id,
         "kb_target": _resolve_kb_target(req.kb_target),
         "database": KB_TARGETS[_resolve_kb_target(req.kb_target)],
+        # What will actually be read, and where each value came from.
+        "resolved": plan.get("resolved"),
+        "sources": plan.get("sources"),
         "raw_dir": str(raw_dir) if raw_dir else None,
         # Which tile folder the coordinates were read from. Named in the report
         # because a wrong folder does not fail — it comes back as tiles with no
@@ -6333,6 +6420,9 @@ def preview_registration(submission_id: str, req: RegistrationRequest):
         # reimplemented in two frontends.
         "would_refuse_collision": bool(collisions),
         "needs_replace": bool(occupied) and not req.replace,
+        # Reported here, before anything is written, because the write that
+        # would fail happens after the rows are already committed.
+        "missing_run_tracking_columns": _missing_run_tracking_columns(),
         "already_registered": bool(row.get("registration_done")),
         "registration_at": (row["registration_at"].isoformat()
                             if row.get("registration_at") else None),
@@ -6432,24 +6522,9 @@ def submit_registration(submission_id: str, req: RegistrationRequest):
     row = _get_dataset_run_row(submission_id)
     target = _resolve_kb_target(req.kb_target)
 
-    packaged = row.get("h5_output_path")
-    if not packaged or not Path(packaged).is_file():
-        raise HTTPException(400, "This run has no packaged .h5 on disk — "
-                                 "registration reads tile identity out of it.")
-    tile_dir = Path(row.get("tile_dir") or PROCESSED_TILES_DIR)
-    supplied = (req.tile_dataset_name or "").strip()
-    dataset_name = supplied or row.get("dataset_name")
-    if not dataset_name:
-        raise HTTPException(400, "No tile dataset name for this run — send "
-                                 "tile_dataset_name.")
-    try:
-        dataset_name = _sanitize_dataset_name(dataset_name)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    raw_dir = Path(row["raw_dir"]) if row.get("raw_dir") else None
-    if raw_dir is not None and not raw_dir.is_dir():
-        raw_dir = None
+    inputs = _registration_inputs(row, req)
+    packaged, tile_dir = inputs["h5_path"], inputs["tile_dir"]
+    dataset_name, raw_dir = inputs["dataset_name"], inputs["raw_dir"]
     params = _row_tiling_params(row) or {} if req.write_dataset_config else {}
 
     with _slurm_submission_lock():

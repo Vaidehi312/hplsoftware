@@ -161,6 +161,9 @@ def _handle_upload_result(result: dict):
     if result["kind"] == "success":
         payload = result["payload"]
         st.success("Slide uploaded successfully.")
+        if payload.get("pipeline_error"):
+            # The slide is saved and viewable; only its run was refused.
+            st.error(f"The pipeline was not started: {payload['pipeline_error']}")
         st.json(payload)
 
         returned_slide_id = str(payload.get("slide_id") or "").strip().upper()
@@ -189,8 +192,8 @@ def _handle_upload_result(result: dict):
 def render_wsi_upload_panel():
     """Upload a new WSI to the FastAPI backend.
 
-    The backend queues tissue masking + tiling as a background job right
-    after saving the file; this panel polls /processing-status for progress.
+    The backend queues Stages 1-4 as a one-slide pipeline run right after
+    saving the file; this panel polls /processing-status for progress.
 
     Re-using a slide_id from a previous upload is allowed, but the backend
     now hard-stops the first attempt (409 slide_id_exists) rather than
@@ -266,7 +269,10 @@ def render_wsi_upload_panel():
 
             stage = (status_payload or {}).get("status", "unknown")
             if stage == "done":
-                st.success("Tissue masking + tiling complete. Tiles are ready.")
+                st.success(
+                    "Stages 1-4 complete: tiled, packaged, embedded and classified. "
+                    "Register it and load it into the Knowledge Bank below."
+                )
                 packaging_error = (status_payload or {}).get("error")
                 if packaging_error:
                     st.warning(packaging_error)
@@ -277,25 +283,23 @@ def render_wsi_upload_panel():
                 if st.button("Dismiss", key="wsi_processing_dismiss_error"):
                     del st.session_state["processing_slide_id"]
             else:
-                st.info(f"Status: **{stage}** (queued → masking → tiling → packaging → done)")
+                st.info(
+                    f"Status: **{stage}** (queued → tiling → packaging → "
+                    f"feature extraction → classification → done)"
+                )
                 st.button("Refresh status", key="wsi_processing_refresh")
 
             _render_upload_pipeline(processing_slide_id, status_payload or {})
 
 
 def _render_upload_pipeline(slide_id: str, status_payload: dict):
-    """The rest of the pipeline for an uploaded slide: Stages 3-7, rendered by
-    the same stepper a dataset run uses.
+    """An uploaded slide's run, rendered by the same stepper a dataset run uses.
 
-    An upload used to stop at its .h5. Masking, tiling and packaging all ran
-    and then nothing else could: feature extraction, cluster classification,
-    registration and the Knowledge Bank load are keyed on a run, and an upload
-    had none — so an uploaded slide could be looked at, but never carried any
-    HPC labels, never appeared in hpl_profile_*, and the chatbot could not
-    answer a single question about it. The backend now creates a one-slide run
-    for every upload (see _start_upload_run in tile_server_v2_.py), and this is
-    where the user drives it: the same seven steps, with Stages 1 and 2 already
-    finished by the upload itself.
+    Every upload is a one-slide pipeline run (_start_upload_pipeline_run in
+    tile_server_v2_.py): Stages 1-4 run by themselves, exactly as Run HPL's
+    do, and Stages 5 and 6 — registration and the Knowledge Bank load — are
+    driven from here with their dry runs. An upload from before that is a run
+    whose Stages 1-2 ran in the server, and keeps its Stage 3/4 buttons.
     """
     submission_id = status_payload.get("submission_id")
     if not submission_id:
@@ -308,10 +312,11 @@ def _render_upload_pipeline(slide_id: str, status_payload: dict):
 
     st.divider()
     st.caption(
-        f"**Rest of the pipeline for {slide_id}** — cohort "
-        f"`{status_payload.get('dataset_name') or ''}`. Steps 1 and 2 were done "
-        f"by the upload itself; run 3 onwards here to get this slide's tiles "
-        f"into the Knowledge Bank and its HPC overlay into the viewer."
+        f"**Pipeline for {slide_id}** — cohort "
+        f"`{status_payload.get('dataset_name') or ''}`. Steps 1-4 run by "
+        f"themselves, as in Run HPL; once they are done, run 5 and 6 here to "
+        f"get this slide's tiles into the Knowledge Bank and its HPC overlay "
+        f"into the viewer."
     )
     # Registration always asks for Replace on an uploaded slide, and the
     # refusal it comes from names a row count rather than a reason. Said here,
@@ -845,7 +850,8 @@ def _is_anorak_run(run: dict) -> bool:
 
 
 def _is_upload_run(status: dict) -> bool:
-    """An uploaded slide's one-slide run: Stages 1-2 ran in-process (local:)."""
+    """An upload from before uploads were pipeline runs: its Stages 1-2 ran
+    in the server (local:). A newer upload's run is a pipeline run."""
     return str(status.get("job_id") or "").startswith("local:")
 
 
@@ -2637,6 +2643,92 @@ def _render_assignment_step(status: dict, submission_id: str, key_prefix: str, s
     )
 
 
+# Said wherever a standby head job is shown, in both UIs, in these words.
+ANORAK_CHAIN_EXPLAINED = (
+    "If this head job reaches its time limit, the next standby resumes the run; "
+    "finished slides are kept."
+)
+_ANORAK_STEP_LABELS = {
+    "TILE_SLIDE": "Tile slides",
+    "PREDICT_GP": "Predict growth patterns (GPU)",
+    "SS1_STITCH": "Stitch masks",
+    "PUBLISH_SLIDE": "Publish",
+    "SLIDE_PROPORTIONS": "Slide proportions",
+    "TUMOUR_GRADE": "Tumour grades",
+}
+
+
+def _render_anorak_head_chain(status: dict, resume_hint: str):
+    """The live head job, its standbys, and — when none is queued — that
+    nothing will take over at its time limit. Port target:
+    AnorakHeadChain in AnorakStage.jsx.
+
+    The head job shown is the one Slurm is running under the run's name, not
+    only the one this server recorded: on 2026-09-30 the recorded head job had
+    timed out and a chain submitted by hand was carrying the run, and the stage
+    said "ended" with a Retry form over it."""
+    head = status.get("anorak_head_job_id")
+    head_state = status.get("anorak_head_state")
+    left = status.get("anorak_head_time_left")
+    if status.get("anorak_chain_took_over"):
+        st.info(
+            f"The recorded head job ({status.get('anorak_job_id')}) ended as "
+            f"{status.get('anorak_recorded_state')}; the chain took over, and head job "
+            f"{head} is carrying the run."
+        )
+    if head:
+        st.markdown(f"**Head job {head}** · {head_state}" + (f" · {left} left" if left else ""))
+        if status.get("anorak_head_reason_text"):
+            st.caption(f"Waiting to start: {status['anorak_head_reason_text']}.")
+    standbys = status.get("anorak_standby_job_ids") or []
+    if standbys:
+        st.caption(
+            f"{len(standbys)} standby head job{'s' if len(standbys) != 1 else ''} queued "
+            f"({', '.join(standbys)}). {ANORAK_CHAIN_EXPLAINED}"
+        )
+    elif head and head_state == "RUNNING":
+        st.warning(
+            f"No standby head job is queued: nothing will take over when head job {head} "
+            f"reaches its time limit" + (f" (in {left})" if left else "") + f". {resume_hint}"
+        )
+    if status.get("anorak_head_discovery_failed"):
+        st.caption("Couldn't ask Slurm for head jobs under this run's name, so only the "
+                   "recorded ones are shown.")
+
+
+def _render_anorak_progress(status: dict):
+    """Per step done / total from Nextflow's trace, with running, waiting and
+    failed, the stitched-slide count, and why the queued task jobs are waiting.
+    Port target: AnorakProgress in AnorakStage.jsx."""
+    progress = status.get("anorak_progress")
+    if not progress:
+        return
+    steps = progress.get("steps") or []
+    if progress.get("trace_available") or any(s.get("running") or s.get("waiting") for s in steps):
+        for step in steps:
+            total, done = step.get("total"), step.get("done") or 0
+            label = _ANORAK_STEP_LABELS.get(step["process"], step["process"])
+            extras = ", ".join(
+                f"{step[k]:,} {k}" for k in ("running", "waiting", "failed") if step.get(k))
+            text = (f"{label}: {done:,} / {total:,} done" if total else f"{label}: {done:,} done")
+            st.progress(min(done / total, 1.0) if total else 0.0,
+                        text=text + (f" · {extras}" if extras else ""))
+        if progress.get("counts_source") == "trace" and status.get("anorak_in_flight"):
+            st.caption("Running and waiting are from the trace, which learns of a task only "
+                       "when it finishes — squeue could not be asked.")
+    elif progress.get("trace_error"):
+        st.caption(f"No progress yet: {progress['trace_error']}.")
+    if progress.get("stitched_slides") is not None:
+        total = progress.get("slides")
+        st.caption(f"Stitched slides in ss1_final: {progress['stitched_slides']:,}"
+                   + (f" of {total:,}" if total else "") + ".")
+    queue = progress.get("task_queue")
+    if queue and queue.get("waiting"):
+        st.caption("Why the queued task jobs are waiting:")
+        for item in queue["waiting"]:
+            st.markdown(f"- **{item['count']:,}** — {item['explanation']} (`{item['reason']}`)")
+
+
 def _render_anorak_step(status: dict, submission_id: str, key_prefix: str, state: str):
     """Stage 7: ANORAK growth-pattern segmentation and IASLC grading.
 
@@ -2686,6 +2778,13 @@ def _render_anorak_step(status: dict, submission_id: str, key_prefix: str, state
                 f"one job per slide per stage, so `squeue` shows many more jobs "
                 f"than this one."
             )
+            _render_anorak_head_chain(
+                status,
+                "When it stops, the Retry form comes back here: keep “Continue the "
+                "cached run” ticked and Head jobs at 2 or more, and only unfinished "
+                "slides run again.",
+            )
+            _render_anorak_progress(status)
             if status.get("anorak_out_dir"):
                 st.caption("Live progress — Nextflow's own trace and report:")
                 st.code(f"{status['anorak_out_dir']}/pipeline_info", language=None)
@@ -2709,6 +2808,8 @@ def _render_anorak_step(status: dict, submission_id: str, key_prefix: str, state
         if status.get("anorak_out_dir"):
             st.caption("The head job's log is the first place to look:")
             st.code(f"{status['anorak_out_dir']}/nextflow.log", language=None)
+        # How far it got, so a retry is judged against what is already done.
+        _render_anorak_progress(status)
 
     _render_anorak_form(
         status, submission_id, key_prefix,
@@ -2733,8 +2834,15 @@ def _render_anorak_run_step(status: dict, submission_id: str, key_prefix: str):
         st.success("Growth-pattern grading complete:")
         st.code(status.get("anorak_grades_csv"), language=None)
     elif status.get("anorak_in_flight"):
-        st.info(f"ANORAK running (head job {status.get('anorak_job_id')}, "
+        st.info(f"ANORAK running (head job "
+                f"{status.get('anorak_head_job_id') or status.get('anorak_job_id')}, "
                 f"{status.get('anorak_slurm_state')}).")
+        _render_anorak_head_chain(
+            status,
+            "When it stops, press Resume ANORAK here: it continues the cached run with "
+            "a head job and a standby, and only unfinished slides run again.",
+        )
+        _render_anorak_progress(status)
     elif status.get("anorak_job_id"):
         st.warning(f"ANORAK stopped ({status.get('anorak_slurm_state') or 'no Slurm record'}).")
         if status.get("anorak_stop_reason"):
@@ -2752,6 +2860,7 @@ def _render_anorak_run_step(status: dict, submission_id: str, key_prefix: str):
                 st.error(f"Resume failed: {e}")
             else:
                 st.success(f"Resumed — head job {result.get('anorak_job_id')}.")
+        _render_anorak_progress(status)
     if status.get("anorak_out_dir"):
         st.caption("Run directory (masks, proportions, nextflow.log, report):")
         st.code(status["anorak_out_dir"], language=None)
@@ -4025,8 +4134,8 @@ def _render_job_progress(job: dict, key_prefix: str = ""):
     elif not _is_upload_run(status):
         # A run from before the pipeline: its Stages 1-4 are history. Shown
         # read-only — a new pipeline run carries the dataset on and reuses
-        # whatever these produced. Upload runs keep their Stage 3/4 buttons:
-        # an uploaded slide does not go through the pipeline.
+        # whatever these produced. Older upload runs keep their Stage 3/4
+        # buttons: they were never pipeline runs, and have no resume.
         for stage in _PIPELINE_STAGES:
             renderers[stage] = (lambda stage: lambda s: _render_legacy_stage_readonly(
                 status, stage))(stage)

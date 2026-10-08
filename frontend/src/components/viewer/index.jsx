@@ -11,7 +11,7 @@ import {
 import { getHpcSurvivalMapFor, getHpcTitleMapFor } from "./hpcReferenceCache.js";
 import PyramidViewer from "./PyramidViewer.jsx";
 import ClickInspectorViewer from "./ClickInspectorViewer.jsx";
-import TileInfo from "./TileInfo.jsx";
+import TileDetailCard from "./TileDetailCard.jsx";
 import Legend from "./Legend.jsx";
 import HpcAnnotation from "./HpcAnnotation.jsx";
 import AdjacencyControls from "./AdjacencyControls.jsx";
@@ -392,21 +392,28 @@ export default function SlideViewer({ slideId }) {
                 tileSizeNative={slideInfo.tileSizeNative}
                 onSelectTile={setSelectedTile}
                 height={780}
+                previewUrl={(t, level) =>
+                  api.regionUrl(slideId, t.x_native, t.y_native, slideInfo.tileSizeNative, slideInfo.tileSizeNative, level, 80)
+                }
+                // Same card the click inspector shows, so a tile picked in
+                // either mode reads the same — and the selection itself is
+                // shared state, so switching modes keeps it.
+                renderSidePanel={
+                  selectedTile && selectedTile.tile
+                    ? (zoomToSelected) => (
+                        <TileDetailCard
+                          slideId={slideId}
+                          tile={selectedTile.tile}
+                          tileSizeNative={slideInfo.tileSizeNative}
+                          heatHpc={highlightMode === "Heatmap" ? heatHpc : null}
+                          hpcTitle={hpcTitleMap.get(selectedTile.tile.hpc_id) || ""}
+                          onZoom={zoomToSelected}
+                          onClose={() => setSelectedTile(null)}
+                        />
+                      )
+                    : null
+                }
               />
-              {selectedTile && selectedTile.tile && (
-                <div className="viewer-tile-result">
-                  <div className="viewer-info">
-                    Tile selected: {String(selectedTile.tile.tiles || selectedTile.slide_tile)}
-                  </div>
-                  {/* Same panel the click inspector shows, so a tile picked in
-                      either mode reads the same — and the selection itself is
-                      shared state, so switching modes keeps it. */}
-                  <TileInfo tile={selectedTile.tile} heatHpc={highlightMode === "Heatmap" ? heatHpc : null} />
-                  <button type="button" className="viewer-btn" onClick={() => setSelectedTile(null)}>
-                    Clear selection
-                  </button>
-                </div>
-              )}
             </>
           ) : (
             <ClickInspectorViewer

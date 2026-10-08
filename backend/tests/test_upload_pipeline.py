@@ -1,27 +1,30 @@
-"""A single uploaded slide is a one-slide dataset run, all the way to the KB.
+"""A single uploaded slide is a one-slide pipeline run, all the way to the KB.
 
-Uploading a slide used to mask it, tile it, package a .h5 and stop. Everything
-after that — feature extraction, cluster classification, registration, the
-Knowledge Bank load — is keyed on a slurm_dataset_runs row, and an upload had
-none, so an uploaded slide could be looked at in the viewer and never carried a
-single HPC label. It now gets a run, and Stages 1 and 2 record themselves
-against it as they finish in-process.
+Uploading a slide used to mask, tile and package it inside the server and
+then wait for someone to click through feature extraction and classification
+— with an empty checkpoint box, the one place a typed path reached the
+encoder. It is now submitted as the same Nextflow run Run HPL starts, over the
+upload's own directory, so Stages 1-4 happen by themselves.
 
-Three things that go wrong quietly, which is why they are tested here rather
-than left to the first upload someone tries:
+What goes wrong quietly, which is why it is tested here rather than left to
+the first upload someone tries:
 
-  * the sentinel job id standing in for a stage that ran in this process. sacct
-    rejects a whole call for one id it does not recognise, so a sentinel
-    reaching it would have reported "can't reach Slurm" for every real run in
-    the same listing — not just for the upload;
+  * a re-upload over the previous upload's tiles. The tiling task keeps any
+    slide whose tiles already validate, so the new run would classify the
+    *old* file's tiles under the new file's name — every label plausible,
+    every one for the wrong slide;
   * the cohort each upload is registered under. register_dataset.commit()
     scopes --replace to a dataset_id and DELETEs what it finds there, so one
     shared "UPLOADED" cohort would mean registering the second uploaded slide
     either refused outright or deleted the first one's rows;
-  * the name the raw file is saved under. Registration finds each slide's file
-    via slide_id_from_raw_path(), and a name it cannot recover the slide_id
-    from does not fail — it registers a cohort with no wsi_registry row, and
-    the viewer 404s on a slide sitting right there on disk.
+  * the name the raw file is saved under. Registration and the tiler both
+    find each slide's id via slide_id_from_raw_path(), and a name it cannot
+    recover the slide_id from does not fail — it registers a cohort with no
+    wsi_registry row, and the viewer 404s on a slide sitting right there;
+  * the sentinel job id standing in for a stage that ran in the server, which
+    uploads from before this still carry. sacct rejects a whole call for one
+    id it does not recognise, so a sentinel reaching it would report "can't
+    reach Slurm" for every real run in the same listing.
 """
 
 import inspect
@@ -183,12 +186,20 @@ def test_the_cohort_name_is_also_the_tile_folder(_tmp=None):
     """Registration reads Stage 1's _tile_metadata.csv out of
     tile_dir/<the run's dataset_name>/<slide_id>/. The upload pipeline writes
     its tiles under the same name, which is what makes registering an upload
-    need no special case at all."""
-    source = _SERVER_SOURCE[_SERVER_SOURCE.index("def _run_postupload_pipeline"):]
-    source = source[:source.index("\ndef ", 1)]
-    assert "dataset_name = upload_dataset_name(slide_id)" in source
-    assert "PROCESSED_TILES_DIR / dataset_name" in source
-    assert "tile_dataset_name=dataset_name" in source
+    need no special case at all.
+
+    Also what a re-upload moves aside: the pipeline's tiler writes exactly the
+    folders _move_upload_tiles_aside moves, and a mismatch would leave the old
+    tiles where the new run adopts them."""
+    from submit_mask_tile_slurm import slide_output_paths
+
+    masks, tiles = Path("/m"), Path("/t")
+    name = srv.upload_dataset_name("TCGA-55-7574")
+    saved = Path(f"/raw/uuid/TCGA-55-7574_{'0' * 8}-{'0' * 4}-{'0' * 4}-{'0' * 4}-{'0' * 12}_x.svs")
+    paths = slide_output_paths(saved, masks, tiles, name)
+    assert paths["dataset_tile_dir"] == tiles / name
+    assert paths["dataset_mask_dir"] == masks / name
+    assert paths["slide_tile_dir"] == tiles / name / "TCGA-55-7574"
 
 
 def test_an_upload_from_before_this_is_still_recognised_as_an_upload(_tmp=None):
@@ -240,128 +251,235 @@ def test_the_endpoint_saves_under_the_parseable_name(_tmp=None):
     assert 'save_dir / f"{safe_user_slide_id}_{internal_id}_{safe_filename}"' in _SERVER_SOURCE
 
 
-# --- what the run records --------------------------------------------------
+# --- the upload's run is a pipeline run -----------------------------------
 
-def test_the_recorded_tiling_params_are_the_ones_the_upload_runs_with(_tmp=None):
-    """Registration writes these into dataset_config, so a wrong pair claims a
-    cohort was tessellated at a resolution it was not. Read off the two
-    functions that actually own them rather than copied."""
-    params = srv._upload_tiling_params()
-    assert set(params) == set(srv._TILING_PARAM_NAMES), params
-    assert params["min_tissue"] == srv.MIN_TISSUE_PERCENT
-    tiler = inspect.signature(tile_slide_from_mask).parameters
-    masker = inspect.signature(run_tissue_detection).parameters
-    assert params["target_mpp"] == tiler["target_mpp"].default
-    assert params["target_tile_px"] == tiler["target_tile_px"].default
-    assert params["mask_max_size"] == masker["max_size"].default
-    assert params["mask_saturation"] == masker["saturation_threshold"].default
+class _Refused(Exception):
+    pass
 
 
-def _run_upload_pipeline(tmp_path, package=None):
-    """Drive _run_postupload_pipeline with the three heavy stages stubbed out,
-    returning everything it recorded against the run."""
-    mask_dir, tile_dir = tmp_path / "masks", tmp_path / "tiles"
-    slide_id = "TCGA-55-7574"
-    dataset_name = srv.upload_dataset_name(slide_id)
-    recorded = []
-
-    def _fake_mask(slide_path, output_dir, slide_id):
-        out = Path(output_dir)
-        return {"mask_path": str(out / f"{slide_id}_mask.png"),
-                "overlay_path": str(out / f"{slide_id}_overlay.png")}
-
-    def _fake_tile(slide_path, mask_path, output_dir, min_tissue_percent, slide_id):
-        return {"output_dir": str(Path(output_dir) / slide_id), "saved_tiles": 512}
-
-    def _fake_package(**kwargs):
-        if package is not None:
-            return package(**kwargs)
-        return {"output_h5_path": str(tmp_path / dataset_name /
-                                      f"hdf5_{dataset_name}_he_train.h5")}
-
-    with _Patched(
-        srv,
-        TISSUE_MASK_DIR=mask_dir,
-        PROCESSED_TILES_DIR=tile_dir,
-        HPL_DATASETS_ROOT=tmp_path,
-        run_tissue_detection=_fake_mask,
-        tile_slide_from_mask=_fake_tile,
-        package_slides_to_h5=_fake_package,
-        _set_processing_status=lambda *a, **k: None,
-        _update_dataset_run_best_effort=lambda sid, **fields: recorded.append(fields),
-    ):
-        srv._run_postupload_pipeline(slide_id, str(tmp_path / "slide.svs"), "run-1")
-
-    merged = {}
-    for fields in recorded:
-        merged.update(fields)
-    return merged
+def _dirs(tmp_path):
+    masks, tiles = tmp_path / "masks", tmp_path / "tiles"
+    return masks, tiles
 
 
-def test_an_upload_leaves_the_run_ready_for_feature_extraction(_tmp=None):
-    """The whole point: Stage 3 gates on h5_job_id plus a recorded .h5 path,
-    and an upload's Stages 1 and 2 never go near Slurm to produce either."""
+def _previous_upload(tmp_path, slide_id="TCGA-55-7574"):
+    """The mask and tiles a previous upload of this slide_id left on disk,
+    plus a neighbouring cohort's that must never be touched."""
+    masks, tiles = _dirs(tmp_path)
+    name = srv.upload_dataset_name(slide_id)
+    for root in (masks, tiles):
+        (root / name / slide_id).mkdir(parents=True)
+        (root / name / slide_id / "old.jpeg").write_bytes(b"old")
+        (root / "TCGA").mkdir()
+    return name
+
+
+def _start(tmp_path, create=None, update=None):
+    """_start_upload_pipeline_run with the run creation stubbed out."""
+    masks, tiles = _dirs(tmp_path)
+    calls = []
+
+    def _fake_create(req, raw_dir, dataset_name):
+        calls.append((req, raw_dir, dataset_name))
+        if create is not None:
+            return create(req, raw_dir, dataset_name)
+        return {"submission_id": "run-1"}, ("run-1",)
+
+    with _Patched(srv, TISSUE_MASK_DIR=masks, PROCESSED_TILES_DIR=tiles,
+                  _create_pipeline_run=_fake_create,
+                  _update_dataset_run=update or (lambda *a, **k: None)):
+        response, submission = srv._start_upload_pipeline_run(
+            "TCGA-55-7574", tmp_path / "raw" / "uuid-dir")
+    return calls, response, submission
+
+
+def test_an_upload_is_submitted_as_a_pipeline_run_over_its_own_directory(_tmp=None):
+    """The whole change: one run, over a directory holding exactly this slide,
+    under the slide's own cohort, with every setting the server's — the
+    checkpoint in particular, which is no longer anybody's to type."""
     tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
-    recorded = _run_upload_pipeline(tmp_path)
+    calls, response, submission = _start(tmp_path)
 
-    assert recorded["job_id"] == srv._local_job_id("tiling")
-    assert recorded["h5_job_id"] == srv._local_job_id("packaging")
-    assert recorded["h5_output_path"].endswith("hdf5_UPLOADED_TCGA-55-7574_he_train.h5")
-    assert recorded["status"] == "completed"
-    assert recorded["total_slides"] == 1
+    (req, raw_dir, dataset_name), = calls
+    assert raw_dir == tmp_path / "raw" / "uuid-dir"
+    assert dataset_name == srv.upload_dataset_name("TCGA-55-7574")
+    assert req.dataset_name == dataset_name
+    assert req.checkpoint is None and req.reference is None, "not the server's defaults"
+    assert req.vote_preset == srv.DEFAULT_VOTE_PRESET
+    assert not req.sample_size and not req.slide_names
+    # A re-upload's earlier .h5/projections/assignments are moved aside, not
+    # refused: the upload has no other button to press.
+    assert req.move_existing_outputs is True
+    assert submission == ("run-1",)
 
 
-def test_a_failed_packaging_leaves_stage_3_shut(_tmp=None):
-    """Proves the recording above is evidence and not decoration. Packaging
-    that raised must not leave a sentinel behind: the sentinel reads as
-    COMPLETED everywhere, so Stage 3 would queue a GPU job against a .h5 that
-    was never written."""
+def test_a_reupload_moves_the_old_tiles_aside(_tmp=None):
     tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    name = _previous_upload(tmp_path)
+    _, response, _ = _start(tmp_path)
 
-    def _explode(**kwargs):
-        raise RuntimeError("no space left on device")
-
-    recorded = _run_upload_pipeline(tmp_path, package=_explode)
-
-    assert "h5_job_id" not in recorded
-    assert "h5_output_path" not in recorded
-    # Stage 1 still finished, and saying so is what keeps the retry on
-    # packaging rather than sending the user back to re-tile.
-    assert recorded["job_id"] == srv._local_job_id("tiling")
-    assert "packaging failed" in recorded["error"]
+    masks, tiles = _dirs(tmp_path)
+    for root in (masks, tiles):
+        assert not (root / name).exists(), "the new run would adopt these tiles"
+        kept = list((root / ".superseded").glob(f"{name}-*/TCGA-55-7574/old.jpeg"))
+        assert kept, "moved, never deleted"
+        assert (root / "TCGA").is_dir(), "another cohort was touched"
+    assert len(response["superseded_tiles"]) == 2
 
 
-def test_a_slide_with_no_tissue_stops_without_claiming_a_h5(_tmp=None):
-    """Tissue below the threshold is an expected outcome for one ad-hoc slide,
-    not a failure — but it must not look like a run with something to extract
-    features from."""
+def test_the_moved_tiles_are_not_offered_as_a_dataset_folder(_tmp=None):
     tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    _previous_upload(tmp_path)
+    _start(tmp_path)
+    with _Patched(srv, PROCESSED_TILES_DIR=_dirs(tmp_path)[1]):
+        names = srv.list_tile_dataset_names()["dataset_names"]
+    assert names == ["TCGA"], names
 
-    def _no_tiles(slide_path, mask_path, output_dir, min_tissue_percent, slide_id):
-        return {"output_dir": str(Path(output_dir) / slide_id), "saved_tiles": 0}
 
-    recorded = []
-    with _Patched(
-        srv,
-        TISSUE_MASK_DIR=tmp_path / "masks",
-        PROCESSED_TILES_DIR=tmp_path / "tiles",
-        run_tissue_detection=lambda slide_path, output_dir, slide_id: {
-            "mask_path": str(Path(output_dir) / "m.png"),
-            "overlay_path": str(Path(output_dir) / "o.png"),
-        },
-        tile_slide_from_mask=_no_tiles,
-        package_slides_to_h5=lambda **k: (_ for _ in ()).throw(
-            AssertionError("packaging ran for a slide with no tiles")),
-        _set_processing_status=lambda *a, **k: None,
-        _update_dataset_run_best_effort=lambda sid, **fields: recorded.append(fields),
-    ):
-        srv._run_postupload_pipeline("TCGA-55-7574", str(tmp_path / "slide.svs"), "run-1")
+def test_a_refused_run_leaves_the_old_tiles_where_they_were(_tmp=None):
+    """The move comes after the run exists. Moved first, a refusal (a missing
+    checkpoint, say) would leave the previous upload's run pointing at tiles
+    that are no longer there."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    name = _previous_upload(tmp_path)
 
-    merged = {}
-    for fields in recorded:
-        merged.update(fields)
-    assert "h5_job_id" not in merged
-    assert "tissue" in merged["error"]
+    def _refuse(*args):
+        raise _Refused("checkpoint not found")
+
+    try:
+        _start(tmp_path, create=_refuse)
+    except _Refused:
+        pass
+    else:
+        raise AssertionError("the refusal did not reach the caller")
+    for root in _dirs(tmp_path):
+        assert (root / name / "TCGA-55-7574" / "old.jpeg").is_file()
+
+
+def test_tiles_that_cannot_be_moved_stop_the_run(_tmp=None):
+    """If the old tiles stay, the run must not start: its tiling would keep
+    them. The row says so, and the caller never queues the submission."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    _previous_upload(tmp_path)
+    updates = []
+
+    def _cannot_move(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    with _Patched(srv, _move_upload_tiles_aside=_cannot_move):
+        try:
+            _start(tmp_path, update=lambda sid, **fields: updates.append((sid, fields)))
+        except srv.HTTPException as e:
+            assert "earlier tiles" in e.detail
+        else:
+            raise AssertionError("a run was handed back over tiles it would adopt")
+    assert updates and updates[0][0] == "run-1"
+    assert updates[0][1]["status"] == "error"
+
+
+def test_the_endpoint_queues_the_run_it_created(_tmp=None):
+    upload = _SERVER_SOURCE[_SERVER_SOURCE.index("async def upload_slide("):]
+    upload = upload[:upload.index("\n@app.get")]
+    assert "_start_upload_pipeline_run(safe_user_slide_id, save_dir)" in upload
+    assert "background_tasks.add_task(_run_pipeline_submission, *submission)" in upload
+    # save_dir, not the shared UPLOAD_RAW_DIR: discovery walks raw_dir, and
+    # the pool holds every upload ever made.
+    assert "_start_upload_pipeline_run(safe_user_slide_id, UPLOAD_RAW_DIR" not in upload
+
+
+# --- a re-upload while the last run is still going --------------------------
+
+def _in_flight(state):
+    row = {"submission_id": "run-0", "job_id": "nf:run-0:tiling",
+           "h5_job_id": "nf:run-0:packaging", "extraction_job_id": "nf:run-0:extraction",
+           "assignment_job_id": "nf:run-0:assignment"}
+    with _Patched(srv,
+                  _upload_run_for_slide=lambda slide_id: {"submission_id": "run-0"},
+                  _get_dataset_run_row=lambda sid: dict(row),
+                  _get_slurm_job_state=lambda job_id: state):
+        return srv._upload_run_in_flight("TCGA-55-7574")
+
+
+def test_a_reupload_waits_for_a_running_run(_tmp=None):
+    assert "run-0" in _in_flight("RUNNING")
+    assert "run-0" in _in_flight("PENDING")
+
+
+def test_a_reupload_waits_when_slurm_cannot_say(_tmp=None):
+    """Unreachable is not "nothing running" — moving tiles out from under a
+    live tiling task is the worse outcome."""
+    assert "unknown" in _in_flight(None)
+
+
+def test_a_finished_or_stopped_run_does_not_block_a_reupload(_tmp=None):
+    for state in ("COMPLETED", "FAILED", "CANCELLED", ""):
+        assert _in_flight(state) is None, state
+
+
+def test_the_in_flight_check_comes_before_the_overwrite_prompt(_tmp=None):
+    """Otherwise the user confirms the overwrite and is refused anyway."""
+    upload = _SERVER_SOURCE[_SERVER_SOURCE.index("async def upload_slide("):]
+    assert upload.index('"upload_run_in_progress"') < upload.index('"slide_id_exists"')
+
+
+# --- the upload panel's status, read off the pipeline -----------------------
+
+def _progress(tmp_path, head_state, started=(), done=(), row=None):
+    from hpl_nf_state import mark_done, mark_started
+    run_dir = tmp_path / "run-1"
+    for stage in started:
+        mark_started(run_dir, stage)
+    for stage in done:
+        mark_started(run_dir, stage)
+        mark_done(run_dir, stage, {"rows": 1})
+    row = row or {"submission_id": "run-1", "status": "submitted",
+                  "job_id": "nf:run-1:tiling"}
+    with _Patched(srv, HPL_NF_RESULTS_ROOT=tmp_path,
+                  _get_dataset_run_row=lambda sid: dict(row),
+                  _nf_head_state=lambda sid: head_state):
+        return srv._upload_pipeline_progress("run-1")
+
+
+def test_the_status_follows_the_pipeline(_tmp=None):
+    def fresh():
+        return Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+
+    assert _progress(fresh(), "PENDING")["status"] == "queued"
+    assert _progress(fresh(), "RUNNING", started=["tiling"])["status"] == "tiling"
+    assert _progress(fresh(), "RUNNING", done=["tiling"],
+                     started=["packaging"])["status"] == "packaging"
+    assert _progress(fresh(), "RUNNING", done=["tiling", "packaging"],
+                     started=["extraction"])["status"] == "feature extraction"
+    assert _progress(fresh(), "RUNNING", done=["tiling", "packaging", "extraction"],
+                     started=["assignment"])["status"] == "classification"
+    assert _progress(fresh(), "COMPLETED",
+                     done=list(srv.NF_STAGES))["status"] == "done"
+
+
+def test_a_run_that_stopped_is_an_error_naming_the_stage(_tmp=None):
+    """The guard can come out bad: a head job that ended without the
+    extraction marker must not read as done, or as still going."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    progress = _progress(tmp_path, "COMPLETED", done=["tiling", "packaging"])
+    assert progress["status"] == "error", progress
+    assert "feature extraction" in progress["error"]
+
+
+def test_a_refused_submission_is_an_error(_tmp=None):
+    tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    progress = _progress(tmp_path, None, row={
+        "submission_id": "run-1", "status": "error", "job_id": "nf:run-1:tiling",
+        "error": "sbatch: invalid partition"})
+    assert progress == {"status": "error", "error": "sbatch: invalid partition"}
+
+
+def test_an_older_upload_keeps_the_status_it_recorded(_tmp=None):
+    """Uploads from before this ran Stages 1-2 in the server and wrote their
+    progress to wsi_registry; nothing here may overwrite it."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="hpl_upload_test_"))
+    assert _progress(tmp_path, None, row={
+        "submission_id": "run-1", "status": "completed",
+        "job_id": srv._local_job_id("tiling")}) is None
 
 
 # --- the UI's route into the run ------------------------------------------
@@ -381,7 +499,7 @@ def test_the_upload_response_carries_the_run(_tmp=None):
     upload = _SERVER_SOURCE[_SERVER_SOURCE.index("async def upload_slide("):]
     upload = upload[:upload.index("\n@app.get")]
     assert '"submission_id": submission_id' in upload
-    assert "_start_upload_run(safe_user_slide_id, save_path)" in upload
+    assert '"pipeline_error": pipeline_error' in upload
 
 
 def _pipeline_steps():
@@ -401,9 +519,9 @@ def _pipeline_steps():
     return namespace["_pipeline_steps"]
 
 
-def test_the_stepper_offers_feature_extraction_for_an_uploaded_slide(_tmp=None):
-    """End of the chain, in the terms the user actually sees: Stages 1 and 2
-    read as done and Stage 3 is the next thing to click."""
+def test_the_stepper_offers_feature_extraction_for_an_older_uploaded_slide(_tmp=None):
+    """An upload from before uploads were pipeline runs: Stages 1 and 2 read as
+    done and Stage 3 is still the next thing to click."""
     steps = {s["key"]: s for s in _pipeline_steps()({
         "status": "completed",
         "total_slides": 1, "succeeded": 1, "tiling_complete": True,

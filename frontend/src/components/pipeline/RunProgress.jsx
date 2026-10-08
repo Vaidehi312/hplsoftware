@@ -158,8 +158,8 @@ export default function RunProgress({ submissionId, job }) {
       );
     }
     // A run from before the pipeline: its Stages 1-4 are history, read-only.
-    // Upload runs keep their Stage 3/4 buttons — an uploaded slide does not
-    // go through the pipeline.
+    // Older upload runs (Stages 1-2 ran in the server, local:) keep their
+    // Stage 3/4 buttons; a newer upload is a pipeline run, handled above.
     const isUpload = String(status.job_id || "").startsWith("local:");
     if (!status.pipeline && !isUpload && PIPELINE_STAGES.includes(s.key)) {
       return <LegacyStage stage={s.key} status={status} />;

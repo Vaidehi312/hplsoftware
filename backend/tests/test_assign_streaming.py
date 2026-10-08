@@ -2467,6 +2467,57 @@ def test_resuming_a_different_configuration_is_refused(tmp_path):
     assert "rm -rf" in result.stderr
 
 
+# --- Stage 4's extras check ---------------------------------------------------
+
+def test_gpu_extras_holding_only_a_gpu_faiss_are_accepted(tmp_path):
+    """What --bootstrap-extras-gpu actually installs. The encoder's check
+    (scikit-image) refused this directory, and with it every GPU assignment
+    and every pipeline run on a cluster set up exactly as documented."""
+    import submit_cluster_assignment as sca
+    from submit_feature_extraction import _check_container_extras as encoder_check
+
+    extras = tmp_path / "extras-py38-gpu"
+    (extras / "faiss").mkdir(parents=True)
+    sca._check_container_extras(extras, tmp_path / "tf.sif", "/usr/bin/singularity")
+    try:
+        encoder_check(extras, tmp_path / "tf.sif", "/usr/bin/singularity")
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("the encoder's check no longer differs; this test proves nothing")
+
+
+def test_extras_without_faiss_are_refused_whatever_else_they_hold(tmp_path):
+    """The guard can come out bad: scikit-image alone is not what Stage 4
+    imports, and the refusal names the bootstrap for the directory it is."""
+    import submit_cluster_assignment as sca
+
+    extras = tmp_path / "extras-py38"
+    (extras / "skimage").mkdir(parents=True)
+    for directory in (extras, tmp_path / "missing"):
+        try:
+            sca._check_container_extras(directory, tmp_path / "tf.sif", "/usr/bin/singularity")
+        except FileNotFoundError as e:
+            assert "faiss" in str(e) and "--bootstrap-extras" in str(e), e
+        else:
+            raise AssertionError(f"{directory} has no faiss and was accepted")
+
+
+def test_the_gpu_directory_is_told_to_bootstrap_the_gpu_package(tmp_path):
+    import submit_cluster_assignment as sca
+
+    saved = sca.CONTAINER_EXTRAS_GPU
+    sca.CONTAINER_EXTRAS_GPU = tmp_path / "gpu"
+    try:
+        sca._check_container_extras(tmp_path / "gpu", tmp_path / "tf.sif", "/usr/bin/singularity")
+    except FileNotFoundError as e:
+        assert "--bootstrap-extras-gpu" in str(e), e
+    else:
+        raise AssertionError("an empty GPU extras directory was accepted")
+    finally:
+        sca.CONTAINER_EXTRAS_GPU = saved
+
+
 # --- standalone runner ---------------------------------------------------
 
 def main():

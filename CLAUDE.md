@@ -56,8 +56,7 @@ Those name where each stage's *logic* lives; how it reaches Slurm is not uniform
 dedicated `submit_*.py` modules that build and run their own `sbatch`. Stage 1 also has a shell
 wrapper, `submit_dataset_tiling.sh`, which expects a `mask_and_tile_array.sbatch` alongside it that is
 not in this repo — it lives on the cluster. Stage 2's submission is
-driven by the server's `/package` endpoint, and `make_hpl_hdf5.package_slides_to_h5` is additionally
-imported and called in-process on the single-slide upload path (see the one-slide run below). Stages 5 and 6 can run **either**
+driven by the server's `/package` endpoint. Stages 5 and 6 can run **either**
 way: `register_dataset.py`'s and `load_hpc_assignments.py`'s functions run in-process inside
 `tile_server_v2_.py` (`/register-preview`, `/register`, `/kb-load-preview`, `/kb-load`), and the same
 two CLIs are submitted to Slurm by `submit_kb_write.py` via `/register-submit` and `/kb-load-submit`
@@ -67,18 +66,23 @@ on client disconnect — but it dies with the server, which is why the Slurm pat
 and `kb_load_done` mean *committed* on both paths: on the Slurm path the **job** sets them, through
 `--record-run` and `run_record.py`, because the job is the only process that knows.
 
-**A single uploaded slide is a one-slide run, not a separate pipeline.**
-`/upload-slide` creates its own `slurm_dataset_runs` row (`_start_upload_run`) and
-`_run_postupload_pipeline` records Stages 1 and 2 against it as they finish in this process, so the
-same UI stepper and the same Stage 3-6 endpoints carry an upload the rest of the way. Three things
-make that work, and each is the kind that fails silently if changed back:
+**A single uploaded slide is a one-slide pipeline run, not a separate pipeline.**
+`/upload-slide` saves the file, writes its `wsi_registry` row so the viewer can open it at once, and
+submits the same Nextflow run `POST /pipeline-runs` does (`_start_upload_pipeline_run`, through the
+shared `_create_pipeline_run`) over the upload's own UUID directory — so Stages 1-4 run by
+themselves with the server's checkpoint, reference and tuned vote, and Stages 5-6 stay manual.
+`/slide/{id}/processing-status` reads the run's stage markers (`_upload_pipeline_progress`). Until
+2026-09-30 an upload was masked, tiled and packaged inside the server and recorded `local:<stage>`
+sentinels (`LOCAL_JOB_ID_PREFIX`, read as COMPLETED, still stripped from every Slurm query); those rows
+still exist and keep their Stage 3/4 buttons. Four things fail silently if changed back:
 
-- **The sentinel job id.** Every later stage gates on "which Slurm state is this stage in", and an
-  in-process stage has no job. It records `local:<stage>` instead (`LOCAL_JOB_ID_PREFIX`), which
-  `_get_slurm_job_state` reads as COMPLETED — written only *after* the stage returned, and still
-  subject to `_job_output_ready`'s validator, which opens the `.h5`. Every Slurm query helper strips
-  these before asking, because sacct and squeue reject a whole call for one id they do not know: a
-  sentinel reaching them would report "can't reach Slurm" for every real run listed beside it.
+- **Re-upload moves the old tiles aside.** The tiling task keeps any slide whose mask and tiles
+  already validate, so a new run over the previous upload's tiles would classify the *old* file under
+  the new file's name. `_move_upload_tiles_aside` renames both cohort folders into a dot-prefixed
+  `.superseded/` (hidden from `/tile-dataset-names`) — only after the run is created, so a refused run
+  leaves the previous upload intact — and a move that fails marks the run `error` before it is queued.
+  A re-upload is refused while the previous run may still be writing (`_upload_run_in_flight`,
+  unknown counts as busy). The `.h5`/projections/assignments go aside via `move_existing_outputs`.
 - **One cohort per uploaded slide,** `UPLOADED_<SLIDE_ID>` (`upload_dataset_name`), used as the
   `dataset_id`, the tile folder and the run's `dataset_name` at once. `register_dataset.commit()`
   scopes `--replace` to a `dataset_id` and DELETEs what it finds there, so the old shared `UPLOADED`
@@ -87,11 +91,13 @@ make that work, and each is the kind that fails silently if changed back:
   `_is_upload_dataset_id` is a prefix test — rows written before this carry the bare `UPLOADED`.
   Registering an upload always needs **Replace**, because the upload already wrote that slide's
   `wsi_registry` row so the viewer could open it immediately; the delete is scoped to that one slide.
-- **The saved filename,** `{slide_id}_{uuid}_{original}`. Registration finds each raw slide through
-  `slide_naming.slide_id_from_raw_path()`, and a name that does not parse is not an error — it
-  registers a cohort with no `wsi_registry` row, and the viewer 404s on a slide sitting on disk.
+- **The saved filename,** `{slide_id}_{uuid}_{original}`. The tiler and registration find each raw
+  slide's id through `slide_naming.slide_id_from_raw_path()`, and a name that does not parse is not an
+  error — it registers a cohort with no `wsi_registry` row, and the viewer 404s on a slide on disk.
+- **The raw directory is the upload's own UUID directory,** never the shared `UPLOAD_RAW_DIR`:
+  discovery walks it, and the pool holds every upload ever made.
 
-`backend/tests/test_upload_pipeline.py` pins all three.
+`backend/tests/test_upload_pipeline.py` pins all four.
 
 **New runs are one click: Stages 1-4 as one Nextflow run, like ANORAK.** The dataset panel in both
 UIs takes one input — the dataset path — and two buttons, **Run HPL** and below it **Run ANORAK**,
@@ -103,8 +109,8 @@ folder = the directory's name, `HPL_CHECKPOINT`, `HPC_REFERENCE_PATH`, the tuned
 `HPL_NF_MAX_TILING` (50) slides at a time, and earlier complete outputs at the run's paths *moved*
 into `superseded-<stamp>/` beside them (never deleted; refused while any recorded job may be
 writing them). Runs from before the pipeline are shown read-only under "Earlier runs"; their
-per-stage buttons are gone. Upload runs keep their Stage 3/4 buttons — an uploaded slide does not
-go through the pipeline — and Stages 5-7 keep theirs everywhere. `POST /pipeline-runs`
+per-stage buttons are gone. Uploads made before 2026-09-30 (Stages 1-2 ran in the server, `local:` sentinels) keep their
+Stage 3/4 buttons; a newer upload is a pipeline run like any other. Stages 5-7 keep theirs everywhere. `POST /pipeline-runs`
 submits `hpl-nf/` through `submit_hpl_nf.py`: one
 supervised head job (`head_sbatch_command()`, chain of standbys, and the watchdog at
 `hpl-nf/tools/nf_supervise.sh`, a symlink to ANORAK's that submission refuses if it has drifted),
@@ -414,7 +420,9 @@ moves the flat index to GPU 0 (`GpuIndexFlat` compares every query against every
 exactly as `IndexFlat` does), which is why it is admissible where faiss-ivf was not. It needs a
 *separate* extras directory — `HPL_CONTAINER_EXTRAS_GPU`, populated by
 `submit_feature_extraction.py --bootstrap-extras-gpu` — because faiss-cpu and GPU faiss both import
-as `faiss` and PYTHONPATH cannot hold both. `Searcher._verify_matches_cpu` searches a sample of the
+as `faiss` and PYTHONPATH cannot hold both. Stage 4 therefore has its own extras check, `submit_cluster_assignment._check_container_extras`,
+which looks for `faiss`; the encoder's (scikit-image) refused every GPU assignment and every pipeline
+run until 2026-09-30, because the GPU directory holds a GPU faiss and nothing else. `Searcher._verify_matches_cpu` searches a sample of the
 reference against both indexes at startup and refuses on disagreement: a build can expose
 `StandardGpuResources`, report `get_num_gpus() == 1`, accept `index_cpu_to_gpu`, and still be a stub
 that returns well-formed nonsense. Measured on a working build, CPU and GPU agree 100% on the nearest

@@ -52,10 +52,39 @@ from submit_feature_extraction import (
     bootstrap_container_extras,
     _CONTAINER_EXTRA_PACKAGES_GPU,
     _bind_args,
-    _check_container_extras,
     _check_singularity_image,
 )
 from submit_mask_tile_slurm import _run_sbatch_with_retry
+
+
+def _check_container_extras(
+    extras_dir: Path, singularity_image: Path, singularity_bin: str
+) -> None:
+    """Refuse to submit Stage 4 until its extras directory holds faiss.
+
+    Stage 4's own check, not submit_feature_extraction's. That one looks for
+    scikit-image, which only the encoder imports — and the GPU extras
+    directory is bootstrapped with a GPU faiss and nothing else, so reusing it
+    refused every GPU assignment on a correctly set-up cluster, with advice to
+    install the CPU package list into the GPU directory: the one thing that
+    directory must not hold, since faiss-cpu and a GPU faiss both import as
+    `faiss`. What the job actually imports from the extras is faiss
+    (_REQUIRED_MODULES; numpy, pandas and h5py ship in the image), so that is
+    what is checked, by the same directory-presence test.
+    """
+    if (extras_dir / "faiss").is_dir():
+        return
+    gpu = Path(extras_dir) == Path(CONTAINER_EXTRAS_GPU)
+    what = "has no faiss in it" if extras_dir.is_dir() else "does not exist"
+    flag = "--bootstrap-extras-gpu" if gpu else "--bootstrap-extras"
+    raise FileNotFoundError(
+        f"Stage 4's container extras directory {what}: {extras_dir}. Cluster "
+        f"assignment imports faiss from it, so the job would start and die on "
+        f"ModuleNotFoundError. Populate it once, on the login node, with:\n"
+        f"  python submit_feature_extraction.py {flag}"
+        + ("" if gpu else
+           "\nor use a directory that already holds it (HPL_CONTAINER_EXTRAS).")
+    )
 
 ASSIGN_SCRIPT = "assign_hpc_clusters.py"
 

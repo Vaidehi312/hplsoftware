@@ -10,6 +10,7 @@ import { useState } from "react";
 import { api } from "../../../api";
 import { httpDetail, pipelineStageVerified, SLURM_IN_FLIGHT } from "../utils";
 import { Alert, Button, Caption, CodeBlock, Expander, Field } from "../widgets";
+import { AnorakHeadChain, AnorakProgress } from "./AnorakStage.jsx";
 
 export function PipelineOverview({ status }) {
   const pipeline = status.pipeline || {};
@@ -165,9 +166,19 @@ export function AnorakRunStage({ status, submissionId, onChanged }) {
           <CodeBlock>{status.anorak_grades_csv}</CodeBlock>
         </>
       ) : status.anorak_in_flight ? (
-        <Alert type="info">
-          ANORAK running (head job {status.anorak_job_id}, {status.anorak_slurm_state}).
-        </Alert>
+        <>
+          <Alert type="info">
+            ANORAK running (head job {status.anorak_head_job_id || status.anorak_job_id}, {status.anorak_slurm_state}).
+          </Alert>
+          <AnorakHeadChain
+            status={status}
+            resumeHint={
+              "When it stops, press Resume ANORAK here: it continues the cached run with a head job and a " +
+              "standby, and only unfinished slides run again."
+            }
+          />
+          <AnorakProgress status={status} />
+        </>
       ) : status.anorak_job_id ? (
         <>
           <Alert type="warning">ANORAK stopped ({status.anorak_slurm_state || "no Slurm record"}).</Alert>
@@ -183,6 +194,7 @@ export function AnorakRunStage({ status, submissionId, onChanged }) {
               {busy ? "Resuming…" : "Resume ANORAK"}
             </Button>
           )}
+          <AnorakProgress status={status} />
         </>
       ) : null}
       {message && <Alert type={message.type}>{message.text}</Alert>}

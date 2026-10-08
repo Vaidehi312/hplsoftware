@@ -1,7 +1,7 @@
 // Port of render_wsi_upload_panel() in app/app_v28.py (lines ~115-208).
 //
-// Uploads queue tissue masking + tiling as a background job right after the
-// file is saved; this panel polls /processing-status for progress via a
+// Uploads queue Stages 1-4 as a one-slide pipeline run right after the file
+// is saved; this panel polls /processing-status for progress via a
 // manual "Refresh status" button — deliberately no timer here, matching the
 // original (only the dataset workspace list is on an interval).
 //
@@ -16,14 +16,10 @@ import { errorDetail } from "./utils";
 import { Alert, Button, Expander, Field } from "./widgets";
 import RunProgress from "./RunProgress";
 
-// Port of _render_upload_pipeline(): Stages 3-7 for an uploaded slide,
-// rendered by the same stepper a dataset run uses.
-//
-// An upload used to stop at its .h5 — feature extraction, cluster
-// classification, registration and the Knowledge Bank load are all keyed on a
-// run, and an upload had none, so an uploaded slide could be looked at and
-// never carried a single HPC label. The backend now creates a one-slide run
-// for every upload, and this is where it is driven.
+// Port of _render_upload_pipeline(): an uploaded slide's run, rendered by the
+// same stepper a dataset run uses. Every upload is a one-slide pipeline run:
+// Stages 1-4 run by themselves, as Run HPL's do, and registration and the
+// Knowledge Bank load are driven from here with their dry runs.
 function UploadPipeline({ slideId, statusPayload }) {
   const submissionId = statusPayload && statusPayload.submission_id;
   if (!submissionId) {
@@ -38,12 +34,12 @@ function UploadPipeline({ slideId, statusPayload }) {
     <div>
       <hr className="pipeline-divider" />
       <div className="pipeline-caption pipeline-caption-strong">
-        <strong>Rest of the pipeline for {slideId}</strong> — cohort{" "}
+        <strong>Pipeline for {slideId}</strong> — cohort{" "}
         <code>{statusPayload.dataset_name || ""}</code>
       </div>
       <div className="pipeline-caption">
-        Steps 1 and 2 were done by the upload itself; run 3 onwards here to get this slide&apos;s
-        tiles into the Knowledge Bank and its HPC overlay into the viewer.
+        Steps 1-4 run by themselves, as in Run HPL; once they are done, run 5 and 6 here to get
+        this slide&apos;s tiles into the Knowledge Bank and its HPC overlay into the viewer.
       </div>
       {/* Registration always asks for Replace on an uploaded slide, and the
           refusal it comes from names a row count rather than a reason. Said
@@ -179,6 +175,9 @@ export default function UploadPanel() {
       {result && result.kind === "success" && (
         <>
           <Alert type="success">Slide uploaded successfully.</Alert>
+          {result.payload && result.payload.pipeline_error && (
+            <Alert type="error">The pipeline was not started: {result.payload.pipeline_error}</Alert>
+          )}
           <pre className="pipeline-code">{JSON.stringify(result.payload, null, 2)}</pre>
         </>
       )}
@@ -221,7 +220,10 @@ export default function UploadPanel() {
 
           {stage === "done" && (
             <>
-              <Alert type="success">Tissue masking + tiling complete. Tiles are ready.</Alert>
+              <Alert type="success">
+                Stages 1-4 complete: tiled, packaged, embedded and classified. Register it and load
+                it into the Knowledge Bank below.
+              </Alert>
               {statusPayload && statusPayload.error && <Alert type="warning">{statusPayload.error}</Alert>}
               <Button
                 onClick={() => {
@@ -249,7 +251,8 @@ export default function UploadPanel() {
           {stage !== "done" && stage !== "error" && (
             <>
               <Alert type="info">
-                Status: <strong>{stage}</strong> (queued → masking → tiling → packaging → done)
+                Status: <strong>{stage}</strong> (queued → tiling → packaging → feature extraction →
+                classification → done)
               </Alert>
               <Button onClick={() => refreshStatus()} disabled={statusLoading}>
                 {statusLoading ? "Refreshing…" : "Refresh status"}

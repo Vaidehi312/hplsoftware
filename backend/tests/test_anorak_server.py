@@ -127,6 +127,9 @@ def _endpoint(row, states, submit, updates=None):
         submit_anorak_job=submit,
         _update_dataset_run_best_effort=lambda sid, **f: updates.append(f),
         _record_run_job=lambda *a, **k: None,
+        # Nothing else under the run's job name unless a test says so; the
+        # by-name lookup is tested in test_anorak_progress.py.
+        _anorak_discover_head_jobs=lambda *a, **k: {"live": [], "ended": {}},
     )
 
 
@@ -249,7 +252,9 @@ def _status(row):
             return _Conn()
 
     with _Patched(srv, _get_engine=lambda: _Engine(),
-                  _find_job_ids_by_name_prefix=lambda prefix: []):
+                  _find_job_ids_by_name_prefix=lambda prefix: [],
+                  _anorak_discover_head_jobs=lambda *a, **k: {"live": [], "ended": {}},
+                  _anorak_task_queue=lambda out_dir: None):
         return srv.dataset_job_status("sub1")
 
 

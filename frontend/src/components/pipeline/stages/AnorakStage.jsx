@@ -12,7 +12,7 @@
 import { useState } from "react";
 import { api } from "../../../api";
 import { httpDetail, SLURM_IN_FLIGHT } from "../utils";
-import { Alert, Button, Caption, CodeBlock, Expander, Field, RadioGroup } from "../widgets";
+import { Alert, Button, Caption, CodeBlock, Expander, Field, ProgressBar, RadioGroup } from "../widgets";
 
 const SCOPE_FULL = "Full slide list (production)";
 const SCOPE_SUBSET = "Random subset (test)";
@@ -209,6 +209,129 @@ function AnorakForm({ status, submissionId, buttonLabel, defaultOpen, onChanged,
   );
 }
 
+// Said wherever a standby head job is shown, in both UIs, in these words
+// (ANORAK_CHAIN_EXPLAINED in app_v28.py).
+export const ANORAK_CHAIN_EXPLAINED =
+  "If this head job reaches its time limit, the next standby resumes the run; finished slides are kept.";
+
+const STEP_LABELS = {
+  TILE_SLIDE: "Tile slides",
+  PREDICT_GP: "Predict growth patterns (GPU)",
+  SS1_STITCH: "Stitch masks",
+  PUBLISH_SLIDE: "Publish",
+  SLIDE_PROPORTIONS: "Slide proportions",
+  TUMOUR_GRADE: "Tumour grades",
+};
+
+const fmt = (n) => Number(n || 0).toLocaleString();
+
+// Port of _render_anorak_head_chain. The head job shown is the one Slurm is
+// running under the run's name, not only the one the server recorded: on
+// 2026-09-30 the recorded head job had timed out while a chain submitted by
+// hand carried the run, and the stage said "ended" with a Retry form over it.
+export function AnorakHeadChain({ status, resumeHint }) {
+  const head = status.anorak_head_job_id;
+  const headState = status.anorak_head_state;
+  const left = status.anorak_head_time_left;
+  const standbys = status.anorak_standby_job_ids || [];
+  return (
+    <div className="anorak-head-chain">
+      {status.anorak_chain_took_over && (
+        <Alert type="info">
+          The recorded head job ({status.anorak_job_id}) ended as {status.anorak_recorded_state}; the chain took
+          over, and head job {head} is carrying the run.
+        </Alert>
+      )}
+      {head && (
+        <p>
+          <strong>Head job {head}</strong> · {headState}
+          {left ? ` · ${left} left` : ""}
+        </p>
+      )}
+      {head && status.anorak_head_reason_text && (
+        <Caption>Waiting to start: {status.anorak_head_reason_text}.</Caption>
+      )}
+      {standbys.length > 0 ? (
+        <Caption>
+          {standbys.length} standby head job{standbys.length !== 1 ? "s" : ""} queued ({standbys.join(", ")}).{" "}
+          {ANORAK_CHAIN_EXPLAINED}
+        </Caption>
+      ) : (
+        head &&
+        headState === "RUNNING" && (
+          <Alert type="warning">
+            No standby head job is queued: nothing will take over when head job {head} reaches its time limit
+            {left ? ` (in ${left})` : ""}. {resumeHint}
+          </Alert>
+        )
+      )}
+      {status.anorak_head_discovery_failed && (
+        <Caption>
+          Couldn&apos;t ask Slurm for head jobs under this run&apos;s name, so only the recorded ones are shown.
+        </Caption>
+      )}
+    </div>
+  );
+}
+
+// Port of _render_anorak_progress: per step done / total from Nextflow's
+// trace, with running, waiting and failed; the stitched-slide count; and why
+// the queued task jobs are waiting, in words rather than Slurm's codes.
+export function AnorakProgress({ status }) {
+  const progress = status.anorak_progress;
+  if (!progress) return null;
+  const steps = progress.steps || [];
+  const anyCounts = progress.trace_available || steps.some((s) => s.running || s.waiting);
+  const waiting = progress.task_queue?.waiting || [];
+  return (
+    <div className="anorak-progress">
+      {anyCounts
+        ? steps.map((step) => {
+            const label = STEP_LABELS[step.process] || step.process;
+            const extras = ["running", "waiting", "failed"]
+              .filter((k) => step[k])
+              .map((k) => `${fmt(step[k])} ${k}`)
+              .join(", ");
+            const text =
+              (step.total ? `${label}: ${fmt(step.done)} / ${fmt(step.total)} done` : `${label}: ${fmt(step.done)} done`) +
+              (extras ? ` · ${extras}` : "");
+            return (
+              <ProgressBar
+                key={step.process}
+                fraction={step.total ? step.done / step.total : 0}
+                label={text}
+              />
+            );
+          })
+        : progress.trace_error && <Caption>No progress yet: {progress.trace_error}.</Caption>}
+      {anyCounts && progress.counts_source === "trace" && status.anorak_in_flight && (
+        <Caption>
+          Running and waiting are from the trace, which learns of a task only when it finishes — squeue could not
+          be asked.
+        </Caption>
+      )}
+      {progress.stitched_slides != null && (
+        <Caption>
+          Stitched slides in ss1_final: {fmt(progress.stitched_slides)}
+          {progress.slides ? ` of ${fmt(progress.slides)}` : ""}.
+        </Caption>
+      )}
+      {waiting.length > 0 && (
+        <>
+          <Caption>Why the queued task jobs are waiting:</Caption>
+          <ul>
+            {waiting.map((item) => (
+              <li key={item.reason}>
+                <strong>{fmt(item.count)}</strong> — {item.explanation} (<code>{item.reason}</code>)
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function AnorakStage({ status, submissionId, onChanged }) {
   if (status.anorak_ready) {
     const scope = status.anorak_scope;
@@ -265,6 +388,14 @@ export default function AnorakStage({ status, submissionId, onChanged }) {
                 Pipeline running (head job state: {anorakState}). It submits one job per slide per
                 stage, so <code>squeue</code> shows many more jobs than this one.
               </Alert>
+              <AnorakHeadChain
+                status={status}
+                resumeHint={
+                  "When it stops, the Retry form comes back here: keep “Continue the cached run” ticked and " +
+                  "Head jobs at 2 or more, and only unfinished slides run again."
+                }
+              />
+              <AnorakProgress status={status} />
               {status.anorak_out_dir && (
                 <>
                   <Caption>Live progress — Nextflow&apos;s own trace and report:</Caption>
@@ -296,6 +427,8 @@ export default function AnorakStage({ status, submissionId, onChanged }) {
                   <CodeBlock>{status.anorak_out_dir}/nextflow.log</CodeBlock>
                 </>
               )}
+              {/* How far it got, so a retry is judged against what is done. */}
+              <AnorakProgress status={status} />
             </>
           )}
         </div>

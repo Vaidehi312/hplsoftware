@@ -318,7 +318,9 @@ def resolve_run(
             f"Use device 'cpu', or set HPL_GPU_PARTITION."
         )
     assign_extras = sfe.CONTAINER_EXTRAS_GPU if device == "gpu" else sfe.CONTAINER_EXTRAS
-    sfe._check_container_extras(assign_extras, sfe.SINGULARITY_IMAGE, sfe.SINGULARITY_BIN)
+    # Stage 4's own check (faiss), not the encoder's (scikit-image): the GPU
+    # extras hold a GPU faiss and nothing else.
+    sca._check_container_extras(assign_extras, sfe.SINGULARITY_IMAGE, sfe.SINGULARITY_BIN)
 
     # Walltimes against their partitions, before the queue rather than hours in.
     if check_partitions:

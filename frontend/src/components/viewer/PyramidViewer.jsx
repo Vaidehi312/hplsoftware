@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import OpenSeadragon from "openseadragon";
 
+import { colorForHpc, rgbToCss } from "../../colors.js";
+
 import {
   buildTileLookup,
   GRID_HALO_COLOR,
@@ -51,11 +53,17 @@ export default function PyramidViewer({
   tileSizeNative = 0,
   onSelectTile = null,
   height = 780,
+  // (zoomToSelected) => node — the selected tile's card, laid out beside the
+  // canvas rather than over it, so it never hides the tissue it describes.
+  renderSidePanel = null,
+  // (tile, level) => url for the hover preview, or null for none.
+  previewUrl = null,
 }) {
   const containerRef = useRef(null);
   const svgRef = useRef(null);
   const gridGroupRef = useRef(null);
   const highlightGroupRef = useRef(null);
+  const hudRef = useRef(null);
   const viewerRef = useRef(null);
   const drawGridRef = useRef(null);
   const drawHighlightRef = useRef(null);
@@ -63,6 +71,12 @@ export default function PyramidViewer({
   const selectedTileRectRef = useRef(selectedTileRect);
   const [failed, setFailed] = useState(false);
   const [hovered, setHovered] = useState(null); // the tile record under the pointer
+  // The preview image waits for the pointer to settle on a tile: sweeping
+  // across a slide crosses dozens of cells a second, and each would otherwise
+  // be a /region read off the raw slide.
+  const [previewTile, setPreviewTile] = useState(null);
+  const [previewLevel, setPreviewLevel] = useState(1);
+  const [previewFailed, setPreviewFailed] = useState(false);
 
   overlayTilesRef.current = overlayTiles;
   selectedTileRectRef.current = selectedTileRect;
@@ -203,6 +217,7 @@ export default function PyramidViewer({
 
       const pitch = Number(pitchRef.current);
       const hoveredTile = hoveredRef.current;
+      placeHud(hoveredTile, pitch);
       if (hoveredTile && Number.isFinite(pitch) && pitch > 0) {
         appendRect(group, {
           x: Number(hoveredTile.x_native),
@@ -231,6 +246,29 @@ export default function PyramidViewer({
         });
         appendRect(group, { x: sel.x, y: sel.y, w: sel.w, h: sel.h, fill: "none", stroke: "lime", stroke_width: 3, opacity: "1.0" });
       }
+    }
+
+    // The readout sits beside the hovered tile — to its right, or its left
+    // when there is no room — and follows it through a pan. Written straight
+    // to the element's style: this runs per animation frame, and a React
+    // state update per frame would re-render the viewer to move one box.
+    function placeHud(tile, pitch) {
+      const hud = hudRef.current;
+      if (!hud) return;
+      if (!tile || !Number.isFinite(pitch) || pitch <= 0) return;
+      const box = screenRect({ x: Number(tile.x_native), y: Number(tile.y_native), w: pitch, h: pitch });
+      if (!box) return;
+      const container = viewer.container.getBoundingClientRect();
+      const hudW = hud.offsetWidth || 240;
+      const hudH = hud.offsetHeight || 80;
+      const gap = 12;
+      let left = box.x + box.w + gap;
+      if (left + hudW > container.width - 4) left = box.x - hudW - gap;
+      left = Math.max(4, Math.min(left, container.width - hudW - 4));
+      let top = box.y;
+      top = Math.max(4, Math.min(top, container.height - hudH - 4));
+      hud.style.left = `${left}px`;
+      hud.style.top = `${top}px`;
     }
 
     drawGridRef.current = drawTileOverlay;
@@ -318,21 +356,67 @@ export default function PyramidViewer({
     if (drawHighlightRef.current) drawHighlightRef.current();
   }, [selectedTileRect]);
 
-  const hoveredHpc = hovered && hovered.hpc_id !== null && hovered.hpc_id !== undefined ? hovered.hpc_id : null;
+  // Once the HUD has rendered for a new tile, place it — its size depends on
+  // what it says, so it can only be positioned after React has drawn it.
+  useEffect(() => {
+    if (drawHighlightRef.current) drawHighlightRef.current();
+  }, [hovered, previewTile, previewFailed]);
+
+  useEffect(() => {
+    setPreviewTile(null);
+    setPreviewLevel(1);
+    setPreviewFailed(false);
+    if (!hovered || !previewUrl) return undefined;
+    const timer = setTimeout(() => setPreviewTile(hovered), 250);
+    return () => clearTimeout(timer);
+  }, [hovered, previewUrl]);
+
+  function zoomToSelected() {
+    const viewer = viewerRef.current;
+    const sel = selectedTileRectRef.current;
+    if (!viewer || !sel || !viewer.viewport) return;
+    // Three tiles across: the tile itself and enough around it to see where
+    // it sits in the tissue.
+    const pad = Number(sel.w || 0);
+    const rect = viewer.viewport.imageToViewportRectangle(sel.x - pad, sel.y - pad, sel.w + 2 * pad, sel.h + 2 * pad);
+    viewer.viewport.fitBoundsWithConstraints(rect);
+  }
+
+  const hoveredHpc = hovered && hovered.hpc_id !== null && hovered.hpc_id !== undefined ? Number(hovered.hpc_id) : null;
+  const hoveredSwatch = hoveredHpc === null ? "#6b7280" : rgbToCss(colorForHpc(hoveredHpc));
+  const isHoveredSelected =
+    hovered && selectedTileRect && Number(hovered.x_native) === Number(selectedTileRect.x) && Number(hovered.y_native) === Number(selectedTileRect.y);
+  const sidePanel = renderSidePanel ? renderSidePanel(zoomToSelected) : null;
 
   return (
     <div>
       <div className="viewer-caption">OpenSeadragon DZI source: {dziUrl}</div>
-      <div className="viewer-osd-wrap" style={{ height }}>
+      <div className={`viewer-osd-wrap${sidePanel ? " viewer-osd-wrap-with-panel" : ""}`}>
+        <div className="viewer-osd-stage" style={{ height }}>
         <div ref={containerRef} className="viewer-osd-canvas" style={{ height }} />
         <svg ref={svgRef} className="viewer-osd-overlay-svg">
           <g ref={gridGroupRef} />
           <g ref={highlightGroupRef} />
         </svg>
         {hovered && (
-          <div className="viewer-osd-hud">
-            <span className="viewer-osd-hud-tile">{hovered.slide_tile}</span>
-            <span className="viewer-osd-hud-hpc">{hoveredHpc === null ? "no HPC label" : `HPC ${hoveredHpc}`}</span>
+          <div ref={hudRef} className="viewer-osd-hud" style={{ borderLeftColor: hoveredSwatch }}>
+            {previewTile === hovered && !previewFailed && (
+              <img
+                className="viewer-osd-hud-preview"
+                src={previewUrl(hovered, previewLevel)}
+                alt=""
+                // Level 1 is a quarter of the pixels; a slide without one
+                // falls back to level 0 once, and then to no picture.
+                onError={() => (previewLevel > 0 ? setPreviewLevel(0) : setPreviewFailed(true))}
+              />
+            )}
+            <span className="viewer-osd-hud-tile">{hovered.tiles || hovered.slide_tile}</span>
+            <span className="viewer-osd-hud-hpc">
+              <span className="viewer-osd-hud-swatch" style={{ background: hoveredSwatch }} />
+              {hoveredHpc === null ? "no HPC label" : `HPC ${hoveredHpc}`}
+            </span>
+            {hovered.hpc_title && <span className="viewer-osd-hud-title">{hovered.hpc_title}</span>}
+            {onSelectTile && <span className="viewer-osd-hud-hint">{isHoveredSelected ? "Selected" : "Click for details"}</span>}
           </div>
         )}
         {failed && (
@@ -343,6 +427,8 @@ export default function PyramidViewer({
             </a>
           </div>
         )}
+        </div>
+        {sidePanel}
       </div>
     </div>
   );

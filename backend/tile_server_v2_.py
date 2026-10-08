@@ -16,8 +16,8 @@ GET  /slide/{slide_id}/tiles_meta    → tile_coordinates + tile_registry + hpc 
 GET  /slide/{slide_id}/adjacency     → precomputed adjacency pairs
 GET  /hpc/{hpc_id}/info              → HPC dictionary + malignant/non-malignant details
 GET  /hpc/{hpc_id}/survival          → survival analysis row
-POST /upload-slide                   → upload + preprocess WSI, register it, and queue mask+tile pipeline
-GET  /slide/{slide_id}/processing-status → poll background mask/tiling status after upload
+POST /upload-slide                   → upload a WSI, register it, and queue Stages 1-4 as a one-slide pipeline run
+GET  /slide/{slide_id}/processing-status → poll that run's progress (queued → tiling → ... → done)
 GET  /dataset-roots                  → list submittable dataset directories under LONG_TERM_SCRATCH
 POST /dataset-jobs                   → submit a dataset-wide masking+tiling Slurm array job
 GET  /dataset-jobs                   → list past/active dataset job submissions
@@ -30,6 +30,7 @@ POST /query                          → full NL query → structured answer
 GET  /tile_image/{slide_tile}        → H5-backed tile image by slide_tile key
 """
 
+import csv
 import getpass
 import hashlib
 import inspect
@@ -63,10 +64,9 @@ import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from tile_cache import TileCache
-from tile_mask import run_tissue_detection
 from auto_tile_from_mask import (DEFAULT_NATIVE_MPP, TARGET_MPP,
                                  TARGET_TILE_PX, native_tile_px,
-                                 parse_native_mpp, tile_slide_from_mask)
+                                 parse_native_mpp)
 from slide_naming import slide_id_from_raw_path, tiles_missing_suffix
 from submit_mask_tile_slurm import submit_array as submit_dataset_array
 from submit_mask_tile_slurm import (
@@ -77,7 +77,7 @@ from submit_mask_tile_slurm import (
     write_manifest,
     tiling_output_complete,
 )
-from make_hpl_hdf5 import _checkpoint_paths, package_slides_to_h5, hpl_h5_output_path
+from make_hpl_hdf5 import _checkpoint_paths, hpl_h5_output_path
 from find_missing_slides import find_missing_slides_detailed
 from dataset_rollup import (
     coarse_run_state as _coarse_run_state,
@@ -233,11 +233,6 @@ PROCESSED_TILES_DIR = Path(os.getenv(
     "PROCESSED_TILES_DIR",
     "/hpc-home/home/users/vpandya/long-term-scratch/processed_tiles"
 ))
-# Fraction of a tile's area that must be tissue to keep it. Tiles are now read
-# at the paper's exact 403.2um physical size (~40x the area of the old fixed
-# 256-native-px tiles), so a threshold tuned for those smaller tiles may need
-# lowering here — tune via env var rather than editing code.
-MIN_TISSUE_PERCENT = float(os.getenv("MIN_TISSUE_PERCENT", "30.0"))
 
 # Where packaged .h5 files land — same default submit_packaging_job() uses
 # (a sibling of backend/), so single-slide and dataset-wide packaging share
@@ -576,178 +571,6 @@ def _get_processing_status(slide_id: str) -> dict:
     return _processing_status.get(slide_id, {"status": "not_started", "error": None})
 
 
-def _run_postupload_pipeline(slide_id: str, raw_path: str, submission_id: str | None = None):
-    """Background job: tissue mask -> 224px tiles at Kai's 1.8um/px resolution.
-
-    Runs after /upload-slide returns so the HTTP request doesn't block on a
-    full-slide tiling pass. Progress is tracked via _set_processing_status so
-    the UI can poll GET /slide/{slide_id}/processing-status.
-
-    submission_id is the slurm_dataset_runs row /upload-slide created for this
-    slide (see _start_upload_run). Recording Stages 1 and 2 against it is what
-    carries an uploaded slide on into Stages 3-6 — feature extraction, cluster
-    assignment, registration and the Knowledge Bank load are all keyed on a
-    run, and before this an upload had none, so its tiles stopped at the .h5
-    and never reached the Knowledge Bank or the viewer's overlays at all.
-    None keeps this callable without one.
-    """
-    dataset_name = upload_dataset_name(slide_id)
-
-    def _record(**fields):
-        """Bookkeeping must never take the pipeline down with it: the tiles
-        and the .h5 are real whether or not this row can be written."""
-        if submission_id:
-            _update_dataset_run_best_effort(submission_id, **fields)
-
-    try:
-        _set_processing_status(slide_id, "masking")
-        _record(status="running")
-        # Scoped under this slide's own upload dataset name rather than flat
-        # under TISSUE_MASK_DIR/PROCESSED_TILES_DIR directly — those same flat
-        # dirs are also where bulk dataset submissions (TCGA, Radiogenomics,
-        # ...) write, scoped by their own dataset_name (see run_worker() in
-        # submit_mask_tile_slurm.py). Without this, an ad-hoc upload whose
-        # user-supplied slide_id happens to match a real dataset's slide_id
-        # would silently overwrite that dataset's mask/tiles on disk — a
-        # second, filesystem-level version of the wsi_registry collision
-        # /upload-slide already guards against; that guard alone doesn't
-        # cover this, since it only checks the DB row, not these directories.
-        # It is also the folder registration reads this run's coordinates out
-        # of, which is why it is the run's recorded dataset_name too.
-        # slide_id is passed explicitly rather than left to be derived from
-        # raw_path: the id here is the one the user chose and the one already
-        # written to wsi_registry, so re-deriving it would be trusting a
-        # filename over the record it has to agree with.
-        upload_mask_dir = TISSUE_MASK_DIR / dataset_name
-        mask_result = run_tissue_detection(
-            slide_path=raw_path,
-            output_dir=str(upload_mask_dir),
-            slide_id=slide_id,
-        )
-        # Backstop: confirm masking actually wrote where it was told to,
-        # not just that slide_id's charset was valid — see _resolve_within.
-        _resolve_within(upload_mask_dir, Path(mask_result["mask_path"]))
-        _resolve_within(upload_mask_dir, Path(mask_result["overlay_path"]))
-
-        _set_processing_status(slide_id, "tiling")
-        upload_tile_dir = PROCESSED_TILES_DIR / dataset_name
-        tile_summary = tile_slide_from_mask(
-            slide_path=raw_path,
-            mask_path=mask_result["mask_path"],
-            output_dir=str(upload_tile_dir),
-            min_tissue_percent=MIN_TISSUE_PERCENT,
-            slide_id=slide_id,
-        )
-        _resolve_within(upload_tile_dir, Path(tile_summary["output_dir"]))
-
-        # Stage 1 is finished and its output is on disk. The sentinel job id is
-        # what the status endpoint and the stepper read as "tiling completed"
-        # — see LOCAL_JOB_ID_PREFIX — and it is written here, after the tiler
-        # returned, rather than when the run row was created.
-        _record(status="submitted", job_id=_local_job_id("tiling"))
-
-        if tile_summary.get("saved_tiles", 0) == 0:
-            # package_slides_to_h5 raises RuntimeError when total_tiles == 0
-            # (no per-slide fallback there — it's shared with the multi-slide
-            # dataset path, where "every slide produced zero tiles" is a real
-            # error worth stopping on). For a single upload, tissue below
-            # MIN_TISSUE_PERCENT is an expected, non-fatal outcome — skip
-            # packaging instead of letting that raise get caught below and
-            # reported as a packaging failure when nothing was actually wrong.
-            no_tissue = ("Tiling found no tissue above the tissue threshold — "
-                         "nothing to package.")
-            _set_processing_status(slide_id, "done", error=no_tissue)
-            # Not status="error": tiling ran and answered. The run stops here
-            # because there is nothing to carry forward, and saying so on the
-            # row keeps the pipeline view from offering Stage 3 a .h5 that was
-            # never written.
-            _record(status="completed", total_slides=1, error=no_tissue)
-            return
-
-        _set_processing_status(slide_id, "packaging")
-        try:
-            packaged = package_slides_to_h5(
-                raw_paths=[raw_path],
-                tile_dir=PROCESSED_TILES_DIR,
-                # tile_dataset_name has no default and was missing entirely
-                # here before — this call raised a bare TypeError on every
-                # single-slide upload, always caught by the except below and
-                # reported as a generic packaging failure. Matches the
-                # tile_slide_from_mask output_dir above, which is where
-                # tiles are actually written.
-                tile_dataset_name=dataset_name,
-                output_root=HPL_DATASETS_ROOT,
-                dataset_name=dataset_name,
-                # Same reason as the slide_id passed to run_tissue_detection
-                # / tile_slide_from_mask above: the tiles were written under
-                # the slide_id the user chose, and a slide_id re-derived here
-                # would look for them under whatever the filename says.
-                slide_ids=[slide_id],
-            )
-            _set_processing_status(slide_id, "done")
-            # Stage 2's own sentinel, and the path Stage 3 reads. Taken from
-            # what packaging returned rather than recomputed here, so the run
-            # records the file that was actually written.
-            _record(
-                status="completed",
-                total_slides=1,
-                h5_job_id=_local_job_id("packaging"),
-                h5_output_path=packaged["output_h5_path"],
-            )
-        except Exception as e:
-            # Tiles are real and usable either way — a packaging failure
-            # shouldn't be reported as if masking/tiling itself failed.
-            message = f"Tiling succeeded, but .h5 packaging failed: {e}"
-            _set_processing_status(slide_id, "done", error=message)
-            # No h5_job_id: Stage 3 gates on one, and recording a sentinel for
-            # a stage that raised is exactly the "plausible result" this
-            # codebase refuses. The run stays open at Stage 2 instead.
-            _record(status="completed", total_slides=1, error=message)
-    except Exception as e:
-        _set_processing_status(slide_id, "error", error=str(e))
-        _record(status="error", error=str(e))
-
-
-def _upload_tiling_params() -> dict:
-    """What the in-process tiler will actually run this slide with.
-
-    Read off tile_slide_from_mask()'s own signature for the same reason
-    _default_tiling_params() reads submit_array()'s — a hardcoded copy drifts
-    silently, and these numbers are not decoration: registration writes them
-    into dataset_config, so a wrong pair claims a cohort was tessellated at a
-    resolution it was not. min_tissue is the exception, because
-    _run_postupload_pipeline passes MIN_TISSUE_PERCENT explicitly rather than
-    taking the tiler's default.
-    """
-    # Which function actually owns each parameter, and under what name there:
-    # the three mask_* values are run_tissue_detection's, the rest are the
-    # tiler's, and min_tissue is neither — _run_postupload_pipeline passes
-    # MIN_TISSUE_PERCENT rather than accepting a default.
-    owners = {
-        "target_mpp": (tile_slide_from_mask, "target_mpp"),
-        "target_tile_px": (tile_slide_from_mask, "target_tile_px"),
-        "level": (tile_slide_from_mask, "level"),
-        "jpeg_quality": (tile_slide_from_mask, "jpeg_quality"),
-        "mask_max_size": (run_tissue_detection, "max_size"),
-        "mask_saturation": (run_tissue_detection, "saturation_threshold"),
-        "mask_value": (run_tissue_detection, "value_threshold"),
-    }
-    params = {"min_tissue": MIN_TISSUE_PERCENT}
-    for name in _TILING_PARAM_NAMES:
-        if name == "min_tissue":
-            continue
-        owner, argument = owners.get(name, (None, None))
-        parameter = (inspect.signature(owner).parameters.get(argument)
-                     if owner is not None else None)
-        if parameter is None or parameter.default is inspect.Parameter.empty:
-            raise RuntimeError(
-                f"no defaulted source for tiling parameter '{name}' on the "
-                f"upload path — _upload_tiling_params needs updating."
-            )
-        params[name] = parameter.default
-    return params
-
-
 def _upload_run_for_slide(slide_id: str) -> dict:
     """The pipeline run belonging to an uploaded slide, newest first.
 
@@ -776,69 +599,132 @@ def _upload_run_for_slide(slide_id: str) -> dict:
     return {"submission_id": row[0] if row else None, "dataset_name": dataset_name}
 
 
-def _start_upload_run(slide_id: str, raw_path: Path) -> str | None:
-    """Create the slurm_dataset_runs row a single uploaded slide runs on.
+# --- an uploaded slide is a one-slide pipeline run ---------------------------
+#
+# /upload-slide submits the same Nextflow run POST /pipeline-runs does, over
+# the upload's own UUID directory (which holds exactly this one slide) and
+# under the slide's own cohort. It used to mask, tile and package in this
+# process and then stop, leaving Stages 3 and 4 to per-stage buttons — with an
+# empty checkpoint box, so an upload was the one place a typed path could
+# reach the encoder. Now there is one route through Stages 1-4 for a cohort
+# and a slide alike, it survives a closed browser and a restarted server, and
+# it resumes with /pipeline-resume. Registration and the KB load stay manual,
+# exactly as for a cohort.
 
-    An upload is a one-slide dataset run in every way the later stages care
-    about, so it gets a real row rather than a special case: Stages 3-6 are
-    keyed on submission_id, and this is what gives an uploaded slide the same
-    feature extraction, cluster assignment, registration and Knowledge Bank
-    load a cohort gets. Stages 1 and 2 still run in this process (a single
-    slide does not need Slurm) and record themselves against the row as they
-    finish — see _run_postupload_pipeline.
+_UPLOAD_RUN_STAGE_LABELS = {
+    "tiling": "tiling",
+    "packaging": "packaging",
+    "extraction": "feature extraction",
+    "assignment": "classification",
+}
 
-    raw_dir is this upload's own UUID directory, not the shared upload pool:
-    registration matches raw slide files by slide_id_from_raw_path(), and a
-    directory holding exactly this slide cannot produce the "two files claim
-    one slide_id" ambiguity that a re-upload would otherwise create for the
-    whole pool.
 
-    Returns None rather than raising if the row cannot be written. The upload
-    itself has already succeeded at this point and the slide is viewable; the
-    pipeline view is the thing that degrades, and failing the request would
-    throw away a file the user has already waited on.
+def _upload_run_in_flight(slide_id: str) -> str | None:
+    """Why this slide cannot be uploaded again yet, or None if it can.
+
+    A re-upload moves the previous upload's tiles aside and starts a new run
+    over the same output paths; with the previous run still writing them,
+    that is two runs interleaving one slide's files. Unknown counts as busy —
+    the same rule as _refuse_if_outputs_in_use, since Slurm being unreachable
+    is not evidence that nothing is running.
+    """
+    submission_id = _upload_run_for_slide(slide_id)["submission_id"]
+    if not submission_id:
+        return None
+    try:
+        row = _get_dataset_run_row(submission_id)
+    except HTTPException:
+        return None
+    for column in ("job_id", "h5_job_id", "extraction_job_id", "assignment_job_id"):
+        for job_id in _split_job_ids(row.get(column)):
+            state = _get_slurm_job_state(job_id)
+            if state is None or state in IN_FLIGHT_SLURM_STATES:
+                return (f"its run {submission_id} may still be running "
+                        f"({state or 'state unknown — Slurm unreachable'})")
+    return None
+
+
+def _move_upload_tiles_aside(dataset_name: str, stamp: str) -> list[dict]:
+    """Move a previous upload's mask and tiles out of the new run's way.
+
+    Not optional on a re-upload. The tiling task skips a slide whose mask and
+    tiles already validate, and the previous upload's are complete tiles of
+    the *previous* file under the same slide_id — so a new run would keep
+    them and classify the old slide as the new one. Moved into a dot-prefixed
+    .superseded/ beside them rather than deleted (one rename each, on the
+    same filesystem), and dot-prefixed so /tile-dataset-names never offers it
+    as a dataset folder.
+    """
+    moved = []
+    for root in (TISSUE_MASK_DIR, PROCESSED_TILES_DIR):
+        current = root / dataset_name
+        if not current.exists():
+            continue
+        dest = _resolve_within(root, root / ".superseded" / f"{dataset_name}-{stamp}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(current, dest)
+        moved.append({"from": str(current), "to": str(dest)})
+    return moved
+
+
+def _start_upload_pipeline_run(slide_id: str, raw_dir: Path) -> tuple[dict, tuple]:
+    """Create this upload's pipeline run. The caller queues the submission.
+
+    Every setting is the server's, as for Run HPL: checkpoint, reference,
+    tuned vote, tiling parameters. The earlier outputs at this cohort's paths
+    are moved aside twice over — the .h5, projections and assignments by
+    _create_pipeline_run (move_existing_outputs), the mask and tiles here —
+    and the tiles only after the run exists, so a refused run leaves the
+    previous upload's files where they were.
     """
     dataset_name = upload_dataset_name(slide_id)
-    submission_id = str(uuid.uuid4())
-    # The manifest is how the status endpoint reads each slide's
-    # _tiling_summary.json back off disk, and how a later stage knows which
-    # slides this run set out to cover. Same one-path-per-line format and the
-    # same directory the Slurm path writes to.
-    manifest_path = Path(__file__).resolve().parent / "slurm_manifests" / \
-        f"wsi_manifest_upload_{submission_id}.txt"
+    req = PipelineRunRequest(dataset_path=str(raw_dir), dataset_name=dataset_name)
+    response, submission = _create_pipeline_run(req, raw_dir, dataset_name)
     try:
-        write_manifest([raw_path], manifest_path)
-    except OSError as e:
-        print(f"[{slide_id}] could not write the upload manifest: {e}")
-        return None
+        response["superseded_tiles"] = _move_upload_tiles_aside(
+            dataset_name, datetime.now().strftime("%Y%m%d-%H%M%S"))
+    except Exception as e:  # noqa: BLE001 - the row must not be left 'queued'
+        # The run exists but must not start: its tiling would adopt the old
+        # tiles. Recorded on the row, where the upload's status reads it —
+        # a row left 'queued' would read as a submission still in flight and
+        # refuse every later re-upload of this slide.
+        message = f"Could not move this slide's earlier tiles aside: {e}"
+        _update_dataset_run(response["submission_id"], status="error", error=message)
+        raise HTTPException(500, message)
+    return response, submission
 
+
+def _upload_pipeline_progress(submission_id: str) -> dict | None:
+    """The upload panel's one-word status, read off the pipeline's markers.
+
+    None for a run that is not a pipeline run — an upload from before this
+    change, whose Stages 1-2 ran in this process and recorded their progress
+    in wsi_registry.processing_status, which is still the answer for those.
+    """
     try:
-        eng = _get_engine()
-        with eng.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO slurm_dataset_runs
-                        (submission_id, raw_dir, mask_dir, tile_dir, status,
-                         is_subset, dataset_name, tiling_params, manifest_path,
-                         total_slides)
-                    VALUES
-                        (:submission_id, :raw_dir, :mask_dir, :tile_dir, 'queued',
-                         false, :dataset_name, :tiling_params, :manifest_path, 1)
-                """),
-                {
-                    "submission_id": submission_id,
-                    "raw_dir": str(raw_path.parent),
-                    "mask_dir": str(TISSUE_MASK_DIR),
-                    "tile_dir": str(PROCESSED_TILES_DIR),
-                    "dataset_name": dataset_name,
-                    "tiling_params": json.dumps(_upload_tiling_params()),
-                    "manifest_path": str(manifest_path),
-                },
-            )
-    except Exception as e:
-        print(f"[{slide_id}] could not create a pipeline run for this upload: {e}")
+        row = _get_dataset_run_row(submission_id)
+    except HTTPException:
         return None
-    return submission_id
+    if not _is_pipeline_row(row):
+        return None
+    if row.get("status") == "error":
+        return {"status": "error", "error": row.get("error")}
+    if row.get("status") == "cancelled":
+        return {"status": "error", "error": "This slide's run was stopped."}
+    stages = _nf_stage_summary(_nf_run_dir(submission_id), _nf_head_state(submission_id))
+    for stage in NF_STAGES:
+        state = stages[stage]["state"]
+        if state == "COMPLETED":
+            continue
+        label = _UPLOAD_RUN_STAGE_LABELS[stage]
+        if state is None or state in IN_FLIGHT_SLURM_STATES:
+            if stage == "tiling" and not stages[stage]["started"]:
+                return {"status": "queued", "error": None}
+            return {"status": label, "error": None}
+        return {"status": "error",
+                "error": f"The run stopped at {label} ({state}). Its step below "
+                         f"has the log; Resume re-runs only what did not finish."}
+    return {"status": "done", "error": None}
 
 
 # Dataset-wide Slurm job submission and status
@@ -925,8 +811,10 @@ _SQUEUE_UNKNOWN_JOB_RE = re.compile(r"invalid job id|invalid user", re.I)
 
 # --- stages that ran in this process, not on Slurm --------------------------
 #
-# A single-slide upload masks, tiles and packages inline (see
-# _run_postupload_pipeline) — there is no sbatch and therefore no job id, but
+# A single-slide upload used to mask, tile and package inline, before uploads
+# became one-slide pipeline runs (see _start_upload_pipeline_run). Those runs
+# are still in slurm_dataset_runs and still read through this: there was no
+# sbatch and therefore no job id, but
 # every gate downstream is written against one: "which Slurm state is this
 # stage in" is how the status endpoint and the pipeline stepper decide whether
 # Stage 3 may start. Recording a sentinel instead of NULL is what lets an
@@ -2244,6 +2132,22 @@ async def upload_slide(
     # the caller already confirmed: first attempt gets a structured 409 the
     # UI can render as a warning with an explicit "yes, overwrite" action,
     # rather than the overwrite just happening.
+    # Checked before the overwrite confirmation, so nobody confirms an
+    # overwrite only to be refused afterwards. See _upload_run_in_flight.
+    busy = _upload_run_in_flight(safe_user_slide_id) if existing else None
+    if busy:
+        raise HTTPException(
+            409,
+            {
+                "error": "upload_run_in_progress",
+                "slide_id": safe_user_slide_id,
+                "message": (
+                    f"slide_id '{safe_user_slide_id}' can't be replaced yet: {busy}. "
+                    "Stop that run, or let it finish, then upload again."
+                ),
+            },
+        )
+
     if existing and not confirm_overwrite:
         raise HTTPException(
             409,
@@ -2306,8 +2210,10 @@ async def upload_slide(
     slide_info_payload = None
     metadata_path = None
     # Bound before the try below, which can leave via its own except before
-    # ever reaching _start_upload_run — the response reads it either way.
+    # ever reaching the pipeline — the response reads them either way.
     submission_id = None
+    pipeline = None
+    pipeline_error = None
     status = "uploaded"
     try:
         # Context manager, not a bare OpenSlide(...) + a .close() call at
@@ -2338,13 +2244,10 @@ async def upload_slide(
                 "uploaded_at": datetime.now().isoformat(),
             }
 
-            # No thumbnail generated here — tile_mask.py's masking step (the
-            # very next thing the background pipeline does) already produces
-            # one as a byproduct of computing the tissue mask
-            # (tissue_masks/UPLOADED/{slide_id}_thumbnail.png), and that step
-            # starts essentially immediately after this request returns.
-            # Generating a second one here would just duplicate it for a few
-            # seconds' head start that isn't worth the redundancy.
+            # No thumbnail generated here — the pipeline's masking step
+            # produces one as a byproduct of computing the tissue mask, and
+            # /slide/{id}/thumbnail renders one from the slide itself in the
+            # meantime.
             # Same internal_id-keyed layout as save_path above, for the same
             # reason — slide_id stays readable in the filename, but isn't what
             # determines the path.
@@ -2364,9 +2267,20 @@ async def upload_slide(
         validation["openslide_readable"] = True
 
         _set_processing_status(safe_user_slide_id, "queued")
-        submission_id = _start_upload_run(safe_user_slide_id, save_path)
-        background_tasks.add_task(_run_postupload_pipeline, safe_user_slide_id,
-                                  str(save_path), submission_id)
+        # Stages 1-4 as one pipeline run over this upload's own directory —
+        # see _start_upload_pipeline_run. A refusal here (no checkpoint on
+        # this deployment, a reference missing) does not undo the upload:
+        # the slide is saved and viewable, and the reason is in the response.
+        try:
+            pipeline, submission = _start_upload_pipeline_run(safe_user_slide_id, save_dir)
+            submission_id = pipeline["submission_id"]
+            background_tasks.add_task(_run_pipeline_submission, *submission)
+        except HTTPException as e:
+            detail = e.detail
+            pipeline_error = (detail.get("message") if isinstance(detail, dict) else None) \
+                or str(detail)
+            _set_processing_status(safe_user_slide_id, "error",
+                                   error=f"The pipeline could not be started: {pipeline_error}")
 
     except Exception as e:
         validation["error"] = str(e)
@@ -2381,13 +2295,20 @@ async def upload_slide(
         "processing_status": _get_processing_status(safe_user_slide_id),
         "validation": validation,
         "slide_info": slide_info_payload,
-        # The run the rest of the pipeline is driven from. None means the row
-        # could not be written (see _start_upload_run) — masking and tiling
-        # still run, but this slide has no pipeline view to carry it into the
-        # Knowledge Bank, and the UI should say so rather than show nothing.
+        # The pipeline run this slide goes through. None means it was not
+        # started, and pipeline_error says why: the slide is viewable, and
+        # uploading it again is how to retry.
         "submission_id": submission_id,
         "dataset_name": upload_dataset_name(safe_user_slide_id),
-        "next_step": "Tissue masking + tiling started in the background — poll /slide/{slide_id}/processing-status.",
+        "pipeline": pipeline,
+        "pipeline_error": pipeline_error,
+        "next_step": (
+            "Stages 1-4 (tiling, packaging, feature extraction, classification) "
+            "are queued as one pipeline run — poll /slide/{slide_id}/processing-status. "
+            "Registration and the Knowledge Bank load follow by hand, with their dry runs."
+            if submission_id else
+            "The pipeline was not started; see pipeline_error."
+        ),
     }
 
 
@@ -2403,6 +2324,12 @@ def slide_processing_status(slide_id: str):
     """
     payload = dict(_get_processing_status(slide_id))
     payload.update(_upload_run_for_slide(slide_id))
+    # A pipeline run answers from its stage markers; an upload from before
+    # uploads were pipeline runs keeps the in-process status it recorded.
+    if payload.get("submission_id"):
+        progress = _upload_pipeline_progress(payload["submission_id"])
+        if progress:
+            payload.update(progress)
     return payload
 
 
@@ -3513,6 +3440,28 @@ def create_pipeline_run(req: PipelineRunRequest, background_tasks: BackgroundTas
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+    response, submission = _create_pipeline_run(req, raw_dir, dataset_name)
+    background_tasks.add_task(_run_pipeline_submission, *submission)
+    return response
+
+
+def _create_pipeline_run(req: PipelineRunRequest, raw_dir: Path,
+                         dataset_name: str) -> tuple[dict, tuple]:
+    """Resolve, refuse and record a pipeline run; the caller queues the submission.
+
+    Shared by POST /pipeline-runs and /upload-slide, which is what makes an
+    uploaded slide the same run as a cohort rather than a lookalike. raw_dir
+    and dataset_name arrive already resolved because the two callers resolve
+    them differently: a dataset path is user input and goes through
+    _resolve_dataset_path, while an upload's is its own server-made UUID
+    directory under UPLOAD_ROOT, which that function refuses by design.
+
+    Returns the response and the arguments for _run_pipeline_submission. The
+    caller adds that task itself so it can do its own work in between and
+    still decide the submission never happens — the upload moves the slide's
+    earlier tiles aside there, and a run whose predecessor's tiles are still
+    in place would adopt them (every task keeps an output that validates).
+    """
     submission_id = str(uuid.uuid4())
     is_subset = bool(req.sample_size or req.slide_names)
     tiling_params = _resolve_tiling_params(req)
@@ -3614,9 +3563,7 @@ def create_pipeline_run(req: PipelineRunRequest, background_tasks: BackgroundTas
     _update_dataset_run_best_effort(submission_id, assignment_vote=config["assignment"]["vote"])
 
     req = req.model_copy(update={"dataset_name": dataset_name, "tiling_params": tiling_params})
-    background_tasks.add_task(
-        _run_pipeline_submission, submission_id, str(raw_dir), req, config, nf_params,
-    )
+    submission = (submission_id, str(raw_dir), req, config, nf_params)
     return {
         "submission_id": submission_id,
         "status": "queued",
@@ -3632,7 +3579,7 @@ def create_pipeline_run(req: PipelineRunRequest, background_tasks: BackgroundTas
         "device_reason": config["assignment"]["device_reason"],
         "vote": config["assignment"]["vote"],
         "superseded": config.get("superseded") or [],
-    }
+    }, submission
 
 
 def _refuse_if_outputs_in_use(targets: dict[str, Path]) -> None:
@@ -4423,10 +4370,10 @@ def start_packaging_job(
                 # default (backend_dir.parent / "model_input") — that
                 # default happens to match HPL_DATASETS_ROOT's own default
                 # today, but only by coincidence; without this, overriding
-                # HPL_DATASETS_ROOT would silently only affect single-slide
-                # uploads (_run_postupload_pipeline passes it explicitly)
-                # and not dataset-wide packaging, splitting the two onto
-                # different output roots.
+                # HPL_DATASETS_ROOT would silently only affect pipeline
+                # runs (resolve_run is passed it explicitly) and not
+                # per-stage packaging, splitting the two onto different
+                # output roots.
                 output_root=HPL_DATASETS_ROOT,
             )
         except Exception as e:
@@ -5265,8 +5212,194 @@ def _anorak_job_ids(row: dict) -> list[str]:
     return [j.strip() for j in str(row.get("anorak_job_id") or "").split(",") if j.strip()]
 
 
-def _anorak_run_state(row: dict) -> str | None:
-    """The run's Slurm state across its head job and any chain standbys.
+def _anorak_head_job_name(submission_id: str) -> str:
+    """The Slurm job name every head job of this run carries — the one
+    _submit_anorak gives it, and the one a head job submitted by hand has to
+    carry for nf_supervise.sh's own logs to make sense. It is how a head job the
+    row never heard of is found."""
+    return f"anorak_{submission_id}"
+
+
+# Discovered head jobs per run, briefly. /status is polled, and one poll asks
+# for the run state more than once (the status block, then the blocker); each
+# would otherwise send its own squeue and sacct for the same name. The submit
+# path always asks fresh — five seconds is long enough for a head job
+# submitted by hand to be missed, and missing it is the bug.
+_ANORAK_HEAD_CACHE: dict[tuple[str, int | None], tuple[float, dict | None]] = {}
+_ANORAK_HEAD_TTL_S = 5.0
+
+
+def _anorak_discover_head_jobs(submission_id: str, *, since_job_id: int | None = None,
+                               fresh: bool = False) -> dict | None:
+    """Head jobs Slurm holds under this run's job name, recorded or not.
+
+    The row records the head chain *this server* submitted. On 2026-09-30 that
+    was one head job, 1255076, which reached its two-day walltime; the run was
+    carried on by a head job and six standbys submitted by hand under the same
+    name, and the stage read TIMEOUT — ended, with a Retry form — over a
+    pipeline that was running. A Retry there would have queued a second head
+    over the live one, which is precisely what the in-flight guard exists to
+    stop. So the name is asked about as well as the ids.
+
+    Returns {"live": [{job_id, state, time_left, reason, dependency}],
+    "ended": {job_id: state} | None}, or None when squeue could not be asked —
+    unknown, never "nothing under that name". "ended" is sacct's view, None
+    when sacct could not be asked, {} unasked when something is live (the
+    run is in flight either way), and keeps only jobs submitted at or after
+    since_job_id (Slurm ids only grow): an earlier attempt's COMPLETED head job
+    under the same name says nothing about this one.
+    """
+    key = (submission_id, since_job_id)
+    now = time.monotonic()
+    cached = _ANORAK_HEAD_CACHE.get(key)
+    if not fresh and cached and now - cached[0] < _ANORAK_HEAD_TTL_S:
+        return cached[1]
+
+    name = _anorak_head_job_name(submission_id)
+    user = getpass.getuser()
+    # -n is an exact match on the name, so another run's head job never
+    # matches. The reason (%r) and dependency (%E) are what tell a standby
+    # waiting on its predecessor from a head job waiting for a node.
+    live_result = _run_slurm(
+        ["squeue", "-u", user, "-n", name, "-h", "-o", "%A|%T|%L|%r|%E"], timeout=15,
+    )
+    if live_result is None:
+        _ANORAK_HEAD_CACHE[key] = (now, None)
+        return None
+    live = []
+    for line in live_result.stdout.splitlines():
+        parts = [p.strip() for p in line.split("|", 4)]
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        parts += [""] * (5 - len(parts))
+        live.append({
+            "job_id": parts[0],
+            "state": _normalise_slurm_state(parts[1]),
+            "time_left": parts[2] or None,
+            "reason": parts[3] if parts[3] not in ("", "(null)") else None,
+            "dependency": parts[4] if parts[4] not in ("", "(null)") else None,
+        })
+
+    ended: dict[str, str] | None = None
+    if live:
+        # Something under the name is live, so the run is in flight whatever
+        # sacct says of the rest — and sacct over ten days is the expensive
+        # half of a query /status sends every few seconds.
+        found = {"live": live, "ended": {}}
+        _ANORAK_HEAD_CACHE[key] = (now, found)
+        return found
+    start = (datetime.now() - timedelta(days=_LISTING_SACCT_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    ended_result = _run_slurm(
+        ["sacct", "-u", user, "--name", name, "-X", "-S", start,
+         "--format=JobID,State", "--parsable2", "--noheader"],
+        timeout=15,
+    )
+    if ended_result is not None:
+        ended = {}
+        live_ids = {job["job_id"] for job in live}
+        for line in ended_result.stdout.splitlines():
+            job_id, _, state = line.strip().partition("|")
+            job_id = job_id.strip()
+            # Bare parent ids only, as elsewhere; and squeue has the last word
+            # on anything it still holds.
+            if not job_id.isdigit() or job_id in live_ids:
+                continue
+            if since_job_id is not None and int(job_id) < since_job_id:
+                continue
+            state = _normalise_slurm_state(state)
+            if state:
+                ended[job_id] = state
+
+    found = {"live": live, "ended": ended}
+    _ANORAK_HEAD_CACHE[key] = (now, found)
+    return found
+
+
+def _anorak_is_standby(job: dict) -> bool:
+    """A chain standby: pending on the head job before it (afternotok). What
+    a standby waits for is its predecessor, not a node — which is the
+    difference between "queued behind the live one" and "the head job itself,
+    waiting to start"."""
+    return job["state"] == "PENDING" and (job.get("reason") == "Dependency"
+                                          or bool(job.get("dependency")))
+
+
+def _anorak_combine_states(states: list[str | None]) -> str | None:
+    """One state for a head chain, ordered oldest first. See _anorak_run_state."""
+    for state in states:
+        if state in IN_FLIGHT_SLURM_STATES:
+            return state
+    if not states or any(state is None for state in states):
+        return None
+    if "COMPLETED" in states:
+        return "COMPLETED"
+    ran = [s for s in states if s and not s.startswith("CANCELLED")]
+    return ran[-1] if ran else states[0]
+
+
+def _anorak_head_view(row: dict, *, fresh: bool = False) -> dict:
+    """What this run's head chain is doing: recorded ids and the ones found
+    under its job name, merged.
+
+      state          the run's state, as _anorak_run_state documents
+      ids            every head job known, oldest first
+      recorded_state the recorded ids' state alone — what the stage used to
+                     report, kept so the UI can say "1255076 timed out and the
+                     chain took over" rather than hide the earlier job
+      head           the live head job (not a standby), or None
+      standbys       live standbys, oldest first
+      discovered     False when squeue could not be asked about the name
+
+    A run with nothing recorded and no output directory was never submitted
+    and is not looked up: every HPL run's status carries this block.
+    """
+    recorded = _anorak_job_ids(row)
+    recorded_states = {job_id: _get_slurm_job_state(job_id) for job_id in recorded}
+    view = {"state": None, "ids": list(recorded), "recorded_state": None,
+            "head": None, "standbys": [], "discovered": False, "jobs": []}
+    if recorded:
+        view["recorded_state"] = _anorak_combine_states(list(recorded_states.values()))
+    if not recorded and not row.get("anorak_out_dir"):
+        return view
+
+    numeric = [int(j) for j in recorded if j.isdigit()]
+    found = _anorak_discover_head_jobs(
+        str(row.get("submission_id") or ""),
+        since_job_id=min(numeric) if numeric else None, fresh=fresh,
+    )
+    states = dict(recorded_states)
+    if found is not None:
+        view["discovered"] = True
+        for job in found["live"]:
+            states[job["job_id"]] = job["state"]
+        for job_id, state in (found["ended"] or {}).items():
+            states.setdefault(job_id, state)
+        live = sorted(found["live"], key=lambda j: int(j["job_id"]))
+        view["standbys"] = [j for j in live if _anorak_is_standby(j)]
+        heads = [j for j in live if not _anorak_is_standby(j)]
+        # RUNNING first: of two non-standby jobs, the one doing the work.
+        heads.sort(key=lambda j: (j["state"] != "RUNNING", int(j["job_id"])))
+        view["head"] = heads[0] if heads else None
+
+    ordered = sorted(states, key=lambda j: (not j.isdigit(), int(j) if j.isdigit() else 0, j))
+    view["ids"] = ordered
+    view["jobs"] = [{"job_id": j, "state": states[j], "recorded": j in recorded_states}
+                    for j in ordered]
+    state = _anorak_combine_states([states[j] for j in ordered])
+    if state not in IN_FLIGHT_SLURM_STATES:
+        # Nothing known to be live. If squeue could not be asked about the
+        # name, a head job submitted by hand may be running, so "ended" is
+        # not something this can say. And if sacct could not be asked, a
+        # later head job may have finished the run: unknown either way.
+        if found is None or found["ended"] is None:
+            state = None
+    view["state"] = state
+    return view
+
+
+def _anorak_run_state(row: dict, *, fresh: bool = False) -> str | None:
+    """The run's Slurm state across its head jobs: the recorded chain and any
+    live under the run's job name (see _anorak_discover_head_jobs).
 
     None means at least one of them could not be asked about and none is known
     to be in flight — genuinely unknown, and callers must treat it that way
@@ -5275,26 +5408,18 @@ def _anorak_run_state(row: dict) -> str | None:
     --kill-on-invalid-dep, so their CANCELLED says nothing about the run).
     Otherwise the run ended the way its last member that actually ran did.
     """
-    ids = _anorak_job_ids(row)
-    if not ids:
-        return None
-    states = [_get_slurm_job_state(job_id) for job_id in ids]
-    for state in states:
-        if state in IN_FLIGHT_SLURM_STATES:
-            return state
-    if any(state is None for state in states):
-        return None
-    if "COMPLETED" in states:
-        return "COMPLETED"
-    ran = [s for s in states if s and not s.startswith("CANCELLED")]
-    return ran[-1] if ran else states[0]
+    return _anorak_head_view(row, fresh=fresh)["state"]
 
 
-def _anorak_submit_blocker(row: dict, state: str | None) -> tuple[int, str] | None:
+def _anorak_submit_blocker(row: dict, state: str | None,
+                           ids: list[str] | None = None) -> tuple[int, str] | None:
     """(HTTP status, reason) why a new ANORAK submission must be refused right
     now, or None. overwrite does not enter into it: overwrite replaces a
-    *finished* run's outputs, and nothing replaces a live head job's."""
-    ids = _anorak_job_ids(row)
+    *finished* run's outputs, and nothing replaces a live head job's.
+
+    ids is every head job known, discovered ones included — a head job
+    submitted by hand is as live as one this server recorded."""
+    ids = list(ids) if ids is not None else _anorak_job_ids(row)
     if not ids:
         return None
     if state is None:
@@ -5303,7 +5428,9 @@ def _anorak_submit_blocker(row: dict, state: str | None) -> tuple[int, str] | No
         # is when that misreading happens.
         return 503, (
             f"Couldn't reach Slurm to confirm ANORAK job {', '.join(ids)} has "
-            f"stopped, so a new submission is refused: if it is still running, a "
+            f"stopped (or that no other head job named "
+            f"{_anorak_head_job_name(str(row.get('submission_id') or ''))} is "
+            f"running), so a new submission is refused: if one is still running, a "
             f"second head job would rewrite its slide list and share its work "
             f"directory. Try again once squeue/sacct answer."
         )
@@ -5372,6 +5499,333 @@ def _anorak_output_ready(row: dict, grades: Path | None,
     return ok, (None if ok else reason)
 
 
+# --- Stage 7 progress ----------------------------------------------------------
+# The head job's state says the pipeline is alive and nothing about how far
+# through 7,221 slides it is. That lives in three places, each read here the way
+# the thing that writes it means it:
+#
+#   * <out>/pipeline_info/trace.txt — Nextflow's record of every task. Each
+#     head job rewrites it at start (overwrite = true), but a resumed run lists
+#     earlier work as CACHED, so the latest file is the whole run's record.
+#   * <out>/ss1_final/ — one entry per slide whose stitched mask was published.
+#   * squeue — the run's task jobs, and why the pending ones are pending. That
+#     is the answer to "why is it slow" nobody could get from the UI: on
+#     2026-09-30 192 PREDICT_GP jobs sat PENDING on AssocGrpGRES, the account's
+#     GPU cap, which reads like a stalled pipeline and is a queue.
+
+# The pipeline's processes in the order a slide goes through them. Per-slide
+# except TUMOUR_GRADE, which runs once over every slide's counts.
+ANORAK_PROCESSES = ("TILE_SLIDE", "PREDICT_GP", "SS1_STITCH", "PUBLISH_SLIDE",
+                    "SLIDE_PROPORTIONS", "TUMOUR_GRADE")
+_ANORAK_ONCE_PER_RUN = {"TUMOUR_GRADE"}
+# Shown only once the trace or the queue has one: a run from before
+# PUBLISH_SLIDE existed never ran it, and a row of 0 / 7,221 for it would read
+# as a step that is stuck.
+_ANORAK_OPTIONAL_PROCESSES = {"PUBLISH_SLIDE"}
+
+_TRACE_SUCCESS = {"COMPLETED", "CACHED"}
+_TRACE_RUNNING = {"RUNNING"}
+_TRACE_WAITING = {"SUBMITTED", "NEW", "PENDING"}
+_TRACE_FAILED = {"FAILED", "ABORTED"}
+
+# Keyed on (mtime_ns, size): trace.txt is 1.5 MB and growing on a 7,221-slide
+# run, and /status is polled. A changed file is re-read whole — the head job
+# rewrites it at start, so an append-only reader would be wrong exactly then.
+_ANORAK_TRACE_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+_ANORAK_SLIDE_COUNT_CACHE: dict[str, tuple[tuple[int, int], int | None]] = {}
+_ANORAK_QUEUE_CACHE: dict[str, tuple[float, dict | None]] = {}
+_ANORAK_QUEUE_TTL_S = 10.0
+
+
+def _anorak_process_of(task_name: str) -> str | None:
+    """TILE_SLIDE for "TILE_SLIDE (BB232000 A1 -1 - 2023-08-29 20.08.31)", and
+    for a workflow-qualified "ANORAK:TILE_SLIDE (...)" too."""
+    process = task_name.split(" (", 1)[0].strip().rsplit(":", 1)[-1]
+    return process or None
+
+
+def _anorak_parse_trace(path: Path) -> dict:
+    """Per-process task counts from a Nextflow trace file.
+
+    One task per unique task name (process plus tag — one slide), however many
+    attempts it took. A task is done if any attempt COMPLETED or was CACHED;
+    otherwise it is what its latest attempt says, so a FAILED attempt followed
+    by a retry that is still running counts as running, and "failed" means the
+    retries ran out. Latest is by task_id where the header has one — Nextflow
+    writes a row when a task finishes, not when it starts, so file order is not
+    attempt order.
+
+    Columns are found by header name. Nextflow's trace fields are configurable
+    (trace.fields), so a position that is "status" on one run is something
+    else on another, and a reader by position would count the wrong column
+    without complaint. A row with too few fields — the last line of a file
+    being written — is skipped and counted, not guessed at.
+
+    Returns {"available": bool, "error": str | None, "processes": {name:
+    {"done", "running", "waiting", "failed", "tasks"}}, "rows", "skipped_rows"}.
+    """
+    empty = {"available": False, "error": None, "processes": {}, "rows": 0, "skipped_rows": 0}
+    try:
+        stat = path.stat()
+    except OSError:
+        return {**empty, "error": f"{path} does not exist yet"}
+    key = str(path)
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _ANORAK_TRACE_CACHE.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
+
+    tasks: dict[str, dict] = {}
+    rows = skipped = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.reader(fh, delimiter="\t")
+            header = next(reader, None)
+            columns = {name.strip().lower(): i for i, name in enumerate(header or [])}
+            if "name" not in columns or "status" not in columns:
+                result = {**empty, "error": (
+                    f"{path} has no 'name' and 'status' columns in its header "
+                    f"({', '.join((header or [])[:8]) or 'empty'}), so it cannot be counted")}
+                _ANORAK_TRACE_CACHE[key] = (stamp, result)
+                return result
+            name_i, status_i = columns["name"], columns["status"]
+            order_i = columns.get("task_id")
+            width = max(name_i, status_i, order_i if order_i is not None else 0) + 1
+            for index, fields in enumerate(reader):
+                if not fields or (len(fields) == 1 and not fields[0].strip()):
+                    continue
+                if len(fields) < width:
+                    skipped += 1
+                    continue
+                name = fields[name_i].strip()
+                status = fields[status_i].strip().upper()
+                if not name or not status:
+                    skipped += 1
+                    continue
+                rows += 1
+                order: tuple = (index,)
+                if order_i is not None and fields[order_i].strip().isdigit():
+                    order = (int(fields[order_i].strip()), index)
+                task = tasks.setdefault(name, {"success": False, "latest": None})
+                if status in _TRACE_SUCCESS:
+                    task["success"] = True
+                if task["latest"] is None or order > task["latest"][0]:
+                    task["latest"] = (order, status)
+    except OSError as e:
+        return {**empty, "error": f"Couldn't read {path}: {e}"}
+
+    processes: dict[str, dict] = {}
+    for name, task in tasks.items():
+        process = _anorak_process_of(name)
+        if not process:
+            continue
+        counts = processes.setdefault(
+            process, {"done": 0, "running": 0, "waiting": 0, "failed": 0, "tasks": 0})
+        counts["tasks"] += 1
+        latest = task["latest"][1]
+        if task["success"]:
+            counts["done"] += 1
+        elif latest in _TRACE_RUNNING:
+            counts["running"] += 1
+        elif latest in _TRACE_WAITING:
+            counts["waiting"] += 1
+        elif latest in _TRACE_FAILED:
+            counts["failed"] += 1
+    result = {"available": True, "error": None, "processes": processes,
+              "rows": rows, "skipped_rows": skipped}
+    _ANORAK_TRACE_CACHE[key] = (stamp, result)
+    return result
+
+
+def _anorak_slide_count(slide_list: Path | None) -> int | None:
+    """Data rows in the run's own slide_list.csv — every per-slide step's total.
+    csv rather than a line count, so a quoted field is one row; None if it
+    cannot be read."""
+    if slide_list is None:
+        return None
+    try:
+        stat = slide_list.stat()
+    except OSError:
+        return None
+    key, stamp = str(slide_list), (stat.st_mtime_ns, stat.st_size)
+    cached = _ANORAK_SLIDE_COUNT_CACHE.get(key)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    try:
+        with slide_list.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            count = sum(1 for fields in reader if any(f.strip() for f in fields)) if header else 0
+    except OSError:
+        return None
+    _ANORAK_SLIDE_COUNT_CACHE[key] = (stamp, count)
+    return count
+
+
+def _anorak_stitched_count(out_dir: Path) -> int | None:
+    """Entries in ss1_final/: one per slide PUBLISH_SLIDE has published. None
+    when the directory is not there yet, which is not the same as 0 done."""
+    try:
+        with os.scandir(out_dir / "ss1_final") as entries:
+            return sum(1 for entry in entries if not entry.name.startswith("."))
+    except OSError:
+        return None
+
+
+# squeue's pending reasons in plain words. The codes are Slurm's own and mean
+# nothing to someone asking why their run has not moved, and the commonest one
+# here — AssocGrpGRES — is a limit on the account, not a fault in the run.
+ANORAK_WAIT_REASONS = {
+    "AssocGrpGRES": "your Slurm account's GPU limit is in use — these start as the account's running GPU jobs finish",
+    "AssocGrpGRESMinutes": "your Slurm account's GPU-time allowance is used up",
+    "AssocGrpCpuLimit": "your Slurm account's CPU limit is in use",
+    "AssocGrpMemLimit": "your Slurm account's memory limit is in use",
+    "AssocGrpJobsLimit": "your Slurm account's limit on running jobs is reached",
+    "AssocMaxJobsLimit": "your Slurm account's limit on running jobs is reached",
+    "AssocGrpSubmitJobsLimit": "your Slurm account's limit on queued jobs is reached",
+    "QOSMaxJobsPerUserLimit": "the queue's limit on how many jobs you may run at once is reached",
+    "QOSMaxGRESPerUser": "the queue's limit on how many GPUs you may use at once is reached",
+    "QOSGrpGRES": "the queue's shared GPU limit is in use",
+    "QOSGrpCpuLimit": "the queue's shared CPU limit is in use",
+    "QOSMaxCpuPerUserLimit": "the queue's limit on how many CPUs you may use at once is reached",
+    "Priority": "other jobs are ahead of these in the queue",
+    "Resources": "waiting for a node with enough free GPUs, CPUs or memory",
+    "Dependency": "waiting for another job to finish first",
+    "DependencyNeverSatisfied": "waiting on a job that did not end the way this one needs — it will never start",
+    "ReqNodeNotAvail": "a node these need is down, drained or reserved",
+    "PartitionTimeLimit": "the time asked for is over the partition's limit — these will never start",
+    "BeginTime": "asked not to start before a set time",
+    "JobHeldUser": "held by you (scontrol release to let them go)",
+    "JobHeldAdmin": "held by an administrator",
+    "launch failed requeued held": "a launch failed and Slurm held them",
+}
+
+
+def _anorak_explain_reason(reason: str | None) -> str:
+    if not reason:
+        return "no reason given"
+    return ANORAK_WAIT_REASONS.get(reason, reason)
+
+
+def _anorak_task_queue(out_dir: Path) -> dict | None:
+    """This run's task jobs in squeue, by process, state and reason.
+
+    Matched by working directory under <out>/work — as nf_supervise.sh's
+    cancel_run_jobs and submit_hpl_nf.cancel_run find them — never by name:
+    every ANORAK run's task jobs are called nf-PREDICT_GP_(...), so a name
+    match would count another run's jobs as this one's. The realpath of the
+    work directory is matched too, since squeue reports the path the job was
+    submitted from and a CephFS mount can be reached by more than one.
+
+    None when squeue could not be asked — "no jobs" would be a claim.
+    """
+    work = out_dir / "work"
+    key = str(work)
+    now = time.monotonic()
+    cached = _ANORAK_QUEUE_CACHE.get(key)
+    if cached and now - cached[0] < _ANORAK_QUEUE_TTL_S:
+        return cached[1]
+    prefixes = {str(work).rstrip("/")}
+    try:
+        prefixes.add(os.path.realpath(work).rstrip("/"))
+    except OSError:
+        pass
+    # %Z before %j, and the name last with a bounded split: a job name is
+    # free text, a working directory is not.
+    result = _run_slurm(["squeue", "-u", getpass.getuser(), "-h", "-o", "%A|%T|%r|%Z|%j"],
+                        timeout=15)
+    if result is None:
+        _ANORAK_QUEUE_CACHE[key] = (now, None)
+        return None
+    by_state: dict[str, int] = {}
+    by_reason: dict[str, int] = {}
+    by_process: dict[str, dict[str, int]] = {}
+    jobs = 0
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("|", 4)
+        if len(parts) < 5:
+            continue
+        _job_id, state, reason, workdir, name = (p.strip() for p in parts)
+        workdir = workdir.rstrip("/")
+        if not any(workdir == p or workdir.startswith(p + "/") for p in prefixes):
+            continue
+        jobs += 1
+        state = _normalise_slurm_state(state) or state
+        by_state[state] = by_state.get(state, 0) + 1
+        if state == "PENDING":
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+        process = next((p for p in ANORAK_PROCESSES if p in name.upper()), None)
+        if process:
+            counts = by_process.setdefault(process, {"running": 0, "waiting": 0})
+            counts["running" if state == "RUNNING" else "waiting"] += 1
+    queue = {
+        "jobs": jobs,
+        "by_state": by_state,
+        "by_process": by_process,
+        "waiting": [
+            {"reason": reason, "count": count, "explanation": _anorak_explain_reason(reason)}
+            for reason, count in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+    }
+    _ANORAK_QUEUE_CACHE[key] = (now, queue)
+    return queue
+
+
+def _anorak_progress(row: dict, out_dir: Path, *, in_flight: bool) -> dict:
+    """Stage 7's progress block: per step done / total with running, waiting
+    and failed, the stitched-slide count, and the task queue's reasons.
+
+    Running and waiting come from squeue while the run is in flight and squeue
+    answers — the trace only learns of a task when it finishes, so its own
+    RUNNING and SUBMITTED rows lag the queue by the length of a task — and from
+    the trace otherwise, which counts_source names. Done and failed are always
+    the trace's: squeue forgets a finished job within minutes.
+    """
+    slide_list = (Path(row["anorak_slide_list"]) if row.get("anorak_slide_list")
+                  else out_dir / "slide_list.csv")
+    slides = _anorak_slide_count(slide_list)
+    if slides is None:
+        slides = _anorak_slide_count(out_dir / "slide_list.csv")
+    if slides is None and row.get("anorak_slides"):
+        slides = int(row["anorak_slides"])
+    trace_path = out_dir / "pipeline_info" / "trace.txt"
+    trace = _anorak_parse_trace(trace_path)
+    queue = _anorak_task_queue(out_dir) if in_flight else None
+    from_queue = queue is not None
+
+    steps = []
+    for process in ANORAK_PROCESSES:
+        counts = trace["processes"].get(process)
+        queued = (queue or {}).get("by_process", {}).get(process)
+        if process in _ANORAK_OPTIONAL_PROCESSES and not counts and not queued:
+            continue
+        counts = counts or {"done": 0, "running": 0, "waiting": 0, "failed": 0}
+        if from_queue:
+            running = (queued or {}).get("running", 0)
+            waiting = (queued or {}).get("waiting", 0)
+        else:
+            running, waiting = counts["running"], counts["waiting"]
+        steps.append({
+            "process": process,
+            "done": counts["done"],
+            "running": running,
+            "waiting": waiting,
+            "failed": counts["failed"],
+            "total": 1 if process in _ANORAK_ONCE_PER_RUN else slides,
+        })
+    return {
+        "steps": steps,
+        "slides": slides,
+        "counts_source": "squeue" if from_queue else "trace",
+        "trace_path": str(trace_path),
+        "trace_available": trace["available"],
+        "trace_error": trace["error"],
+        "trace_skipped_rows": trace["skipped_rows"],
+        "stitched_slides": _anorak_stitched_count(out_dir),
+        "task_queue": queue,
+    }
+
+
 def _anorak_status_fields(row: dict) -> dict:
     """Stage 7's block of /status. Also carries the server's own verdict on
     whether a submission would be accepted (anorak_submit_blocked), so neither
@@ -5381,20 +5835,48 @@ def _anorak_status_fields(row: dict) -> dict:
     # Written by a failed submission even when no job id was ever recorded,
     # so it is reported outside the job block below.
     fields = {"anorak_error": row.get("anorak_error")}
-    if not _anorak_job_ids(row):
+    if not _anorak_job_ids(row) and not row.get("anorak_out_dir"):
+        return fields
+    view = _anorak_head_view(row)
+    if not view["ids"]:
         return fields
     anorak_out = Path(row["anorak_out_dir"]) if row.get("anorak_out_dir") else None
     anorak_grades = _anorak_grades_csv_path(anorak_out) if anorak_out else None
-    anorak_state = _anorak_run_state(row)
+    anorak_state = view["state"]
+    in_flight = anorak_state in IN_FLIGHT_SLURM_STATES
     ready, not_ready_reason = _anorak_output_ready(row, anorak_grades, anorak_state)
-    blocker = _anorak_submit_blocker(row, anorak_state)
+    blocker = _anorak_submit_blocker(row, anorak_state, view["ids"])
+    head = view["head"]
+    recorded = _anorak_job_ids(row)
     fields.update(
         anorak_ready=ready,
         anorak_slurm_state=anorak_state,
-        anorak_in_flight=anorak_state in IN_FLIGHT_SLURM_STATES,
+        anorak_in_flight=in_flight,
         anorak_state_unknown=anorak_state is None,
         anorak_submit_blocked=blocker[1] if blocker else None,
-        anorak_job_id=row.get("anorak_job_id"),
+        anorak_job_id=row.get("anorak_job_id") or ",".join(view["ids"]) or None,
+        # The head chain as Slurm has it, not only as this server recorded it:
+        # a head job submitted by hand under the run's name is found by that
+        # name (_anorak_discover_head_jobs).
+        anorak_head_job_id=head["job_id"] if head else None,
+        anorak_head_state=head["state"] if head else None,
+        anorak_head_time_left=head["time_left"] if head else None,
+        anorak_head_reason=head["reason"] if head else None,
+        anorak_head_reason_text=(_anorak_explain_reason(head["reason"])
+                                 if head and head["state"] == "PENDING" else None),
+        anorak_standby_job_ids=[j["job_id"] for j in view["standbys"]],
+        anorak_standbys_queued=len(view["standbys"]),
+        anorak_head_jobs=view["jobs"],
+        anorak_recorded_state=view["recorded_state"],
+        # The recorded chain ended short of finishing and a head job it does
+        # not list is carrying the run: say so, rather than show the earlier
+        # job's TIMEOUT as the run's outcome or hide it.
+        anorak_chain_took_over=bool(
+            head and head["job_id"] not in recorded and recorded
+            and view["recorded_state"] is not None
+            and view["recorded_state"] not in IN_FLIGHT_SLURM_STATES
+            and view["recorded_state"] != "COMPLETED"),
+        anorak_head_discovery_failed=not view["discovered"],
         anorak_out_dir=row.get("anorak_out_dir"),
         anorak_grades_csv=str(anorak_grades) if anorak_grades else None,
         anorak_slide_list=row.get("anorak_slide_list"),
@@ -5404,6 +5886,7 @@ def _anorak_status_fields(row: dict) -> dict:
         anorak_slides=row.get("anorak_slides"),
         anorak_stop_reason=_anorak_stop_reason(anorak_out),
         anorak_tumour_verified=_anorak_tumour_verified(anorak_out),
+        anorak_progress=_anorak_progress(row, anorak_out, in_flight=in_flight) if anorak_out else None,
     )
     # Shown only once the job is known to have stopped and the output is not
     # usable — while it is running (or its state is unknown) there is no
@@ -5586,11 +6069,14 @@ def _submit_anorak(submission_id: str, req: AnorakRequest, *, tumour_verified: b
     with _slurm_submission_lock():
         row = _get_dataset_run_row(submission_id)
 
-        state = _anorak_run_state(row)
-        blocker = _anorak_submit_blocker(row, state)
+        # Fresh, not the status poll's cached answer: a head job submitted by
+        # hand a moment ago is exactly what this must not miss.
+        view = _anorak_head_view(row, fresh=True)
+        state = view["state"]
+        blocker = _anorak_submit_blocker(row, state, view["ids"])
         if blocker:
             raise HTTPException(*blocker)
-        if not req.overwrite and _anorak_job_ids(row):
+        if not req.overwrite and view["ids"]:
             out = Path(row["anorak_out_dir"]) if row.get("anorak_out_dir") else None
             if _anorak_output_ready(row, _anorak_grades_csv_path(out) if out else None,
                                     state)[0]:
@@ -5659,6 +6145,9 @@ def _submit_anorak(submission_id: str, req: AnorakRequest, *, tumour_verified: b
             _update_dataset_run_best_effort(submission_id, anorak_error=message)
             raise HTTPException(500, message)
 
+        # The next poll must see the new head job, not the cached "none".
+        for key in [k for k in _ANORAK_HEAD_CACHE if k[0] == submission_id]:
+            _ANORAK_HEAD_CACHE.pop(key, None)
         selection = result["selection"]
         job_ids = ([result["anorak_job_id"], *result.get("chain_job_ids", [])]
                    if result.get("anorak_job_id") else [])
@@ -6669,8 +7158,18 @@ def cancel_dataset_job(submission_id: str):
         # ANORAK_ONLY_STATUS — it is what makes the run an ANORAK run — and the
         # head job's CANCELLED state is what says it was stopped.
         out = Path(row["anorak_out_dir"]) if row.get("anorak_out_dir") else None
+        # Every live head job under the run's name as well as the recorded
+        # ones: a head job submitted by hand that survived Stop would resubmit
+        # the tasks this just cancelled, and its standbys would follow it.
+        head_ids = _split_job_ids(row.get("anorak_job_id"))
+        found = _anorak_discover_head_jobs(submission_id, fresh=True)
+        for job in (found or {}).get("live", []):
+            if job["job_id"] not in head_ids:
+                head_ids.append(job["job_id"])
+        for key in [k for k in _ANORAK_HEAD_CACHE if k[0] == submission_id]:
+            _ANORAK_HEAD_CACHE.pop(key, None)
         try:
-            outcome = (submit_hpl_nf.cancel_run(out, _split_job_ids(row.get("anorak_job_id")))
+            outcome = (submit_hpl_nf.cancel_run(out, head_ids)
                        if out else {"cancelled_job_ids": [], "errors": []})
         except (OSError, subprocess.SubprocessError) as e:
             outcome = {"cancelled_job_ids": [], "errors": [str(e)]}
@@ -7455,17 +7954,44 @@ def slide_region(
     return _jpeg_response(_img_to_jpeg_bytes(region, quality))
 
 
+#: Stage 6's per-tile confidence, as the viewer's tile card shows it. Added by
+#: migrate_tile_registry_confidence.sql, which a KB built before it may not
+#: have run — hence selected only when present rather than assumed.
+_TILE_CONFIDENCE_COLUMNS = ("hpc_vote_margin", "hpc_neighbor_distance",
+                            "hpc_reference", "hpc_assigned_at")
+
+
+@lru_cache(maxsize=None)
+def _tile_confidence_columns(kb_target: str) -> tuple[str, ...]:
+    """The confidence columns this target's tile_registry actually has.
+
+    Cached per target for the process: the migration is not something that
+    happens under a running server, and the alternative is an inspector round
+    trip on every slide the viewer opens. A failed inspection is not cached as
+    "none" — it raises past the cache and the next call tries again.
+    """
+    existing = {c["name"] for c in sqlalchemy_inspect(
+        _get_engine(kb_target)).get_columns("tile_registry")}
+    return tuple(c for c in _TILE_CONFIDENCE_COLUMNS if c in existing)
+
+
 @app.get("/slide/{slide_id}/tiles_meta")
 def slide_tiles_meta(slide_id: str, kb_target: str = Depends(kb_target_param)):
     """Return tile coordinates + HPC labels + heatmap probs for a slide (JSON)."""
     slide_id = slide_id.strip().upper()
     eng = _get_engine(kb_target)
-    q = text("""
+    try:
+        confidence = _tile_confidence_columns(kb_target)
+    except Exception:
+        confidence = ()
+    # Names come from the fixed tuple above, never from the request.
+    confidence_sql = "".join(f", tr.{c}" for c in confidence)
+    q = text(f"""
         SELECT
             tc.slide_tile, tc.slides, tc.tiles,
             tc.col, tc.row,
             tc.x_5x, tc.y_5x, tc.x_native, tc.y_native,
-            tr.hpc_id, tr.image_index AS h5_index,
+            tr.hpc_id, tr.image_index AS h5_index{confidence_sql},
             hd.inflammation, hd.necrosis, hd.malignant
         FROM tile_coordinates tc
         LEFT JOIN tile_registry tr
@@ -7484,6 +8010,11 @@ def slide_tiles_meta(slide_id: str, kb_target: str = Depends(kb_target_param)):
 
     if "slide_tile" in df.columns:
         df["slide_tile"] = df["slide_tile"].astype(str).str.strip().str.upper()
+
+    # A timestamp is not JSON; JSONResponse would 500 on the whole slide.
+    if "hpc_assigned_at" in df.columns:
+        stamps = pd.to_datetime(df["hpc_assigned_at"], errors="coerce", utc=True)
+        df["hpc_assigned_at"] = stamps.dt.strftime("%Y-%m-%d %H:%M UTC").where(stamps.notna(), None)
 
     # Merge heatmap probs — this target's, not the process's. Merging
     # production's numbers into a test cohort's tiles would render an overlay

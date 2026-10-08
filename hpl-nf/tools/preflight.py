@@ -153,7 +153,11 @@ def check_runtime(r: Report, checkpoint: str | None, reference: str | None) -> N
     device = r.attempt("search device", lambda: " — ".join(sca.resolve_device("auto")))
     if device and device.startswith("gpu"):
         r.attempt(f"GPU faiss extras {sfe.CONTAINER_EXTRAS_GPU}",
-                  lambda: sfe._check_container_extras(sfe.CONTAINER_EXTRAS_GPU, sfe.SINGULARITY_IMAGE,
+                  lambda: sca._check_container_extras(sfe.CONTAINER_EXTRAS_GPU, sfe.SINGULARITY_IMAGE,
+                                                      sfe.SINGULARITY_BIN))
+    elif device:
+        r.attempt(f"faiss in container extras {sfe.CONTAINER_EXTRAS}",
+                  lambda: sca._check_container_extras(sfe.CONTAINER_EXTRAS, sfe.SINGULARITY_IMAGE,
                                                       sfe.SINGULARITY_BIN))
     del gres
     r.attempt("reference", lambda: "{reference_path} ({reference_rows:,} rows, {n_clusters} clusters)"

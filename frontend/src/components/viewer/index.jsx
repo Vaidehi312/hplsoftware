@@ -11,6 +11,7 @@ import {
 import { getHpcSurvivalMapFor, getHpcTitleMapFor } from "./hpcReferenceCache.js";
 import PyramidViewer from "./PyramidViewer.jsx";
 import ClickInspectorViewer from "./ClickInspectorViewer.jsx";
+import TileDetailCard from "./TileDetailCard.jsx";
 import Legend from "./Legend.jsx";
 import HpcAnnotation from "./HpcAnnotation.jsx";
 import AdjacencyControls from "./AdjacencyControls.jsx";
@@ -383,7 +384,35 @@ export default function SlideViewer({ slideId }) {
                 dziUrl={api.dziUrl(slideId)}
                 overlayTiles={osdOverlay.records}
                 selectedTileRect={selectedTileRectForPyramid}
+                // The slide's whole tile list, not the filtered overlay set,
+                // and not the 6,000-record cap the overlay draws under: what
+                // a tile *is* does not depend on the legend filter, and a
+                // pointer over tile 8,000 should still be answered.
+                tileIndex={riskTiles}
+                tileSizeNative={slideInfo.tileSizeNative}
+                onSelectTile={setSelectedTile}
                 height={780}
+                previewUrl={(t, level) =>
+                  api.regionUrl(slideId, t.x_native, t.y_native, slideInfo.tileSizeNative, slideInfo.tileSizeNative, level, 80)
+                }
+                // Same card the click inspector shows, so a tile picked in
+                // either mode reads the same — and the selection itself is
+                // shared state, so switching modes keeps it.
+                renderSidePanel={
+                  selectedTile && selectedTile.tile
+                    ? (zoomToSelected) => (
+                        <TileDetailCard
+                          slideId={slideId}
+                          tile={selectedTile.tile}
+                          tileSizeNative={slideInfo.tileSizeNative}
+                          heatHpc={highlightMode === "Heatmap" ? heatHpc : null}
+                          hpcTitle={hpcTitleMap.get(selectedTile.tile.hpc_id) || ""}
+                          onZoom={zoomToSelected}
+                          onClose={() => setSelectedTile(null)}
+                        />
+                      )
+                    : null
+                }
               />
             </>
           ) : (

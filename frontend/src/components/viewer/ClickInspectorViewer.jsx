@@ -1,9 +1,7 @@
 import { useMemo, useState } from "react";
-import { api } from "../../api.js";
-import { riskToRgba, rgbaToCss, rgbToCss } from "../../colors.js";
-import { computeMinMax, gridColorForTile, heatmapColor, passesGridFilters } from "./overlayBuilders.js";
-import TileInfo from "./TileInfo.jsx";
-import HpcAnnotation from "./HpcAnnotation.jsx";
+import { colorForHpc, riskToRgba, rgbaToCss, rgbToCss } from "../../colors.js";
+import { buildTileLookup, computeMinMax, gridColorForTile, heatmapColor, passesGridFilters, tileAtImagePoint } from "./overlayBuilders.js";
+import TileDetailCard from "./TileDetailCard.jsx";
 
 // Port of show_wsi's "Click tile inspector" branch (app_v28.py ~4434-4506)
 // plus the raster-drawing helpers _draw_heatmap / _draw_survival_risk_heatmap
@@ -48,13 +46,49 @@ export default function ClickInspectorViewer({
     return computeMinMax(tiles, `p_hpc_${Number(heatHpc)}`);
   }, [tiles, highlightMode, heatHpc]);
 
-  const [selectedImgError, setSelectedImgError] = useState(null);
   const [noMatchWarning, setNoMatchWarning] = useState(null);
+  const [hovered, setHovered] = useState(null); // { tile, left, top } in stage CSS px
+
+  // The same lattice lookup the pyramid viewer hovers with. A click still
+  // uses the tolerant scan below, as it always has; hover asks the stricter
+  // question "whose cell is this pixel in", which is what the highlight shows.
+  const lookup = useMemo(() => buildTileLookup(tiles, tileSizeNative), [tiles, tileSizeNative]);
 
   if (!thumbnailUrl) return null;
 
   function handleImgLoad(e) {
     setImgSize({ width: e.target.naturalWidth, height: e.target.naturalHeight });
+  }
+
+  function nativePoint(e) {
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const scaleX = img.naturalWidth / rect.width;
+    const scaleY = img.naturalHeight / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX * downsample,
+      y: (e.clientY - rect.top) * scaleY * downsample,
+      rect,
+    };
+  }
+
+  function handleMove(e) {
+    if (!downsample) return;
+    const { x, y, rect } = nativePoint(e);
+    const tile = tileAtImagePoint(lookup, x, y, tileSizeNative);
+    if (!tile) {
+      if (hovered) setHovered(null);
+      return;
+    }
+    if (hovered && hovered.tile === tile) return;
+    // Tooltip anchored beside the tile's right edge, flipped left near the
+    // image's edge so it never runs off the stage.
+    const cssPerNative = rect.width / (imgSize.width * downsample);
+    const tileRight = (Number(tile.x_native) + tileSizeNative) * cssPerNative;
+    const tileLeft = Number(tile.x_native) * cssPerNative;
+    const left = tileRight + 10 + 220 > rect.width ? Math.max(4, tileLeft - 230) : tileRight + 10;
+    const top = Math.max(4, Math.min(Number(tile.y_native) * cssPerNative, rect.height - 70));
+    setHovered({ tile, left, top });
   }
 
   function handleClick(e) {
@@ -84,7 +118,6 @@ export default function ClickInspectorViewer({
     }
 
     setNoMatchWarning(null);
-    setSelectedImgError(null);
     onSelectTile({
       slide_tile: String(match.slide_tile || ""),
       x_native: Number(match.x_native),
@@ -142,48 +175,64 @@ export default function ClickInspectorViewer({
       );
       rects.push(<rect key="sel_inner" x={sx} y={sy} width={ts} height={ts} fill="none" stroke="lime" strokeWidth={3} />);
     }
+
+    if (hovered) {
+      const hx = Number(hovered.tile.x_native) / downsample;
+      const hy = Number(hovered.tile.y_native) / downsample;
+      rects.push(
+        <rect key="hover" x={hx} y={hy} width={ts} height={ts} fill="rgba(255,255,255,0.22)" stroke="#ffffff" strokeWidth={2} />
+      );
+    }
   }
 
   const tileRow = selectedTile && selectedTile.tile;
-  const tileHpc = tileRow ? tileRow.hpc_id : null;
   const heatHpcForInfo = highlightMode === "Heatmap" ? heatHpc : null;
+  const hoveredHpc = hovered && hovered.tile.hpc_id !== null && hovered.tile.hpc_id !== undefined ? Number(hovered.tile.hpc_id) : null;
+  const hoveredSwatch = hoveredHpc === null ? "#6b7280" : rgbToCss(colorForHpc(hoveredHpc));
 
   return (
     <div>
-      <div className="viewer-caption">Click a tile to view it.</div>
-      <div className="viewer-click-stage">
-        <img src={thumbnailUrl} alt={`${slideId} thumbnail`} onLoad={handleImgLoad} onClick={handleClick} />
-        {imgSize && (
-          <svg className="viewer-click-overlay-svg" viewBox={`0 0 ${imgSize.width} ${imgSize.height}`}>
-            {rects}
-          </svg>
+      <div className="viewer-caption">Hover to identify a tile; click it for its image and details.</div>
+      <div className={`viewer-click-layout${tileRow ? " viewer-click-layout-with-panel" : ""}`}>
+        <div className="viewer-click-stage">
+          <img
+            src={thumbnailUrl}
+            alt={`${slideId} thumbnail`}
+            onLoad={handleImgLoad}
+            onClick={handleClick}
+            onMouseMove={handleMove}
+            onMouseLeave={() => setHovered(null)}
+          />
+          {imgSize && (
+            <svg className="viewer-click-overlay-svg" viewBox={`0 0 ${imgSize.width} ${imgSize.height}`}>
+              {rects}
+            </svg>
+          )}
+          {hovered && (
+            <div className="viewer-osd-hud" style={{ left: hovered.left, top: hovered.top, borderLeftColor: hoveredSwatch }}>
+              <span className="viewer-osd-hud-tile">{hovered.tile.tiles || hovered.tile.slide_tile}</span>
+              <span className="viewer-osd-hud-hpc">
+                <span className="viewer-osd-hud-swatch" style={{ background: hoveredSwatch }} />
+                {hpcLabel(hoveredHpc, hpcTitleMap, 90, "no HPC label")}
+              </span>
+              <span className="viewer-osd-hud-hint">Click for details</span>
+            </div>
+          )}
+        </div>
+
+        {tileRow && (
+          <TileDetailCard
+            slideId={slideId}
+            tile={tileRow}
+            tileSizeNative={tileSizeNative}
+            heatHpc={heatHpcForInfo}
+            hpcTitle={hpcTitleMap?.get(Number(tileRow.hpc_id)) || ""}
+            onClose={() => onSelectTile(null)}
+          />
         )}
       </div>
 
       {noMatchWarning && <div className="viewer-warning">{noMatchWarning}</div>}
-      {!selectedTile && !noMatchWarning && <div className="viewer-info">Click anywhere on the slide to select a tile.</div>}
-
-      {tileRow && (
-        <div className="viewer-tile-result">
-          <div className="viewer-info">Tile selected: {String(tileRow.tiles || tileRow.slide_tile)}</div>
-
-          {tileHpc !== null && tileHpc !== undefined && !Number.isNaN(Number(tileHpc)) && (
-            <div className="viewer-info">{hpcLabel(tileHpc, hpcTitleMap)}</div>
-          )}
-
-          <img
-            className="viewer-tile-image"
-            src={api.regionUrl(slideId, tileRow.x_native, tileRow.y_native, tileSizeNative, tileSizeNative, 0, 95)}
-            alt={`${tileRow.slide_tile} native SVS region`}
-            onError={() => setSelectedImgError("Could not load native SVS tile region.")}
-          />
-          {selectedImgError && <div className="viewer-warning">{selectedImgError}</div>}
-
-          <TileInfo tile={tileRow} heatHpc={heatHpcForInfo} />
-
-          {tileHpc !== null && tileHpc !== undefined && !Number.isNaN(Number(tileHpc)) && <HpcAnnotation hpcId={Number(tileHpc)} />}
-        </div>
-      )}
     </div>
   );
 }
@@ -191,7 +240,8 @@ export default function ClickInspectorViewer({
 // Port of hpc_label(hpc_id, max_title_chars=160) (app_v28.py ~line 3378),
 // using the slide-scoped title map built by hpcReferenceCache instead of the
 // bulk load_hpc_title_map().
-function hpcLabel(hpcId, hpcTitleMap, maxTitleChars = 160) {
+function hpcLabel(hpcId, hpcTitleMap, maxTitleChars = 160, missing = "") {
+  if (hpcId === null || hpcId === undefined || Number.isNaN(Number(hpcId))) return missing;
   const hid = Number(hpcId);
   let title = (hpcTitleMap && hpcTitleMap.get(hid)) || "";
   if (!title) return `HPC ${hid}`;
